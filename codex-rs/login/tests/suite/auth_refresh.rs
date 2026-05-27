@@ -9,6 +9,7 @@ use codex_login::AuthDotJson;
 use codex_login::AuthManager;
 use codex_login::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
 use codex_login::RefreshTokenError;
+use codex_login::account_pool_secret_dir;
 use codex_login::load_auth_dot_json;
 use codex_login::save_auth;
 use codex_login::token_data::IdTokenInfo;
@@ -211,6 +212,133 @@ async fn refresh_token_skips_refresh_when_auth_changed() -> Result<()> {
     let requests = server.received_requests().await.unwrap_or_default();
     assert!(requests.is_empty(), "expected no refresh token requests");
 
+    Ok(())
+}
+
+#[serial_test::serial(auth_refresh)]
+#[tokio::test]
+async fn refresh_token_reloads_pool_secret_when_local_pool_copy_is_stale() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "unexpected-access-token",
+            "refresh_token": "unexpected-refresh-token"
+        })))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let initial_last_refresh = Utc::now() - Duration::days(1);
+    let initial_tokens = build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN);
+    let initial_auth = AuthDotJson {
+        auth_mode: Some(AuthMode::Chatgpt),
+        openai_api_key: None,
+        tokens: Some(initial_tokens.clone()),
+        last_refresh: Some(initial_last_refresh),
+        agent_identity: None,
+    };
+    let ctx = RefreshTokenTestContext::new_with_initial_auth(&server, &initial_auth).await?;
+
+    let reloaded_tokens = TokenData {
+        access_token: access_token_with_expiration(Utc::now() + Duration::hours(1)),
+        refresh_token: "pool-refresh-token".to_string(),
+        ..initial_tokens
+    };
+    let reloaded_pool_auth = AuthDotJson {
+        auth_mode: Some(AuthMode::Chatgpt),
+        openai_api_key: None,
+        tokens: Some(reloaded_tokens.clone()),
+        last_refresh: Some(initial_last_refresh + Duration::hours(1)),
+        agent_identity: None,
+    };
+    save_auth(
+        &account_pool_secret_dir(ctx.codex_home.path(), "account-id"),
+        &reloaded_pool_auth,
+        AuthCredentialsStoreMode::File,
+    )?;
+
+    ctx.auth_manager
+        .refresh_token()
+        .await
+        .context("refresh should reload the shared pool secret")?;
+
+    assert_eq!(ctx.load_auth()?, reloaded_pool_auth);
+    assert_eq!(ctx.load_pool_auth("account-id")?, ctx.load_auth()?);
+
+    server.verify().await;
+    Ok(())
+}
+
+#[serial_test::serial(auth_refresh)]
+#[tokio::test]
+async fn refresh_token_uses_pool_secret_refresh_token_when_local_copy_is_stale() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "new-access-token",
+            "refresh_token": "new-refresh-token"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let initial_last_refresh = Utc::now() - Duration::days(1);
+    let initial_tokens = build_tokens(INITIAL_ACCESS_TOKEN, INITIAL_REFRESH_TOKEN);
+    let initial_auth = AuthDotJson {
+        auth_mode: Some(AuthMode::Chatgpt),
+        openai_api_key: None,
+        tokens: Some(initial_tokens.clone()),
+        last_refresh: Some(initial_last_refresh),
+        agent_identity: None,
+    };
+    let ctx = RefreshTokenTestContext::new_with_initial_auth(&server, &initial_auth).await?;
+
+    let pool_auth = AuthDotJson {
+        auth_mode: Some(AuthMode::Chatgpt),
+        openai_api_key: None,
+        tokens: Some(TokenData {
+            access_token: "stale-pool-access-token".to_string(),
+            refresh_token: "pool-refresh-token".to_string(),
+            ..initial_tokens.clone()
+        }),
+        last_refresh: Some(initial_last_refresh + Duration::minutes(5)),
+        agent_identity: None,
+    };
+    save_auth(
+        &account_pool_secret_dir(ctx.codex_home.path(), "account-id"),
+        &pool_auth,
+        AuthCredentialsStoreMode::File,
+    )?;
+
+    ctx.auth_manager
+        .refresh_token()
+        .await
+        .context("refresh should use the shared pool secret")?;
+
+    let requests = server.received_requests().await.unwrap_or_default();
+    assert_eq!(requests.len(), 1);
+    let request_body: serde_json::Value = serde_json::from_slice(&requests[0].body)?;
+    assert_eq!(request_body["refresh_token"], json!("pool-refresh-token"));
+
+    let stored_auth = ctx.load_auth()?;
+    let stored_pool_auth = ctx.load_pool_auth("account-id")?;
+    assert_eq!(stored_auth, stored_pool_auth);
+    assert_eq!(
+        stored_auth.tokens.as_ref().context("tokens should exist")?,
+        &TokenData {
+            access_token: "new-access-token".to_string(),
+            refresh_token: "new-refresh-token".to_string(),
+            ..initial_tokens
+        }
+    );
+
+    server.verify().await;
     Ok(())
 }
 
@@ -995,10 +1123,48 @@ impl RefreshTokenTestContext {
         })
     }
 
+    async fn new_with_initial_auth(
+        server: &MockServer,
+        auth_dot_json: &AuthDotJson,
+    ) -> Result<Self> {
+        let codex_home = TempDir::new()?;
+        save_auth(
+            codex_home.path(),
+            auth_dot_json,
+            AuthCredentialsStoreMode::File,
+        )?;
+
+        let endpoint = format!("{}/oauth/token", server.uri());
+        let env_guard = EnvGuard::set(REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR, endpoint);
+
+        let auth_manager = AuthManager::shared(
+            codex_home.path().to_path_buf(),
+            /*enable_codex_api_key_env*/ false,
+            AuthCredentialsStoreMode::File,
+            /*chatgpt_base_url*/ None,
+        )
+        .await;
+
+        Ok(Self {
+            codex_home,
+            auth_manager,
+            _env_guard: env_guard,
+        })
+    }
+
     fn load_auth(&self) -> Result<AuthDotJson> {
         load_auth_dot_json(self.codex_home.path(), AuthCredentialsStoreMode::File)
             .context("load auth.json")?
             .context("auth.json should exist")
+    }
+
+    fn load_pool_auth(&self, account_id: &str) -> Result<AuthDotJson> {
+        load_auth_dot_json(
+            &account_pool_secret_dir(self.codex_home.path(), account_id),
+            AuthCredentialsStoreMode::File,
+        )
+        .context("load pool auth.json")?
+        .context("pool auth.json should exist")
     }
 
     async fn write_auth(&self, auth_dot_json: &AuthDotJson) -> Result<()> {
