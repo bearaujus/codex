@@ -97,6 +97,16 @@ use codex_terminal_detection::TerminalName;
     override_usage = "codex [OPTIONS] [PROMPT]\n       codex [OPTIONS] <COMMAND> [ARGS]"
 )]
 struct MultitoolCli {
+    /// Override the Codex home directory (defaults to ~/.codex or $CODEX_HOME).
+    /// The directory is created automatically if it does not exist, making this
+    /// convenient for project-scoped or workspace-scoped Codex invocations.
+    ///
+    /// Examples:
+    ///   codex --codex-home /projects/myapp/.codex
+    ///   codex --codex-home ~/workspaces/myapp
+    #[arg(long = "codex-home", global = true, value_name = "PATH")]
+    pub codex_home: Option<std::path::PathBuf>,
+
     #[clap(flatten)]
     pub config_overrides: CliConfigOverrides,
 
@@ -829,12 +839,26 @@ fn main() -> anyhow::Result<()> {
 
 async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
     let MultitoolCli {
+        codex_home: codex_home_override,
         config_overrides: mut root_config_overrides,
         feature_toggles,
         remote,
         mut interactive,
         subcommand,
     } = MultitoolCli::parse();
+
+    // Apply --codex-home before any find_codex_home() call. This is safe
+    // because no other threads are reading CODEX_HOME yet at this point.
+    if let Some(path) = codex_home_override {
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("--codex-home path is not valid UTF-8"))?;
+        // SAFETY: called before any concurrent CODEX_HOME reads.
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::set_var("CODEX_HOME", path_str);
+        }
+    }
 
     // Fold --enable/--disable into config overrides so they flow to all subcommands.
     let toggle_overrides = feature_toggles.to_overrides()?;

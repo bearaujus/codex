@@ -130,6 +130,10 @@ pub struct ShutdownHandle {
 }
 
 impl ShutdownHandle {
+    pub(crate) fn new(shutdown_notify: Arc<tokio::sync::Notify>) -> Self {
+        Self { shutdown_notify }
+    }
+
     /// Signals the login loop to terminate.
     pub fn shutdown(&self) {
         self.shutdown_notify.notify_one();
@@ -245,7 +249,7 @@ pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
         auth_url,
         actual_port,
         server_handle,
-        shutdown_handle: ShutdownHandle { shutdown_notify },
+        shutdown_handle: ShutdownHandle::new(shutdown_notify),
     })
 }
 
@@ -445,7 +449,7 @@ async fn process_request(
 /// and always appends `Connection: close`, ensuring the socket is closed from
 /// the server side. Ideally, tiny_http would provide an API to control
 /// server-side connection persistence, but it does not.
-fn send_response_with_disconnect(
+pub(crate) fn send_response_with_disconnect(
     req: Request,
     mut headers: Vec<Header>,
     body: Vec<u8>,
@@ -480,7 +484,7 @@ fn send_response_with_disconnect(
     writer.flush()
 }
 
-fn build_authorize_url(
+pub(crate) fn build_authorize_url(
     issuer: &str,
     client_id: &str,
     redirect_uri: &str,
@@ -518,7 +522,7 @@ fn build_authorize_url(
     format!("{issuer}/oauth/authorize?{qs}")
 }
 
-fn generate_state() -> String {
+pub(crate) fn generate_state() -> String {
     let mut bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut bytes);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
@@ -541,7 +545,7 @@ fn send_cancel_request(port: u16) -> io::Result<()> {
     Ok(())
 }
 
-fn bind_server(port: u16) -> io::Result<Server> {
+pub(crate) fn bind_server(port: u16) -> io::Result<Server> {
     let preferred_bind_address = format!("127.0.0.1:{port}");
     let fallback_bind_address = format!("127.0.0.1:{FALLBACK_PORT}");
     let mut bind_address = preferred_bind_address.clone();

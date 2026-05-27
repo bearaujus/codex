@@ -974,18 +974,42 @@ async fn run_sampling_request(
             Ok(output) => {
                 return Ok(output);
             }
-            Err(CodexErr::ContextWindowExceeded) => {
+            Err(SamplingRequestError {
+                error: CodexErr::ContextWindowExceeded,
+                ..
+            }) => {
                 sess.set_total_tokens_full(&turn_context).await;
                 return Err(CodexErr::ContextWindowExceeded);
             }
-            Err(CodexErr::UsageLimitReached(e)) => {
+            Err(SamplingRequestError {
+                error: CodexErr::UsageLimitReached(e),
+                assistant_output_seen,
+                tool_execution_seen,
+            }) => {
+                let safe_to_retry = !assistant_output_seen && !tool_execution_seen;
                 let rate_limits = e.rate_limits.clone();
                 if let Some(rate_limits) = rate_limits {
                     sess.update_rate_limits(&turn_context, *rate_limits).await;
                 }
+                match sess
+                    .services
+                    .auth_manager
+                    .handle_chatgpt_account_pool_usage_limit(
+                        safe_to_retry,
+                        e.rate_limits.as_deref(),
+                        e.resets_at,
+                    )
+                    .await
+                {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(err) => {
+                        tracing::warn!("failed to process ChatGPT account-pool failover: {err}");
+                    }
+                }
                 return Err(CodexErr::UsageLimitReached(e));
             }
-            Err(err) => err,
+            Err(err) => err.error,
         };
 
         if !err.is_retryable() {
@@ -1115,6 +1139,23 @@ pub(crate) async fn built_tools(
 struct SamplingRequestResult {
     needs_follow_up: bool,
     last_agent_message: Option<String>,
+}
+
+#[derive(Debug)]
+struct SamplingRequestError {
+    error: CodexErr,
+    assistant_output_seen: bool,
+    tool_execution_seen: bool,
+}
+
+impl SamplingRequestError {
+    fn new(error: CodexErr, assistant_output_seen: bool, tool_execution_seen: bool) -> Self {
+        Self {
+            error,
+            assistant_output_seen,
+            tool_execution_seen,
+        }
+    }
 }
 
 /// Ephemeral per-response state for streaming a single proposed plan.
@@ -1692,7 +1733,7 @@ async fn try_run_sampling_request(
     turn_diff_tracker: SharedTurnDiffTracker,
     prompt: &Prompt,
     cancellation_token: CancellationToken,
-) -> CodexResult<SamplingRequestResult> {
+) -> Result<SamplingRequestResult, SamplingRequestError> {
     feedback_tags!(
         model = turn_context.model_info.slug.clone(),
         approval_policy = turn_context.approval_policy.value(),
@@ -1706,7 +1747,7 @@ async fn try_run_sampling_request(
         turn_context.model_info.slug.as_str(),
         turn_context.provider.info().name.as_str(),
     );
-    let mut stream = client_session
+    let mut stream = match client_session
         .stream(
             prompt,
             &turn_context.model_info,
@@ -1719,11 +1760,24 @@ async fn try_run_sampling_request(
         )
         .instrument(trace_span!("stream_request"))
         .or_cancel(&cancellation_token)
-        .await??;
+        .await
+    {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(err)) => return Err(SamplingRequestError::new(err, false, false)),
+        Err(codex_async_utils::CancelErr::Cancelled) => {
+            return Err(SamplingRequestError::new(
+                CodexErr::TurnAborted,
+                false,
+                false,
+            ));
+        }
+    };
     let mut in_flight: FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>> =
         FuturesOrdered::new();
     let mut needs_follow_up = false;
+    let mut assistant_output_seen = false;
     let mut last_agent_message: Option<String> = None;
+    let mut tool_execution_seen = false;
     let mut active_item: Option<TurnItem> = None;
     let mut active_tool_argument_diff_consumer: Option<(
         String,
@@ -1740,7 +1794,7 @@ async fn try_run_sampling_request(
     let mut active_item_is_streaming_to_client = false;
     let receiving_span = trace_span!("receiving_stream");
     let mut completed_response_id: Option<String> = None;
-    let outcome: CodexResult<SamplingRequestResult> = loop {
+    let outcome: Result<SamplingRequestResult, SamplingRequestError> = loop {
         let handle_responses = trace_span!(
             parent: &receiving_span,
             "handle_responses",
@@ -1762,16 +1816,29 @@ async fn try_run_sampling_request(
             .await
         {
             Ok(event) => event,
-            Err(codex_async_utils::CancelErr::Cancelled) => break Err(CodexErr::TurnAborted),
+            Err(codex_async_utils::CancelErr::Cancelled) => {
+                break Err(SamplingRequestError::new(
+                    CodexErr::TurnAborted,
+                    assistant_output_seen,
+                    tool_execution_seen,
+                ));
+            }
         };
 
         let event = match event {
             Some(Ok(event)) => event,
-            Some(Err(err)) => break Err(err),
+            Some(Err(err)) => {
+                break Err(SamplingRequestError::new(
+                    err,
+                    assistant_output_seen,
+                    tool_execution_seen,
+                ));
+            }
             None => {
-                break Err(CodexErr::Stream(
-                    "stream closed before response.completed".into(),
-                    None,
+                break Err(SamplingRequestError::new(
+                    CodexErr::Stream("stream closed before response.completed".into(), None),
+                    assistant_output_seen,
+                    tool_execution_seen,
                 ));
             }
         };
@@ -1858,9 +1925,16 @@ async fn try_run_sampling_request(
                         .await
                     {
                         Ok(output_result) => output_result,
-                        Err(err) => break Err(err),
+                        Err(err) => {
+                            break Err(SamplingRequestError::new(
+                                err,
+                                assistant_output_seen,
+                                tool_execution_seen,
+                            ));
+                        }
                     };
                 if let Some(tool_future) = output_result.tool_future {
+                    tool_execution_seen = true;
                     in_flight.push_back(tool_future);
                 }
                 if let Some(agent_message) = output_result.last_agent_message {
@@ -1895,6 +1969,7 @@ async fn try_run_sampling_request(
                 {
                     let mut turn_item = turn_item;
                     let stream_item_to_client = !defer_streamed_turn_items_for_contributors;
+                    assistant_output_seen |= matches!(turn_item, TurnItem::AgentMessage(_));
                     let mut seeded_parsed: Option<ParsedAssistantTextDelta> = None;
                     let mut seeded_item_id: Option<String> = None;
                     if stream_item_to_client
@@ -2134,7 +2209,11 @@ async fn try_run_sampling_request(
         client_session.send_response_processed(response_id).await;
     }
 
-    drain_in_flight(&mut in_flight, sess.clone(), turn_context.clone()).await?;
+    drain_in_flight(&mut in_flight, sess.clone(), turn_context.clone())
+        .await
+        .map_err(|err| {
+            SamplingRequestError::new(err, assistant_output_seen, tool_execution_seen)
+        })?;
 
     if should_emit_token_count {
         // A tool call such as request_user_input can intentionally pause the turn. Emit token
@@ -2145,7 +2224,11 @@ async fn try_run_sampling_request(
     }
 
     if cancellation_token.is_cancelled() {
-        return Err(CodexErr::TurnAborted);
+        return Err(SamplingRequestError::new(
+            CodexErr::TurnAborted,
+            assistant_output_seen,
+            tool_execution_seen,
+        ));
     }
 
     if should_emit_turn_diff {

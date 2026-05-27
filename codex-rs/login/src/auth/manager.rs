@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use chrono::DateTime;
 use chrono::Utc;
 use reqwest::StatusCode;
 use serde::Deserialize;
@@ -23,9 +24,13 @@ use codex_app_server_protocol::AuthMode;
 use codex_app_server_protocol::AuthMode as ApiAuthMode;
 use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::ModelProviderAuthInfo;
+use codex_protocol::protocol::RateLimitSnapshot;
 
 use super::external_bearer::BearerTokenRefresher;
 use super::revoke::revoke_auth_tokens;
+use crate::account_pool::ChatgptAccountPool;
+use crate::account_pool::ChatgptAccountPoolError;
+use crate::account_pool::ChatgptAccountPoolSelectionOutcome;
 pub use crate::auth::agent_identity::AgentIdentityAuth;
 pub use crate::auth::storage::AgentIdentityAuthRecord;
 pub use crate::auth::storage::AuthDotJson;
@@ -1260,6 +1265,7 @@ pub struct AuthManager {
     chatgpt_base_url: Option<String>,
     refresh_lock: Semaphore,
     external_auth: RwLock<Option<Arc<dyn ExternalAuth>>>,
+    account_pool: Option<ChatgptAccountPool>,
 }
 
 /// Configuration view required to construct a shared [`AuthManager`].
@@ -1298,7 +1304,46 @@ impl Debug for AuthManager {
             )
             .field("chatgpt_base_url", &self.chatgpt_base_url)
             .field("has_external_auth", &self.has_external_auth())
+            .field("has_account_pool", &self.account_pool.is_some())
             .finish_non_exhaustive()
+    }
+}
+
+fn should_consider_account_pool_auth(auth: Option<&CodexAuth>) -> bool {
+    auth.is_none() || auth.is_some_and(|auth| matches!(auth, CodexAuth::Chatgpt(_)))
+}
+
+async fn load_startup_account_pool_auth(
+    codex_home: &Path,
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
+    chatgpt_base_url: Option<&str>,
+    managed_auth: Option<CodexAuth>,
+    account_pool: Option<&ChatgptAccountPool>,
+) -> Option<CodexAuth> {
+    let Some(account_pool) = account_pool else {
+        return managed_auth;
+    };
+    let current_account_id = managed_auth.as_ref().and_then(CodexAuth::get_account_id);
+    let selection = account_pool
+        .resolve_turn_selection(
+            current_account_id.as_deref(),
+            /*current_refresh_failed_permanently*/ false,
+        )
+        .await
+        .ok()?;
+    match selection {
+        ChatgptAccountPoolSelectionOutcome::Unchanged
+        | ChatgptAccountPoolSelectionOutcome::NoEligibleAccounts => managed_auth,
+        ChatgptAccountPoolSelectionOutcome::Activated { auth, .. } => {
+            if save_auth(codex_home, &auth, auth_credentials_store_mode).is_err() {
+                return managed_auth;
+            }
+            CodexAuth::from_auth_storage(codex_home, auth_credentials_store_mode, chatgpt_base_url)
+                .await
+                .ok()
+                .flatten()
+                .or(managed_auth)
+        }
     }
 }
 
@@ -1322,6 +1367,29 @@ impl AuthManager {
         .await
         .ok()
         .flatten();
+        let account_pool = ChatgptAccountPool::open(
+            codex_home.clone(),
+            auth_credentials_store_mode,
+            chatgpt_base_url.clone(),
+        )
+        .await
+        .map_err(|err| {
+            tracing::warn!("failed to initialize ChatGPT account pool: {err}");
+            err
+        })
+        .ok();
+        let managed_auth = if should_consider_account_pool_auth(managed_auth.as_ref()) {
+            load_startup_account_pool_auth(
+                &codex_home,
+                auth_credentials_store_mode,
+                chatgpt_base_url.as_deref(),
+                managed_auth,
+                account_pool.as_ref(),
+            )
+            .await
+        } else {
+            managed_auth
+        };
         let (auth_change_tx, _auth_change_rx) = watch::channel(0);
         Self {
             codex_home,
@@ -1336,6 +1404,7 @@ impl AuthManager {
             chatgpt_base_url,
             refresh_lock: Semaphore::new(/*permits*/ 1),
             external_auth: RwLock::new(None),
+            account_pool,
         }
     }
 
@@ -1357,6 +1426,7 @@ impl AuthManager {
             chatgpt_base_url: None,
             refresh_lock: Semaphore::new(/*permits*/ 1),
             external_auth: RwLock::new(None),
+            account_pool: None,
         })
     }
 
@@ -1377,6 +1447,7 @@ impl AuthManager {
             chatgpt_base_url: None,
             refresh_lock: Semaphore::new(/*permits*/ 1),
             external_auth: RwLock::new(None),
+            account_pool: None,
         })
     }
 
@@ -1397,6 +1468,7 @@ impl AuthManager {
             external_auth: RwLock::new(Some(
                 Arc::new(BearerTokenRefresher::new(config)) as Arc<dyn ExternalAuth>
             )),
+            account_pool: None,
         })
     }
 
@@ -1634,6 +1706,132 @@ impl AuthManager {
         .await;
         auth_manager.set_forced_chatgpt_workspace_id(config.forced_chatgpt_workspace_id());
         auth_manager
+    }
+
+    pub fn chatgpt_account_pool(&self) -> Option<ChatgptAccountPool> {
+        self.account_pool.clone()
+    }
+
+    pub async fn sync_selected_chatgpt_account_pool_auth(
+        &self,
+    ) -> Result<bool, ChatgptAccountPoolError> {
+        if !should_consider_account_pool_auth(self.auth_cached().as_ref()) {
+            return Ok(false);
+        }
+        let Some(account_pool) = self.account_pool.as_ref() else {
+            return Ok(false);
+        };
+        let current_account_id = self
+            .auth_cached()
+            .as_ref()
+            .and_then(CodexAuth::get_account_id);
+        match account_pool
+            .resolve_turn_selection(
+                current_account_id.as_deref(),
+                /*current_refresh_failed_permanently*/ false,
+            )
+            .await?
+        {
+            ChatgptAccountPoolSelectionOutcome::Unchanged => Ok(false),
+            ChatgptAccountPoolSelectionOutcome::NoEligibleAccounts => {
+                if self
+                    .auth_cached()
+                    .as_ref()
+                    .is_some_and(|auth| matches!(auth, CodexAuth::Chatgpt(_)))
+                {
+                    logout(&self.codex_home, self.auth_credentials_store_mode)?;
+                    self.reload().await;
+                    return Ok(true);
+                }
+                Ok(false)
+            }
+            ChatgptAccountPoolSelectionOutcome::Activated { auth, .. } => {
+                save_auth(&self.codex_home, &auth, self.auth_credentials_store_mode)?;
+                Ok(self.reload().await)
+            }
+        }
+    }
+
+    pub async fn prepare_chatgpt_account_pool_for_turn(
+        &self,
+    ) -> Result<(), ChatgptAccountPoolError> {
+        if !should_consider_account_pool_auth(self.auth_cached().as_ref()) {
+            return Ok(());
+        }
+        let Some(account_pool) = self.account_pool.as_ref() else {
+            return Ok(());
+        };
+        let current_auth = self.auth_cached();
+        let current_account_id = current_auth.as_ref().and_then(CodexAuth::get_account_id);
+        let current_refresh_failed_permanently = current_auth
+            .as_ref()
+            .and_then(|auth| self.refresh_failure_for_auth(auth))
+            .is_some();
+        match account_pool
+            .resolve_turn_selection(
+                current_account_id.as_deref(),
+                current_refresh_failed_permanently,
+            )
+            .await?
+        {
+            ChatgptAccountPoolSelectionOutcome::Unchanged => Ok(()),
+            ChatgptAccountPoolSelectionOutcome::NoEligibleAccounts => {
+                if current_auth
+                    .as_ref()
+                    .is_some_and(|auth| matches!(auth, CodexAuth::Chatgpt(_)))
+                {
+                    logout(&self.codex_home, self.auth_credentials_store_mode)?;
+                    self.reload().await;
+                }
+                Err(ChatgptAccountPoolError::NoEligibleAccounts)
+            }
+            ChatgptAccountPoolSelectionOutcome::Activated { auth, .. } => {
+                save_auth(&self.codex_home, &auth, self.auth_credentials_store_mode)?;
+                self.reload().await;
+                Ok(())
+            }
+        }
+    }
+
+    pub async fn handle_chatgpt_account_pool_usage_limit(
+        &self,
+        safe_to_retry: bool,
+        snapshot: Option<&RateLimitSnapshot>,
+        resets_at: Option<DateTime<Utc>>,
+    ) -> Result<bool, ChatgptAccountPoolError> {
+        let Some(account_pool) = self.account_pool.as_ref() else {
+            return Ok(false);
+        };
+        let current_auth = self.auth_cached();
+        let Some(current_auth) = current_auth.as_ref() else {
+            return Ok(false);
+        };
+        if !matches!(current_auth, CodexAuth::Chatgpt(_)) {
+            return Ok(false);
+        }
+        let Some(account_id) = current_auth.get_account_id() else {
+            return Ok(false);
+        };
+        account_pool
+            .mark_current_account_rate_limited(&account_id, snapshot, resets_at)
+            .await?;
+        if !safe_to_retry {
+            return Ok(false);
+        }
+        match account_pool
+            .resolve_turn_selection(
+                Some(account_id.as_str()),
+                /*current_refresh_failed_permanently*/ false,
+            )
+            .await?
+        {
+            ChatgptAccountPoolSelectionOutcome::Activated { auth, failover, .. } if failover => {
+                save_auth(&self.codex_home, &auth, self.auth_credentials_store_mode)?;
+                self.reload().await;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     pub fn unauthorized_recovery(self: &Arc<Self>) -> UnauthorizedRecovery {
