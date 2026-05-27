@@ -1,28 +1,21 @@
-SHELL := sh
+.PHONY: build prod release install run clean
 
-CODEX_RS_DIR := codex-rs
-BIN_DIR := bin
-EXE :=
+# Build the release codex binary into ./bin (prod/release are back-compat aliases).
+build:
+	powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1
 
-ifeq ($(OS),Windows_NT)
-EXE := .exe
-endif
+prod: build
 
-CODEX_BIN := $(BIN_DIR)/codex$(EXE)
+release: build
 
-.PHONY: prod
-prod: $(CODEX_BIN)
+# Build + install codex onto your user PATH (%LOCALAPPDATA%\codex\bin).
+install:
+	powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/install-windows.ps1
 
-.PHONY: release
-release: prod
+# Build + run the local codex binary.
+run:
+	powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/run-windows.ps1
 
-$(BIN_DIR):
-	mkdir -p "$(BIN_DIR)"
-
-$(CODEX_BIN): | $(BIN_DIR)
-	cd "$(CODEX_RS_DIR)" && cargo build -p codex-cli --release
-	cp "$(CODEX_RS_DIR)/target/release/codex$(EXE)" "$(CODEX_BIN)"
-
-.PHONY: clean
+# Remove the repo-local built binary.
 clean:
-	rm -f "$(CODEX_BIN)"
+	powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/clean-repo-artifacts.ps1

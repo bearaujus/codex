@@ -143,7 +143,9 @@ impl ChatgptAccountPool {
         };
         match parse_jwt_expiration(&tokens.access_token) {
             Ok(Some(expires_at)) => {
-                expires_at <= now + chrono::Duration::seconds(ACCOUNT_TOKEN_REFRESH_EXPIRATION_SKEW_SECONDS)
+                expires_at
+                    <= now
+                        + chrono::Duration::seconds(ACCOUNT_TOKEN_REFRESH_EXPIRATION_SKEW_SECONDS)
             }
             Ok(None) | Err(_) => true,
         }

@@ -219,6 +219,26 @@ pub(super) async fn user_input_or_turn_inner(
         })
         .await;
     }
+    // Re-evaluate the shared ChatGPT account-pool selection at each user-turn boundary so
+    // service-side enable/disable/validate changes take effect before work starts. When no
+    // eligible account remains, the login layer logs out the stale active auth and we abort this
+    // turn with an error instead of running with credentials the pool no longer allows.
+    if let Err(err) = sess
+        .services
+        .auth_manager
+        .prepare_chatgpt_account_pool_for_turn()
+        .await
+    {
+        sess.send_event_raw(Event {
+            id: sub_id.clone(),
+            msg: EventMsg::Error(ErrorEvent {
+                message: err.to_string(),
+                codex_error_info: Some(CodexErrorInfo::Other),
+            }),
+        })
+        .await;
+        return;
+    }
     sess.maybe_emit_unknown_model_warning_for_turn(current_context.as_ref())
         .await;
     let accepted_items = match sess
