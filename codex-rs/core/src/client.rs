@@ -65,6 +65,8 @@ use codex_app_server_protocol::AuthMode;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::RefreshTokenError;
+use codex_login::RefreshTokenFailedError;
+use codex_login::RefreshTokenFailedReason;
 use codex_login::UnauthorizedRecovery;
 use codex_login::default_client::build_reqwest_client;
 use codex_otel::SessionTelemetry;
@@ -2086,6 +2088,28 @@ async fn handle_unauthorized(
         debug.auth_error.as_deref(),
         debug.auth_error_code.as_deref(),
     );
+
+    // If recovery was available but is now exhausted and the server is still
+    // returning 401, the token is permanently broken. Surface this as
+    // RefreshTokenFailed so the account pool failover in the turn loop fires
+    // and marks the account, rather than letting UnexpectedStatus(401) slip
+    // through the failover arm undetected.
+    if let Some(recovery) = auth_recovery.as_ref()
+        && !recovery.has_next()
+        && let TransportError::Http { status, .. } = &transport
+        && *status == StatusCode::UNAUTHORIZED
+    {
+        let reason = match debug.auth_error_code.as_deref() {
+            Some("token_invalidated") => RefreshTokenFailedReason::Revoked,
+            _ => RefreshTokenFailedReason::Other,
+        };
+        let message = debug.auth_error.clone().unwrap_or_else(|| {
+            "Authentication failed after all recovery steps were exhausted.".to_string()
+        });
+        return Err(CodexErr::RefreshTokenFailed(RefreshTokenFailedError::new(
+            reason, message,
+        )));
+    }
 
     Err(map_api_error(ApiError::Transport(transport)))
 }

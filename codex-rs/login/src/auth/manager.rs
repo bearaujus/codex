@@ -1237,7 +1237,7 @@ impl UnauthorizedRecovery {
                 }
             }
             UnauthorizedRecoveryStep::RefreshToken => {
-                self.manager.refresh_token_from_authority().await?;
+                self.manager.refresh_token_from_authority_forced().await?;
                 self.step = UnauthorizedRecoveryStep::Done;
                 return Ok(UnauthorizedRecoveryStepResult {
                     auth_state_changed: Some(true),
@@ -1951,7 +1951,9 @@ impl AuthManager {
                 tracing::info!("Skipping token refresh because auth changed after guarded reload.");
                 Ok(())
             }
-            ReloadOutcome::ReloadedNoChange => self.refresh_token_from_authority_impl().await,
+            ReloadOutcome::ReloadedNoChange => {
+                self.refresh_token_from_authority_impl(/*forced=*/ false).await
+            }
             ReloadOutcome::Skipped => {
                 Err(RefreshTokenError::Permanent(RefreshTokenFailedError::new(
                     RefreshTokenFailedReason::Other,
@@ -1966,16 +1968,33 @@ impl AuthManager {
     /// observe refreshed token. If the token refresh fails, returns the error to
     /// the caller.
     pub async fn refresh_token_from_authority(&self) -> Result<(), RefreshTokenError> {
+        self.refresh_token_from_authority_with_forced(/*forced=*/ false)
+            .await
+    }
+
+    /// Like [`refresh_token_from_authority`] but bypasses the "token looks
+    /// valid by expiry" short-circuit inside the pool-managed refresh path.
+    /// Call this when responding to a server-side 401 — the server has already
+    /// told us the token is invalid, so expiry-based skipping is wrong.
+    pub(crate) async fn refresh_token_from_authority_forced(&self) -> Result<(), RefreshTokenError> {
+        self.refresh_token_from_authority_with_forced(/*forced=*/ true)
+            .await
+    }
+
+    async fn refresh_token_from_authority_with_forced(
+        &self,
+        forced: bool,
+    ) -> Result<(), RefreshTokenError> {
         let _refresh_guard = self.refresh_lock.acquire().await.map_err(|_| {
             RefreshTokenError::Permanent(RefreshTokenFailedError::new(
                 RefreshTokenFailedReason::Other,
                 REFRESH_TOKEN_UNKNOWN_MESSAGE.to_string(),
             ))
         })?;
-        self.refresh_token_from_authority_impl().await
+        self.refresh_token_from_authority_impl(forced).await
     }
 
-    async fn refresh_token_from_authority_impl(&self) -> Result<(), RefreshTokenError> {
+    async fn refresh_token_from_authority_impl(&self, forced: bool) -> Result<(), RefreshTokenError> {
         tracing::info!("Refreshing token");
 
         let auth = match self.auth_cached() {
@@ -1993,7 +2012,7 @@ impl AuthManager {
         let result = if let Some((account_pool, chatgpt_auth, account_id)) =
             self.pool_managed_chatgpt_refresh_context(&auth).await?
         {
-            self.refresh_pool_managed_chatgpt_token(&account_pool, &chatgpt_auth, &account_id)
+            self.refresh_pool_managed_chatgpt_token(&account_pool, &chatgpt_auth, &account_id, forced)
                 .await
         } else {
             match auth {
@@ -2098,8 +2117,13 @@ impl AuthManager {
         account_pool: &ChatgptAccountPool,
         chatgpt_auth: &ChatgptAuth,
         account_id: &str,
+        // When true the expiry-based early-return is skipped. Pass true when
+        // the caller is responding to a server 401 — the server has already
+        // declared the token invalid, so an expiry check is unreliable.
+        forced: bool,
     ) -> Result<(), RefreshTokenError> {
-        if let Some(auth_dot_json) = chatgpt_auth.current_auth_json()
+        if !forced
+            && let Some(auth_dot_json) = chatgpt_auth.current_auth_json()
             && !ChatgptAccountPool::account_auth_needs_token_refresh(&auth_dot_json, Utc::now())
         {
             tracing::info!(
