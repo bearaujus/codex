@@ -520,17 +520,22 @@ impl ChatgptAccountPool {
             self.store_rate_limit_snapshot(account_id, snapshot, now_ts())
                 .await?;
         }
+        let now = now_ts();
+        // When we have no reset data, fall back to a 1-hour conservative cooldown
+        // rather than clearing whatever was already in the DB.
+        let cooldown_until = cooldown_until.unwrap_or(now + 3600);
         sqlx::query(
             r#"
             UPDATE accounts
-            SET updated_at = ?, cooldown_until = ?, cooldown_reason = ?, auth_status = ?
+            SET updated_at = ?,
+                cooldown_until = MAX(COALESCE(cooldown_until, 0), ?),
+                cooldown_reason = ?
             WHERE account_id = ?
             "#,
         )
-        .bind(now_ts())
+        .bind(now)
         .bind(cooldown_until)
-        .bind(Some("usage_limit_reached"))
-        .bind(ChatgptAccountPoolAuthStatus::Valid.as_str())
+        .bind("usage_limit_reached")
         .bind(account_id)
         .execute(&self.pool)
         .await?;
@@ -539,6 +544,25 @@ impl ChatgptAccountPool {
             "rate_limit_reached",
             format!(
                 "Rate limit reached for ChatGPT account {}",
+                account_suffix(account_id)
+            ),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn mark_account_auth_failed(
+        &self,
+        account_id: &str,
+        reason: &str,
+    ) -> Result<(), ChatgptAccountPoolError> {
+        self.update_auth_status(account_id, ChatgptAccountPoolAuthStatus::RefreshFailedPermanent)
+            .await?;
+        self.append_event(
+            Some(account_id),
+            "auth_failure_permanent",
+            format!(
+                "Permanent auth failure for ChatGPT account {}: {reason}",
                 account_suffix(account_id)
             ),
         )
@@ -581,7 +605,14 @@ impl ChatgptAccountPool {
         sqlx::query(
             r#"
             UPDATE accounts
-            SET updated_at = ?, cooldown_until = ?, cooldown_reason = ?, auth_status = ?
+            SET updated_at = ?,
+                cooldown_until = ?,
+                cooldown_reason = ?,
+                auth_status = CASE
+                    WHEN auth_status IN ('missing_secret', 'invalid', 'refresh_failed_permanent')
+                    THEN auth_status
+                    ELSE ?
+                END
             WHERE account_id = ?
             "#,
         )

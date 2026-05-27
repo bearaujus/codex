@@ -1836,6 +1836,46 @@ impl AuthManager {
         }
     }
 
+    pub async fn handle_chatgpt_account_pool_auth_failure(
+        &self,
+        safe_to_retry: bool,
+        error: &RefreshTokenFailedError,
+    ) -> Result<bool, ChatgptAccountPoolError> {
+        let Some(account_pool) = self.account_pool.as_ref() else {
+            return Ok(false);
+        };
+        let current_auth = self.auth_cached();
+        let Some(current_auth) = current_auth.as_ref() else {
+            return Ok(false);
+        };
+        if !matches!(current_auth, CodexAuth::Chatgpt(_)) {
+            return Ok(false);
+        }
+        let Some(account_id) = current_auth.get_account_id() else {
+            return Ok(false);
+        };
+        account_pool
+            .mark_account_auth_failed(&account_id, &error.to_string())
+            .await?;
+        if !safe_to_retry {
+            return Ok(false);
+        }
+        match account_pool
+            .resolve_turn_selection(
+                Some(account_id.as_str()),
+                /*current_refresh_failed_permanently*/ false,
+            )
+            .await?
+        {
+            ChatgptAccountPoolSelectionOutcome::Activated { auth, failover, .. } if failover => {
+                save_auth(&self.codex_home, &auth, self.auth_credentials_store_mode)?;
+                self.reload().await;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     pub fn unauthorized_recovery(self: &Arc<Self>) -> UnauthorizedRecovery {
         UnauthorizedRecovery::new(Arc::clone(self))
     }
