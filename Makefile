@@ -1,4 +1,4 @@
-.PHONY: build prod release install run clean check lint
+.PHONY: build prod release fmt check test lint install run clean
 
 # Build the release codex binary into ./bin (prod/release are back-compat aliases).
 build:
@@ -8,9 +8,17 @@ prod: build
 
 release: build
 
+# Format the Rust workspace with the repo-standard formatter.
+fmt:
+	powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/fmt.ps1
+
 # Inner dev loop: fast compile check (no optimized binary). Narrow with: make check p=codex-login
 check:
 	powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/check.ps1 $(p)
+
+# Run repo-standard tests. Narrow with: make test p=codex-login
+test:
+	powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/test.ps1 $(p)
 
 # Clippy with the repo's deny lints; run before committing. Narrow with: make lint p=codex-login
 lint:

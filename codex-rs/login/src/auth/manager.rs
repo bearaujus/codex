@@ -1344,9 +1344,19 @@ async fn load_startup_account_pool_auth(
         )
         .await
         .ok()?;
+    let managed_chatgpt_auth_loaded = managed_auth
+        .as_ref()
+        .is_some_and(|auth| matches!(auth, CodexAuth::Chatgpt(_)));
     match selection {
-        ChatgptAccountPoolSelectionOutcome::Unchanged
-        | ChatgptAccountPoolSelectionOutcome::NoEligibleAccounts => managed_auth,
+        ChatgptAccountPoolSelectionOutcome::Unchanged => managed_auth,
+        ChatgptAccountPoolSelectionOutcome::NoEligibleAccounts => {
+            if managed_chatgpt_auth_loaded
+                && let Err(err) = logout(codex_home, auth_credentials_store_mode)
+            {
+                tracing::warn!("failed to clear stale ChatGPT auth after pool selection: {err}");
+            }
+            None
+        }
         ChatgptAccountPoolSelectionOutcome::Activated { auth, .. } => {
             if save_auth(codex_home, &auth, auth_credentials_store_mode).is_err() {
                 return managed_auth;
