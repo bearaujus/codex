@@ -584,6 +584,27 @@ async fn resolve_turn_selection_keeps_current_selected_account() {
 }
 
 #[tokio::test]
+async fn resolve_turn_selection_reports_no_eligible_accounts_for_stale_current_account() {
+    let codex_home = TempDir::new().expect("tempdir");
+    let pool = ChatgptAccountPool::open(
+        codex_home.path().to_path_buf(),
+        AuthCredentialsStoreMode::File,
+        None,
+    )
+    .await
+    .expect("pool should open");
+
+    let selection = pool
+        .resolve_turn_selection(Some("workspace-stale"), false)
+        .await
+        .expect("selection should succeed");
+    assert_eq!(
+        selection,
+        ChatgptAccountPoolSelectionOutcome::NoEligibleAccounts
+    );
+}
+
+#[tokio::test]
 async fn resolve_turn_selection_skips_cooling_down_account_and_prefers_oldest_unused() {
     let codex_home = TempDir::new().expect("tempdir");
     let pool = ChatgptAccountPool::open(

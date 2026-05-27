@@ -193,6 +193,72 @@ async fn missing_auth_json_returns_none() {
 
 #[tokio::test]
 #[serial(codex_auth_env)]
+async fn startup_pool_selection_clears_stale_chatgpt_auth_when_pool_is_empty() {
+    let codex_home = tempdir().unwrap();
+    let _access_token_guard = remove_access_token_env_var();
+    let pool = ChatgptAccountPool::open(
+        codex_home.path().to_path_buf(),
+        AuthCredentialsStoreMode::File,
+        None,
+    )
+    .await
+    .expect("pool should open");
+    let _jwt = write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".to_string()),
+            chatgpt_account_id: Some(WORKSPACE_ID_ALLOWED.to_string()),
+        },
+        codex_home.path(),
+    )
+    .expect("failed to write auth file");
+    let mut pool_managed_auth = CodexAuth::from_auth_storage(
+        codex_home.path(),
+        AuthCredentialsStoreMode::File,
+        /*chatgpt_base_url*/ None,
+    )
+    .await
+    .expect("auth load should succeed")
+    .expect("managed auth should exist")
+    .get_current_auth_json()
+    .expect("auth json should exist");
+    pool_managed_auth
+        .tokens
+        .as_mut()
+        .expect("tokens should exist")
+        .account_id = Some(WORKSPACE_ID_ALLOWED.to_string());
+    save_auth(
+        codex_home.path(),
+        &pool_managed_auth,
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("updated auth should save");
+    let managed_auth = CodexAuth::from_auth_storage(
+        codex_home.path(),
+        AuthCredentialsStoreMode::File,
+        /*chatgpt_base_url*/ None,
+    )
+    .await
+    .expect("auth reload should succeed");
+
+    let selected_auth = load_startup_account_pool_auth(
+        codex_home.path(),
+        AuthCredentialsStoreMode::File,
+        /*chatgpt_base_url*/ None,
+        managed_auth,
+        Some(&pool),
+    )
+    .await;
+
+    assert_eq!(selected_auth, None);
+    assert!(
+        !get_auth_file(codex_home.path()).exists(),
+        "stale auth.json should be removed when the pool has no eligible accounts"
+    );
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
 async fn pro_account_with_no_api_key_uses_chatgpt_auth() {
     let codex_home = tempdir().unwrap();
     let _access_token_guard = remove_access_token_env_var();

@@ -447,7 +447,11 @@ impl ChatgptAccountPool {
         let selected_account_id = self.selected_account_id().await?;
         let accounts = self.list_accounts().await?;
         if accounts.is_empty() {
-            return Ok(ChatgptAccountPoolSelectionOutcome::Unchanged);
+            return Ok(if current_account_id.is_some() {
+                ChatgptAccountPoolSelectionOutcome::NoEligibleAccounts
+            } else {
+                ChatgptAccountPoolSelectionOutcome::Unchanged
+            });
         }
         let now = now_ts();
         if let Some(selected_account_id) = selected_account_id.as_deref()
