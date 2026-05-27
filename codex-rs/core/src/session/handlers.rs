@@ -199,22 +199,6 @@ pub(super) async fn user_input_or_turn_inner(
     else {
         unreachable!();
     };
-    if let Err(err) = sess
-        .services
-        .auth_manager
-        .prepare_chatgpt_account_pool_for_turn()
-        .await
-    {
-        sess.send_event_raw(Event {
-            id: sub_id,
-            msg: EventMsg::Error(ErrorEvent {
-                message: err.to_string(),
-                codex_error_info: Some(CodexErrorInfo::Other),
-            }),
-        })
-        .await;
-        return;
-    }
     let emit_thread_settings_applied = thread_settings != ThreadSettingsOverrides::default();
     let mut updates = if emit_thread_settings_applied {
         thread_settings_update(sess, thread_settings).await

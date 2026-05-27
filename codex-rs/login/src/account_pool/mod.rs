@@ -51,6 +51,27 @@ const POOL_DB_FILE: &str = "accounts.sqlite";
 const SECRET_ROOT_DIR: &str = "auth";
 const EVENT_LIMIT_DEFAULT: i64 = 100;
 
+/// Returns the path to the account-pool SQLite database for the given
+/// `codex_home`. External services that append accounts while the CLI is
+/// running should open this file with WAL journal mode and write through the
+/// same schema (use [`ChatgptAccountPool::open`] from the same crate).
+pub fn account_pool_db_path(codex_home: &Path) -> PathBuf {
+    pool_db_path(codex_home)
+}
+
+/// Returns the directory where the per-account auth secret (auth.json) is
+/// stored for `account_id`. The directory is nested under
+/// `<codex_home>/account-pool/auth/<sha256_prefix>/`.
+///
+/// An external service registering a new account must write a valid `auth.json`
+/// into this directory **before** inserting the row into the `accounts` table,
+/// so the CLI never sees an account without its credentials.
+pub fn account_pool_secret_dir(codex_home: &Path, account_id: &str) -> PathBuf {
+    pool_root_dir(codex_home)
+        .join(SECRET_ROOT_DIR)
+        .join(hash_fragment(account_id))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ChatgptAccountPoolError {
     #[error(transparent)]
