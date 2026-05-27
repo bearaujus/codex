@@ -1021,6 +1021,34 @@ async fn run_sampling_request(
                 }
                 return Err(CodexErr::UsageLimitReached(e));
             }
+            Err(SamplingRequestError {
+                error: CodexErr::RefreshTokenFailed(e),
+                assistant_output_seen,
+                tool_execution_seen,
+            }) => {
+                let safe_to_retry = !assistant_output_seen && !tool_execution_seen;
+                match sess
+                    .services
+                    .auth_manager
+                    .handle_chatgpt_account_pool_auth_failure(safe_to_retry, &e)
+                    .await
+                {
+                    Ok(true) => {
+                        sess.services
+                            .auth_manager
+                            .record_account_pool_activity()
+                            .await;
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(err) => {
+                        tracing::warn!(
+                            "failed to process ChatGPT account-pool auth failover: {err}"
+                        );
+                    }
+                }
+                return Err(CodexErr::RefreshTokenFailed(e));
+            }
             Err(err) => err.error,
         };
 
