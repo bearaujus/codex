@@ -793,16 +793,12 @@ async fn load_auth(
 }
 
 // Persist refreshed tokens into auth storage and update last_refresh.
-fn persist_tokens(
-    storage: &Arc<dyn AuthStorageBackend>,
+fn apply_refreshed_tokens(
+    mut auth_dot_json: AuthDotJson,
     id_token: Option<String>,
     access_token: Option<String>,
     refresh_token: Option<String>,
 ) -> std::io::Result<AuthDotJson> {
-    let mut auth_dot_json = storage
-        .load()?
-        .ok_or(std::io::Error::other("Token data is not available."))?;
-
     let tokens = auth_dot_json.tokens.get_or_insert_with(TokenData::default);
     if let Some(id_token) = id_token {
         tokens.id_token = parse_chatgpt_jwt_claims(&id_token).map_err(std::io::Error::other)?;
@@ -814,6 +810,21 @@ fn persist_tokens(
         tokens.refresh_token = refresh_token;
     }
     auth_dot_json.last_refresh = Some(Utc::now());
+    Ok(auth_dot_json)
+}
+
+// Persist refreshed tokens into auth storage and update last_refresh.
+fn persist_tokens(
+    storage: &Arc<dyn AuthStorageBackend>,
+    id_token: Option<String>,
+    access_token: Option<String>,
+    refresh_token: Option<String>,
+) -> std::io::Result<AuthDotJson> {
+    let auth_dot_json = storage
+        .load()?
+        .ok_or(std::io::Error::other("Token data is not available."))?;
+    let auth_dot_json =
+        apply_refreshed_tokens(auth_dot_json, id_token, access_token, refresh_token)?;
     storage.save(&auth_dot_json)?;
     Ok(auth_dot_json)
 }
@@ -2082,15 +2093,15 @@ impl AuthManager {
         }
 
         let result = async {
-            let auth_dot_json = chatgpt_auth
-                .storage()
-                .load()
-                .map_err(RefreshTokenError::Transient)?
-                .ok_or_else(|| {
-                    RefreshTokenError::Transient(std::io::Error::other(
-                        "Token data is not available.",
-                    ))
-                })?;
+            let pool_secret_home = account_pool_secret_dir(&self.codex_home, account_id);
+            let auth_dot_json =
+                load_auth_dot_json(&pool_secret_home, AuthCredentialsStoreMode::File)
+                    .map_err(RefreshTokenError::Transient)?
+                    .ok_or_else(|| {
+                        RefreshTokenError::Transient(std::io::Error::other(format!(
+                            "pool auth secret missing for account {account_id}",
+                        )))
+                    })?;
             let loaded_account_id = auth_dot_json
                 .tokens
                 .as_ref()
@@ -2102,31 +2113,34 @@ impl AuthManager {
                 )));
             }
             if !ChatgptAccountPool::account_auth_needs_token_refresh(&auth_dot_json, Utc::now()) {
-                self.reload().await;
+                self.reload_active_auth_from_pool_copy(account_id).await?;
                 return Ok(());
             }
             let refresh_token = auth_dot_json
                 .tokens
+                .as_ref()
                 .ok_or_else(|| {
                     RefreshTokenError::Transient(std::io::Error::other(
                         "Token data is not available.",
                     ))
                 })?
-                .refresh_token;
+                .refresh_token
+                .clone();
             let refresh_response =
                 request_chatgpt_token_refresh(refresh_token, chatgpt_auth.client()).await?;
-            let persisted_auth = persist_tokens(
-                chatgpt_auth.storage(),
+            let persisted_auth = apply_refreshed_tokens(
+                auth_dot_json,
                 refresh_response.id_token,
                 refresh_response.access_token,
                 refresh_response.refresh_token,
             )
-            .map_err(RefreshTokenError::from)?;
-            self.reload().await;
+            .map_err(RefreshTokenError::Transient)?;
             account_pool
                 .persist_refreshed_account_auth(account_id, &persisted_auth)
                 .await
-                .map_err(|err| RefreshTokenError::Transient(std::io::Error::other(err)))
+                .map_err(|err| RefreshTokenError::Transient(std::io::Error::other(err)))?;
+            self.reload_active_auth_from_pool_copy(account_id).await?;
+            Ok(())
         }
         .await;
 

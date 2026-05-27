@@ -513,6 +513,14 @@ debug = "limited"
 inherits = "test"
 opt-level = 0
 
+# Local daily-driver builds. Fat LTO + a single codegen unit exist to shrink the
+# shipped binary; dropping them cuts build time ~2-4x with no meaningful runtime
+# cost for an IO-bound CLI.
+[profile.fast]
+inherits = "release"
+lto = false
+codegen-units = 256
+
 [patch.crates-io]
 # Uncomment to debug local changes.
 # ratatui = { path = "../../ratatui" }

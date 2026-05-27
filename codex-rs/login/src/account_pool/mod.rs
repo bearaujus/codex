@@ -41,8 +41,6 @@ use crate::AuthDotJson;
 use crate::CodexAuth;
 use crate::default_client::get_codex_user_agent;
 use crate::load_auth_dot_json;
-#[cfg(test)]
-use crate::logout;
 use crate::save_auth;
 
 const DEFAULT_CHATGPT_BACKEND_BASE_URL: &str = "https://chatgpt.com/backend-api";
@@ -430,44 +428,6 @@ impl ChatgptAccountPool {
         self.account_by_id(account_id)
             .await?
             .ok_or_else(|| ChatgptAccountPoolError::AccountNotFound(account_id.to_string()))
-    }
-
-    #[cfg(test)]
-    async fn remove_account(&self, account_id: &str) -> Result<bool, ChatgptAccountPoolError> {
-        let selected_account_id = self.selected_account_id().await?;
-        let default_account_id = self.default_account_id().await?;
-        let removed_rows = sqlx::query("DELETE FROM accounts WHERE account_id = ?")
-            .bind(account_id)
-            .execute(&self.pool)
-            .await?
-            .rows_affected();
-        if removed_rows == 0 {
-            return Ok(false);
-        }
-        sqlx::query("DELETE FROM account_rate_limits WHERE account_id = ?")
-            .bind(account_id)
-            .execute(&self.pool)
-            .await?;
-        let _ = logout(
-            &self.secret_codex_home(account_id),
-            self.auth_credentials_store_mode,
-        )?;
-        if selected_account_id.as_deref() == Some(account_id) {
-            let replacement = self.best_default_replacement().await?;
-            self.set_selected_account_id(replacement.as_deref(), /*change_default*/ false)
-                .await?;
-        }
-        if default_account_id.as_deref() == Some(account_id) {
-            let replacement = self.best_default_replacement().await?;
-            self.set_default_account_id(replacement.as_deref()).await?;
-        }
-        self.append_event(
-            Some(account_id),
-            "account_removed",
-            format!("Removed ChatGPT account {}", account_suffix(account_id)),
-        )
-        .await?;
-        Ok(true)
     }
 
     pub async fn resolve_turn_selection(
@@ -972,15 +932,6 @@ impl ChatgptAccountPool {
             .await?
             .into_iter()
             .find(|account| account.account_id == account_id))
-    }
-
-    #[cfg(test)]
-    async fn best_default_replacement(&self) -> Result<Option<String>, ChatgptAccountPoolError> {
-        let accounts = self.list_accounts().await?;
-        let now = now_ts();
-        Ok(select_best_account(&accounts, now)
-            .map(str::to_string)
-            .or_else(|| accounts.first().map(|account| account.account_id.clone())))
     }
 
     async fn update_auth_status(
