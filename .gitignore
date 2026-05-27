@@ -12,6 +12,7 @@ dist/
 bazel-*
 user.bazelrc
 build/
+bin/
 out/
 storybook-static/
 

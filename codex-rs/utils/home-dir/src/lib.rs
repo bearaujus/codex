@@ -23,15 +23,21 @@ fn find_codex_home_from_env(codex_home_env: Option<&str>) -> std::io::Result<Abs
     match codex_home_env {
         Some(val) => {
             let path = PathBuf::from(val);
-            let metadata = std::fs::metadata(&path).map_err(|err| match err.kind() {
-                std::io::ErrorKind::NotFound => std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("CODEX_HOME points to {val:?}, but that path does not exist"),
-                ),
-                _ => std::io::Error::new(
+            // Auto-create the directory so that workspace paths can be specified
+            // without requiring a manual `mkdir` beforehand.
+            if !path.exists() {
+                std::fs::create_dir_all(&path).map_err(|err| {
+                    std::io::Error::new(
+                        err.kind(),
+                        format!("failed to create CODEX_HOME {val:?}: {err}"),
+                    )
+                })?;
+            }
+            let metadata = std::fs::metadata(&path).map_err(|err| {
+                std::io::Error::new(
                     err.kind(),
                     format!("failed to read CODEX_HOME {val:?}: {err}"),
-                ),
+                )
             })?;
 
             if !metadata.is_dir() {
@@ -73,19 +79,16 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn find_codex_home_env_missing_path_is_fatal() {
+    fn find_codex_home_env_missing_path_is_auto_created() {
         let temp_home = TempDir::new().expect("temp home");
-        let missing = temp_home.path().join("missing-codex-home");
+        let missing = temp_home.path().join("new-codex-home");
         let missing_str = missing
             .to_str()
             .expect("missing codex home path should be valid utf-8");
 
-        let err = find_codex_home_from_env(Some(missing_str)).expect_err("missing CODEX_HOME");
-        assert_eq!(err.kind(), ErrorKind::NotFound);
-        assert!(
-            err.to_string().contains("CODEX_HOME"),
-            "unexpected error: {err}"
-        );
+        let resolved =
+            find_codex_home_from_env(Some(missing_str)).expect("should auto-create missing dir");
+        assert!(resolved.as_path().is_dir());
     }
 
     #[test]

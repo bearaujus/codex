@@ -1,5 +1,4 @@
 use super::*;
-
 // Duration before a browser ChatGPT login attempt is abandoned.
 const LOGIN_CHATGPT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 // The override is intentionally available only in debug builds, matching the login path below.
