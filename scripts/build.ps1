@@ -6,6 +6,9 @@ $RepoRoot = Split-Path -Parent $PSScriptRoot
 $RsDir    = Join-Path $RepoRoot 'codex-rs'
 $BinDir   = Join-Path $RepoRoot 'bin'
 
+. (Join-Path $PSScriptRoot 'rust-env.ps1')
+Enable-SccacheIfAvailable
+
 New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
 
 Push-Location $RsDir

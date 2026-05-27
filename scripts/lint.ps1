@@ -4,6 +4,9 @@ param([string]$Crate)
 $ErrorActionPreference = 'Stop'
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'rust-env.ps1')
+Enable-SccacheIfAvailable
+
 Push-Location (Join-Path $RepoRoot 'codex-rs')
 try {
     if ($Crate) { cargo clippy -p $Crate --all-targets } else { cargo clippy --workspace --all-targets }
