@@ -39,6 +39,7 @@ use crate::responses_retry::ResponsesStreamRequest;
 use crate::responses_retry::handle_retryable_response_stream_error;
 use crate::session::PreviousTurnSettings;
 use crate::session::TurnInput;
+use crate::session::account_pool_activity::AccountPoolActivityHeartbeat;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::stream_events_utils::HandleOutputCtx;
@@ -139,6 +140,11 @@ pub(crate) async fn run_turn(
 ) -> Option<String> {
     let mut client_session =
         prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
+    let _account_pool_activity_heartbeat = AccountPoolActivityHeartbeat::start(
+        Arc::clone(&sess.services.auth_manager),
+        &cancellation_token,
+    )
+    .await;
     // TODO(ccunningham): Pre-turn compaction runs before context updates and the
     // new user message are recorded. Estimate pending incoming items (context
     // diffs/full reinjection + user input) and trigger compaction preemptively
@@ -980,7 +986,13 @@ async fn run_sampling_request(
                     )
                     .await
                 {
-                    Ok(true) => continue,
+                    Ok(true) => {
+                        sess.services
+                            .auth_manager
+                            .record_account_pool_activity()
+                            .await;
+                        continue;
+                    }
                     Ok(false) => {}
                     Err(err) => {
                         tracing::warn!("failed to process ChatGPT account-pool failover: {err}");

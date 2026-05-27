@@ -191,6 +191,7 @@ use codex_protocol::error::Result as CodexResult;
 #[cfg(test)]
 use codex_protocol::exec_output::StreamOutput;
 
+mod account_pool_activity;
 mod config_lock;
 mod handlers;
 mod input_queue;
