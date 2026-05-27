@@ -18,8 +18,6 @@ pub use server::ServerOptions;
 pub use server::ShutdownHandle;
 pub use server::run_login_server;
 
-pub use account_pool::AccountRegistrationServer;
-pub use account_pool::AccountRegistrationStart;
 pub use account_pool::ChatgptAccountEvent;
 pub use account_pool::ChatgptAccountPool;
 pub use account_pool::ChatgptAccountPoolAccount;
@@ -29,7 +27,6 @@ pub use account_pool::ChatgptAccountPoolRateLimitEntry;
 pub use account_pool::ChatgptAccountPoolSelectionOutcome;
 pub use account_pool::account_pool_db_path;
 pub use account_pool::account_pool_secret_dir;
-pub use account_pool::run_account_registration_server;
 pub use auth::AuthConfig;
 pub use auth::AuthDotJson;
 pub use auth::AuthManager;

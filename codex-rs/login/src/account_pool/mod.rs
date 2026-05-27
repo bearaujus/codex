@@ -1,5 +1,4 @@
 mod activity;
-mod registration;
 mod token_refresh;
 
 use std::collections::BTreeMap;
@@ -42,12 +41,9 @@ use crate::AuthDotJson;
 use crate::CodexAuth;
 use crate::default_client::get_codex_user_agent;
 use crate::load_auth_dot_json;
+#[cfg(test)]
 use crate::logout;
 use crate::save_auth;
-
-pub use registration::AccountRegistrationServer;
-pub use registration::AccountRegistrationStart;
-pub use registration::run_account_registration_server;
 
 const DEFAULT_CHATGPT_BACKEND_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const POOL_DB_DIR: &str = "account-pool";
@@ -162,6 +158,10 @@ pub struct ChatgptAccountPoolRateLimitEntry {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "boxing Activated.auth would change the public login API"
+)]
 pub enum ChatgptAccountPoolSelectionOutcome {
     Unchanged,
     Activated {
@@ -326,7 +326,7 @@ impl ChatgptAccountPool {
             .collect())
     }
 
-    pub async fn register_account(
+    async fn register_account(
         &self,
         auth: &AuthDotJson,
     ) -> Result<ChatgptAccountPoolAccount, ChatgptAccountPoolError> {
@@ -413,7 +413,8 @@ impl ChatgptAccountPool {
         }
     }
 
-    pub async fn select_account(
+    #[cfg(test)]
+    async fn select_account(
         &self,
         account_id: &str,
     ) -> Result<ChatgptAccountPoolAccount, ChatgptAccountPoolError> {
@@ -431,7 +432,8 @@ impl ChatgptAccountPool {
             .ok_or_else(|| ChatgptAccountPoolError::AccountNotFound(account_id.to_string()))
     }
 
-    pub async fn remove_account(&self, account_id: &str) -> Result<bool, ChatgptAccountPoolError> {
+    #[cfg(test)]
+    async fn remove_account(&self, account_id: &str) -> Result<bool, ChatgptAccountPoolError> {
         let selected_account_id = self.selected_account_id().await?;
         let default_account_id = self.default_account_id().await?;
         let removed_rows = sqlx::query("DELETE FROM accounts WHERE account_id = ?")
@@ -972,6 +974,7 @@ impl ChatgptAccountPool {
             .find(|account| account.account_id == account_id))
     }
 
+    #[cfg(test)]
     async fn best_default_replacement(&self) -> Result<Option<String>, ChatgptAccountPoolError> {
         let accounts = self.list_accounts().await?;
         let now = now_ts();
@@ -1093,7 +1096,7 @@ fn is_account_eligible(account: &ChatgptAccountPoolAccount, now: i64) -> bool {
             .is_none_or(|cooldown_until| cooldown_until <= now)
 }
 
-fn select_best_account<'a>(accounts: &'a [ChatgptAccountPoolAccount], now: i64) -> Option<&'a str> {
+fn select_best_account(accounts: &[ChatgptAccountPoolAccount], now: i64) -> Option<&str> {
     accounts
         .iter()
         .filter(|account| is_account_eligible(account, now))
@@ -1153,11 +1156,14 @@ fn remaining_percent(snapshot: &RateLimitSnapshot, cooldown_active: bool) -> Opt
     if let Some(secondary) = snapshot.secondary.as_ref() {
         remaining.push((100.0 - secondary.used_percent).floor() as i64);
     }
-    snapshot
+    if snapshot
         .credits
         .as_ref()
         .filter(|credits| !credits.unlimited && !credits.has_credits)
-        .map(|_| remaining.push(0));
+        .is_some()
+    {
+        remaining.push(0);
+    }
     if remaining.is_empty() {
         None
     } else {
@@ -1258,7 +1264,7 @@ fn rate_limit_snapshots_from_payload(payload: RateLimitStatusPayload) -> Vec<Rat
         /*limit_name*/ None,
         payload.rate_limit.flatten().map(|details| *details),
         payload.credits.flatten().map(|details| *details),
-        plan_type.clone(),
+        plan_type,
         rate_limit_reached_type,
     )];
     if let Some(additional) = payload.additional_rate_limits.flatten() {
@@ -1268,7 +1274,7 @@ fn rate_limit_snapshots_from_payload(payload: RateLimitStatusPayload) -> Vec<Rat
                 Some(details.limit_name),
                 details.rate_limit.flatten().map(|rate_limit| *rate_limit),
                 /*credits*/ None,
-                plan_type.clone(),
+                plan_type,
                 /*rate_limit_reached_type*/ None,
             )
         }));

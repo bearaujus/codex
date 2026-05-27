@@ -771,13 +771,22 @@ async fn persist_refreshed_account_auth_updates_pool_secret_and_ack() {
     .fetch_one(&pool.pool)
     .await
     .expect("refresh event should load");
-    assert_eq!(event.get::<Option<String>, _>("account_id"), Some("workspace-refresh".to_string()));
-    assert_eq!(event.get::<String, _>("event_type"), "account_auth_refreshed".to_string());
+    assert_eq!(
+        event.get::<Option<String>, _>("account_id"),
+        Some("workspace-refresh".to_string())
+    );
+    assert_eq!(
+        event.get::<String, _>("event_type"),
+        "account_auth_refreshed".to_string()
+    );
 }
 
 #[test]
 fn account_auth_needs_token_refresh_respects_access_token_expiration() {
-    let now = Utc.timestamp_opt(1_900, 0).single().expect("valid timestamp");
+    let now = Utc
+        .timestamp_opt(1_900, 0)
+        .single()
+        .expect("valid timestamp");
 
     let mut future_auth = chatgpt_auth("future@example.com", "workspace-exp", "pro");
     future_auth
