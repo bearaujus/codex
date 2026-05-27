@@ -1,8 +1,11 @@
+mod activity;
 mod registration;
+mod token_refresh;
 
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use chrono::DateTime;
 use chrono::Utc;
@@ -32,6 +35,7 @@ use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::sqlite::SqliteJournalMode;
 use sqlx::sqlite::SqlitePoolOptions;
+use sqlx::sqlite::SqliteSynchronous;
 
 use crate::AuthCredentialsStoreMode;
 use crate::AuthDotJson;
@@ -50,6 +54,7 @@ const POOL_DB_DIR: &str = "account-pool";
 const POOL_DB_FILE: &str = "accounts.sqlite";
 const SECRET_ROOT_DIR: &str = "auth";
 const EVENT_LIMIT_DEFAULT: i64 = 100;
+const ACCOUNT_POOL_SCHEMA_VERSION: &str = "1";
 
 /// Returns the path to the account-pool SQLite database for the given
 /// `codex_home`. External services that append accounts while the CLI is
@@ -66,6 +71,10 @@ pub fn account_pool_db_path(codex_home: &Path) -> PathBuf {
 /// An external service registering a new account must write a valid `auth.json`
 /// into this directory **before** inserting the row into the `accounts` table,
 /// so the CLI never sees an account without its credentials.
+///
+/// Cross-language services can interoperate only when the pool is configured
+/// with [`AuthCredentialsStoreMode::File`]; other modes may store credentials
+/// outside this directory.
 pub fn account_pool_secret_dir(codex_home: &Path, account_id: &str) -> PathBuf {
     pool_root_dir(codex_home)
         .join(SECRET_ROOT_DIR)
@@ -190,11 +199,20 @@ impl ChatgptAccountPool {
         auth_credentials_store_mode: AuthCredentialsStoreMode,
         chatgpt_base_url: Option<String>,
     ) -> Result<Self, ChatgptAccountPoolError> {
+        if auth_credentials_store_mode != AuthCredentialsStoreMode::File {
+            tracing::warn!(
+                auth_credentials_store_mode = ?auth_credentials_store_mode,
+                "ChatGPT account pool interop requires File credential storage; \
+                external account services cannot read secrets from non-File stores"
+            );
+        }
         std::fs::create_dir_all(pool_root_dir(&codex_home))?;
         let connect_options = SqliteConnectOptions::new()
             .filename(pool_db_path(&codex_home))
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .busy_timeout(Duration::from_secs(5))
             .foreign_keys(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -703,6 +721,67 @@ impl ChatgptAccountPool {
             )
             "#,
         )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS account_usage_history (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id    TEXT NOT NULL,
+                limit_id      TEXT NOT NULL,
+                snapshot_json TEXT NOT NULL,
+                fetched_at    INTEGER NOT NULL
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_usage_history_acct_time
+                ON account_usage_history (account_id, fetched_at);
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS account_activity (
+                account_id   TEXT NOT NULL,
+                owner_pid    INTEGER NOT NULL,
+                host         TEXT NOT NULL,
+                started_at   INTEGER NOT NULL,
+                heartbeat_at INTEGER NOT NULL,
+                expires_at   INTEGER NOT NULL,
+                PRIMARY KEY (account_id, owner_pid, host)
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS account_token_locks (
+                account_id  TEXT PRIMARY KEY,
+                locked_by   TEXT NOT NULL,
+                acquired_at INTEGER NOT NULL,
+                expires_at  INTEGER NOT NULL
+            );
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO pool_state (key, value)
+            VALUES ('schema_version', ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value
+            WHERE pool_state.value IS NULL
+                OR CAST(pool_state.value AS INTEGER) < CAST(excluded.value AS INTEGER)
+            "#,
+        )
+        .bind(ACCOUNT_POOL_SCHEMA_VERSION)
         .execute(&self.pool)
         .await?;
         Ok(())
