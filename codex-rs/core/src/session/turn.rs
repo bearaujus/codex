@@ -192,6 +192,7 @@ pub(crate) async fn run_turn(
     track_turn_resolved_config_analytics(&sess, &turn_context, &input).await;
 
     let mut last_agent_message: Option<String> = None;
+    let mut turn_completed_successfully = false;
     let mut stop_hook_active = false;
     // Although from the perspective of codex.rs, TurnDiffTracker has the lifecycle of a Task which contains
     // many turns, from the perspective of the user, it is a single turn.
@@ -345,6 +346,7 @@ pub(crate) async fn run_turn(
                         }
                     }
                     if stop_outcome.should_stop {
+                        turn_completed_successfully = true;
                         break;
                     }
                     if run_legacy_after_agent_hook(
@@ -357,6 +359,7 @@ pub(crate) async fn run_turn(
                     {
                         return None;
                     }
+                    turn_completed_successfully = true;
                     break;
                 }
                 continue;
@@ -401,6 +404,13 @@ pub(crate) async fn run_turn(
                 break;
             }
         }
+    }
+
+    if turn_completed_successfully {
+        sess.services
+            .auth_manager
+            .record_account_pool_activity()
+            .await;
     }
 
     last_agent_message

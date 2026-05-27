@@ -124,7 +124,7 @@ impl ChatgptAccountPool {
                 locked_by = excluded.locked_by,
                 acquired_at = excluded.acquired_at,
                 expires_at = excluded.expires_at
-            WHERE account_token_locks.expires_at < excluded.acquired_at
+            WHERE account_token_locks.expires_at <= excluded.acquired_at
             "#,
         )
         .bind(account_id)
