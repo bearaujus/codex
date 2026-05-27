@@ -1857,6 +1857,7 @@ impl AuthManager {
         account_pool
             .mark_account_auth_failed(&account_id, &error.to_string())
             .await?;
+        self.record_permanent_refresh_failure_if_unchanged(current_auth, error);
         if !safe_to_retry {
             return Ok(false);
         }
@@ -1952,7 +1953,8 @@ impl AuthManager {
                 Ok(())
             }
             ReloadOutcome::ReloadedNoChange => {
-                self.refresh_token_from_authority_impl(/*forced=*/ false).await
+                self.refresh_token_from_authority_impl(/*forced=*/ false)
+                    .await
             }
             ReloadOutcome::Skipped => {
                 Err(RefreshTokenError::Permanent(RefreshTokenFailedError::new(
@@ -1976,7 +1978,9 @@ impl AuthManager {
     /// valid by expiry" short-circuit inside the pool-managed refresh path.
     /// Call this when responding to a server-side 401 — the server has already
     /// told us the token is invalid, so expiry-based skipping is wrong.
-    pub(crate) async fn refresh_token_from_authority_forced(&self) -> Result<(), RefreshTokenError> {
+    pub(crate) async fn refresh_token_from_authority_forced(
+        &self,
+    ) -> Result<(), RefreshTokenError> {
         self.refresh_token_from_authority_with_forced(/*forced=*/ true)
             .await
     }
@@ -1994,7 +1998,10 @@ impl AuthManager {
         self.refresh_token_from_authority_impl(forced).await
     }
 
-    async fn refresh_token_from_authority_impl(&self, forced: bool) -> Result<(), RefreshTokenError> {
+    async fn refresh_token_from_authority_impl(
+        &self,
+        forced: bool,
+    ) -> Result<(), RefreshTokenError> {
         tracing::info!("Refreshing token");
 
         let auth = match self.auth_cached() {
@@ -2012,8 +2019,13 @@ impl AuthManager {
         let result = if let Some((account_pool, chatgpt_auth, account_id)) =
             self.pool_managed_chatgpt_refresh_context(&auth).await?
         {
-            self.refresh_pool_managed_chatgpt_token(&account_pool, &chatgpt_auth, &account_id, forced)
-                .await
+            self.refresh_pool_managed_chatgpt_token(
+                &account_pool,
+                &chatgpt_auth,
+                &account_id,
+                forced,
+            )
+            .await
         } else {
             match auth {
                 CodexAuth::ChatgptAuthTokens(_) => {
@@ -2117,21 +2129,13 @@ impl AuthManager {
         account_pool: &ChatgptAccountPool,
         chatgpt_auth: &ChatgptAuth,
         account_id: &str,
-        // When true the expiry-based early-return is skipped. Pass true when
-        // the caller is responding to a server 401 — the server has already
-        // declared the token invalid, so an expiry check is unreliable.
+        // When true, the current in-memory token should not be trusted just
+        // because its expiry still looks fresh. Pass true when responding to a
+        // server 401. We still reload from the pool copy when another refresher
+        // already rotated the token.
         forced: bool,
     ) -> Result<(), RefreshTokenError> {
-        if !forced
-            && let Some(auth_dot_json) = chatgpt_auth.current_auth_json()
-            && !ChatgptAccountPool::account_auth_needs_token_refresh(&auth_dot_json, Utc::now())
-        {
-            tracing::info!(
-                "Skipping pool-managed token refresh because the access token is still valid."
-            );
-            return Ok(());
-        }
-
+        let cached_auth_dot_json = chatgpt_auth.current_auth_json();
         let owner = ChatgptAccountPool::token_refresh_lock_owner();
         let acquired = account_pool
             .try_acquire_token_refresh_lock(
@@ -2186,7 +2190,14 @@ impl AuthManager {
                     REFRESH_TOKEN_ACCOUNT_MISMATCH_MESSAGE.to_string(),
                 )));
             }
-            if !ChatgptAccountPool::account_auth_needs_token_refresh(&auth_dot_json, Utc::now()) {
+            let pool_auth_needs_refresh =
+                ChatgptAccountPool::account_auth_needs_token_refresh(&auth_dot_json, Utc::now());
+            let pool_auth_changed = cached_auth_dot_json.as_ref() != Some(&auth_dot_json);
+            if pool_auth_changed && !pool_auth_needs_refresh {
+                self.reload_active_auth_from_pool_copy(account_id).await?;
+                return Ok(());
+            }
+            if !forced && !pool_auth_needs_refresh {
                 self.reload_active_auth_from_pool_copy(account_id).await?;
                 return Ok(());
             }

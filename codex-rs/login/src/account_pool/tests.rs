@@ -659,6 +659,28 @@ async fn resolve_turn_selection_skips_cooling_down_account_and_prefers_oldest_un
     assert!(failover);
 }
 
+#[test]
+fn capacity_score_treats_missing_rate_limits_as_fresh() {
+    let account = ChatgptAccountPoolAccount {
+        account_id: "workspace-activity".to_string(),
+        email: Some("activity@example.com".to_string()),
+        plan_type: Some("pro".to_string()),
+        enabled: true,
+        is_default: false,
+        is_selected: false,
+        created_at: 1,
+        updated_at: 1,
+        last_used_at: None,
+        last_auth_refresh_at: None,
+        auth_status: ChatgptAccountPoolAuthStatus::Valid,
+        cooldown_until: None,
+        cooldown_reason: None,
+        rate_limits: BTreeMap::new(),
+    };
+
+    assert_eq!(capacity_score(&account, 1_000), (true, 100));
+}
+
 #[tokio::test]
 async fn token_refresh_lock_is_single_flight_and_releasable() {
     let codex_home = TempDir::new().expect("tempdir");
@@ -699,10 +721,10 @@ async fn token_refresh_lock_is_single_flight_and_releasable() {
             "workspace-lock",
             "host-c:1003",
             ChatgptAccountPool::token_refresh_lock_ttl(),
-            1_000 + ACCOUNT_TOKEN_REFRESH_LOCK_TTL_SECONDS + 1,
+            1_000 + ACCOUNT_TOKEN_REFRESH_LOCK_TTL_SECONDS,
         )
         .await
-        .expect("expired lock should be stealable")
+        .expect("lock should be stealable at the expiry boundary")
     );
 
     pool.release_token_refresh_lock("workspace-lock", "host-c:1003")

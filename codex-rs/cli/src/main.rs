@@ -46,6 +46,7 @@ mod app_cmd;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod desktop_app;
 mod doctor;
+mod info_cmd;
 mod marketplace_cmd;
 mod mcp_cmd;
 mod plugin_cmd;
@@ -59,6 +60,7 @@ use crate::plugin_cmd::PluginCli;
 use crate::plugin_cmd::PluginSubcommand;
 use crate::remote_control_cmd::RemoteControlCommand;
 use doctor::DoctorCommand;
+use info_cmd::InfoCommand;
 use state_db_recovery as local_state_db;
 
 use codex_config::LoaderOverrides;
@@ -165,6 +167,9 @@ enum Subcommand {
 
     /// Diagnose local Codex installation, config, auth, and runtime health.
     Doctor(DoctorCommand),
+
+    /// Print the client metadata and headers Codex derives for API requests.
+    Info(InfoCommand),
 
     /// Run commands within a Codex-provided sandbox.
     Sandbox(HostSandboxArgs),
@@ -983,6 +988,14 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                     plugin_cmd::run_plugin_remove(overrides, args).await?;
                 }
             }
+        }
+        Some(Subcommand::Info(info)) => {
+            reject_remote_mode_for_subcommand(
+                root_remote.as_deref(),
+                root_remote_auth_token_env.as_deref(),
+                "info",
+            )?;
+            info_cmd::run_info(info)?;
         }
         Some(Subcommand::AppServer(app_server_cli)) => {
             let AppServerCommand {
@@ -1914,6 +1927,7 @@ fn unsupported_subcommand_name_for_strict_config(
         Some(Subcommand::RemoteControl(remote_control)) => Some(remote_control.subcommand_name()),
         Some(Subcommand::Mcp(_)) => Some("mcp"),
         Some(Subcommand::Plugin(_)) => Some("plugin"),
+        Some(Subcommand::Info(_)) => Some("info"),
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         Some(Subcommand::App(_)) => Some("app"),
         Some(Subcommand::Login(_)) => Some("login"),
@@ -2297,6 +2311,7 @@ mod tests {
         let cli = MultitoolCli::try_parse_from(args).expect("parse");
         let MultitoolCli {
             interactive,
+            codex_home: _,
             config_overrides: root_overrides,
             subcommand,
             feature_toggles: _,
@@ -2330,6 +2345,7 @@ mod tests {
         let cli = MultitoolCli::try_parse_from(args).expect("parse");
         let MultitoolCli {
             interactive,
+            codex_home: _,
             config_overrides: root_overrides,
             subcommand,
             feature_toggles: _,
@@ -2418,6 +2434,16 @@ mod tests {
         assert!(args.last);
         assert_eq!(args.session_id, None);
         assert_eq!(args.prompt.as_deref(), Some("2+2"));
+    }
+
+    #[test]
+    fn info_command_accepts_json_flag() {
+        let cli = MultitoolCli::try_parse_from(["codex", "info", "--json"])
+            .expect("parse should succeed");
+        let Some(Subcommand::Info(InfoCommand { json })) = cli.subcommand else {
+            panic!("expected info subcommand");
+        };
+        assert!(json);
     }
 
     #[test]

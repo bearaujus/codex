@@ -443,6 +443,145 @@ async fn refresh_failure_is_scoped_to_the_matching_auth_snapshot() {
     assert_eq!(manager.refresh_failure_for_auth(&updated_auth), None);
 }
 
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn pool_managed_auth_failure_marks_cached_refresh_failure() {
+    let codex_home = tempdir().unwrap();
+    let _access_token_guard = remove_access_token_env_var();
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".to_string()),
+            chatgpt_account_id: Some(WORKSPACE_ID_ALLOWED.to_string()),
+        },
+        codex_home.path(),
+    )
+    .expect("failed to write auth file");
+    let mut auth_dot_json = load_auth_dot_json(codex_home.path(), AuthCredentialsStoreMode::File)
+        .expect("auth should load")
+        .expect("auth should exist");
+    auth_dot_json
+        .tokens
+        .as_mut()
+        .expect("tokens should exist")
+        .account_id = Some(WORKSPACE_ID_ALLOWED.to_string());
+    save_auth(
+        codex_home.path(),
+        &auth_dot_json,
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("updated auth should save");
+
+    let manager = AuthManager::new(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+        /*chatgpt_base_url*/ None,
+    )
+    .await;
+    let auth = manager.auth_cached().expect("auth should be cached");
+    let error = RefreshTokenFailedError::new(
+        RefreshTokenFailedReason::Exhausted,
+        "refresh token already used",
+    );
+
+    let failover = manager
+        .handle_chatgpt_account_pool_auth_failure(/*safe_to_retry*/ false, &error)
+        .await
+        .expect("auth failure handling should succeed");
+
+    assert!(!failover);
+    assert_eq!(manager.refresh_failure_for_auth(&auth), Some(error));
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn non_forced_pool_refresh_reloads_newer_pool_copy_even_when_cached_token_looks_fresh() {
+    let codex_home = tempdir().unwrap();
+    let _access_token_guard = remove_access_token_env_var();
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".to_string()),
+            chatgpt_account_id: Some(WORKSPACE_ID_ALLOWED.to_string()),
+        },
+        codex_home.path(),
+    )
+    .expect("failed to write auth file");
+
+    let mut active_auth_dot_json =
+        load_auth_dot_json(codex_home.path(), AuthCredentialsStoreMode::File)
+            .expect("auth should load")
+            .expect("auth should exist");
+    let initial_access_token =
+        fake_access_token(WORKSPACE_ID_ALLOWED, Utc::now().timestamp() + 3600);
+    let active_tokens = active_auth_dot_json
+        .tokens
+        .as_mut()
+        .expect("tokens should exist");
+    active_tokens.access_token = initial_access_token.clone();
+    active_tokens.account_id = Some(WORKSPACE_ID_ALLOWED.to_string());
+    save_auth(
+        codex_home.path(),
+        &active_auth_dot_json,
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("updated auth should save");
+
+    let manager = AuthManager::new(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+        /*chatgpt_base_url*/ None,
+    )
+    .await;
+    let cached_before = manager.auth_cached().expect("auth should be cached");
+    assert_eq!(
+        cached_before
+            .get_current_auth_json()
+            .expect("auth json should exist")
+            .tokens
+            .expect("tokens should exist")
+            .access_token,
+        initial_access_token
+    );
+
+    let pool_secret_home = crate::account_pool_secret_dir(codex_home.path(), WORKSPACE_ID_ALLOWED);
+    let mut pool_auth_dot_json =
+        load_auth_dot_json(&pool_secret_home, AuthCredentialsStoreMode::File)
+            .expect("pool auth should load")
+            .expect("pool auth should exist");
+    let reloaded_access_token =
+        fake_access_token(WORKSPACE_ID_ALLOWED, Utc::now().timestamp() + 7200);
+    pool_auth_dot_json
+        .tokens
+        .as_mut()
+        .expect("tokens should exist")
+        .access_token = reloaded_access_token.clone();
+    save_auth(
+        &pool_secret_home,
+        &pool_auth_dot_json,
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("pool auth should save");
+
+    manager
+        .refresh_token_from_authority()
+        .await
+        .expect("non-forced refresh should reload newer pool copy");
+
+    let cached_after = manager.auth_cached().expect("auth should remain cached");
+    assert_eq!(
+        cached_after
+            .get_current_auth_json()
+            .expect("auth json should exist")
+            .tokens
+            .expect("tokens should exist")
+            .access_token,
+        reloaded_access_token
+    );
+}
+
 #[test]
 fn external_auth_tokens_without_chatgpt_metadata_cannot_seed_chatgpt_auth() {
     let err = AuthDotJson::from_external_tokens(&ExternalAuthTokens::access_token_only(
@@ -719,6 +858,30 @@ fn fake_jwt_for_auth_file_params(params: &AuthFileParams) -> std::io::Result<Str
     let payload_b64 = b64(&serde_json::to_vec(&payload)?);
     let signature_b64 = b64(b"sig");
     Ok(format!("{header_b64}.{payload_b64}.{signature_b64}"))
+}
+
+fn fake_access_token(account_id: &str, exp: i64) -> String {
+    #[derive(Serialize)]
+    struct Header {
+        alg: &'static str,
+        typ: &'static str,
+    }
+
+    let header = Header {
+        alg: "none",
+        typ: "JWT",
+    };
+    let payload = json!({
+        "exp": exp,
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": account_id,
+        },
+    });
+    let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+    let header_b64 = b64(&serde_json::to_vec(&header).expect("header should serialize"));
+    let payload_b64 = b64(&serde_json::to_vec(&payload).expect("payload should serialize"));
+    let signature_b64 = b64(b"sig");
+    format!("{header_b64}.{payload_b64}.{signature_b64}")
 }
 
 async fn build_config(

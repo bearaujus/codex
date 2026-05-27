@@ -556,8 +556,11 @@ impl ChatgptAccountPool {
         account_id: &str,
         reason: &str,
     ) -> Result<(), ChatgptAccountPoolError> {
-        self.update_auth_status(account_id, ChatgptAccountPoolAuthStatus::RefreshFailedPermanent)
-            .await?;
+        self.update_auth_status(
+            account_id,
+            ChatgptAccountPoolAuthStatus::RefreshFailedPermanent,
+        )
+        .await?;
         self.append_event(
             Some(account_id),
             "auth_failure_permanent",
@@ -1104,12 +1107,15 @@ fn compare_account_capacity(
 }
 
 fn capacity_score(account: &ChatgptAccountPoolAccount, now: i64) -> (bool, i64) {
+    if account.rate_limits.is_empty() {
+        return (true, 100);
+    }
     let snapshot = account
         .rate_limits
         .get("codex")
         .or_else(|| account.rate_limits.values().next());
     let Some(snapshot) = snapshot else {
-        return (false, -1);
+        return (true, 100);
     };
     // Only treat rate_limit_reached_type as authoritative while the cooldown is
     // still active. Once the cooldown expires the stored snapshot may be stale
