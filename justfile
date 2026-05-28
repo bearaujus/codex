@@ -51,8 +51,12 @@ install:
 # Run `cargo install --locked cargo-nextest` if you don't have it installed.
 # Prefer this for routine local runs. Workspace crate features are banned, so
 # there should be no need to add `--all-features`.
-test *args:
+test-local *args:
     RUST_MIN_STACK={{ rust_min_stack }} cargo nextest run --no-fail-fast "$@"
+
+# Run the repo-standard local verification path: nextest plus benchmark smoke.
+test *args:
+    just test-local "$@"
     just bench-smoke
 
 # Run explicit workspace benchmark targets.

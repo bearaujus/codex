@@ -1754,6 +1754,57 @@ impl AuthManager {
         account_pool.record_account_activity(&account_id).await;
     }
 
+    pub async fn record_account_pool_rate_limits_fetch(&self, snapshots: &[RateLimitSnapshot]) {
+        if snapshots.is_empty() {
+            return;
+        }
+        let Some(account_pool) = self.account_pool.as_ref() else {
+            return;
+        };
+        let current_auth = self.auth_cached();
+        let account_id = current_auth
+            .as_ref()
+            .filter(|auth| matches!(auth, CodexAuth::Chatgpt(_)))
+            .and_then(CodexAuth::get_account_id);
+        let Some(account_id) = account_id else {
+            return;
+        };
+        if let Err(err) = account_pool
+            .record_fetched_rate_limits(&account_id, snapshots)
+            .await
+        {
+            tracing::warn!(
+                account_id,
+                error = %err,
+                "failed to persist fetched ChatGPT account-pool rate limits"
+            );
+        }
+    }
+
+    pub async fn record_account_pool_rate_limit_snapshot(&self, snapshot: &RateLimitSnapshot) {
+        let Some(account_pool) = self.account_pool.as_ref() else {
+            return;
+        };
+        let current_auth = self.auth_cached();
+        let account_id = current_auth
+            .as_ref()
+            .filter(|auth| matches!(auth, CodexAuth::Chatgpt(_)))
+            .and_then(CodexAuth::get_account_id);
+        let Some(account_id) = account_id else {
+            return;
+        };
+        if let Err(err) = account_pool
+            .record_rate_limit_snapshot(&account_id, snapshot)
+            .await
+        {
+            tracing::warn!(
+                account_id,
+                error = %err,
+                "failed to persist observed ChatGPT account-pool rate limits"
+            );
+        }
+    }
+
     pub async fn prepare_chatgpt_account_pool_for_turn(
         &self,
     ) -> Result<(), ChatgptAccountPoolError> {

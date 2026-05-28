@@ -79,6 +79,14 @@ struct ActivityRow {
     expires_at: i64,
 }
 
+#[derive(Debug, PartialEq)]
+struct UsageHistoryRow {
+    account_id: String,
+    limit_id: String,
+    fetched_at: i64,
+    snapshot: RateLimitSnapshot,
+}
+
 async fn activity_rows(pool: &ChatgptAccountPool) -> Vec<ActivityRow> {
     sqlx::query(
         r#"
@@ -100,6 +108,74 @@ async fn activity_rows(pool: &ChatgptAccountPool) -> Vec<ActivityRow> {
         expires_at: row.get("expires_at"),
     })
     .collect()
+}
+
+async fn account_column_names(pool: &ChatgptAccountPool) -> Vec<String> {
+    sqlx::query("PRAGMA table_info(accounts)")
+        .fetch_all(&pool.pool)
+        .await
+        .expect("account columns should load")
+        .into_iter()
+        .map(|row| row.get("name"))
+        .collect()
+}
+
+async fn usage_history_rows(pool: &ChatgptAccountPool) -> Vec<UsageHistoryRow> {
+    sqlx::query(
+        r#"
+        SELECT account_id, limit_id, fetched_at, snapshot_json
+        FROM account_usage_history
+        ORDER BY id
+        "#,
+    )
+    .fetch_all(&pool.pool)
+    .await
+    .expect("usage history rows should load")
+    .into_iter()
+    .map(|row| UsageHistoryRow {
+        account_id: row.get("account_id"),
+        limit_id: row.get("limit_id"),
+        fetched_at: row.get("fetched_at"),
+        snapshot: serde_json::from_str(&row.get::<String, _>("snapshot_json"))
+            .expect("usage history snapshot should decode"),
+    })
+    .collect()
+}
+
+fn codex_snapshot(used_percent: f64) -> RateLimitSnapshot {
+    RateLimitSnapshot {
+        limit_id: Some("codex".to_string()),
+        limit_name: None,
+        primary: Some(RateLimitWindow {
+            used_percent,
+            window_minutes: Some(300),
+            resets_at: Some(3_600),
+        }),
+        secondary: Some(RateLimitWindow {
+            used_percent: used_percent / 2.0,
+            window_minutes: Some(10_080),
+            resets_at: Some(7_200),
+        }),
+        credits: None,
+        plan_type: Some(AccountPlanType::Pro),
+        rate_limit_reached_type: None,
+    }
+}
+
+fn premium_snapshot(balance: &str) -> RateLimitSnapshot {
+    RateLimitSnapshot {
+        limit_id: Some("premium".to_string()),
+        limit_name: Some("premium".to_string()),
+        primary: None,
+        secondary: None,
+        credits: Some(codex_protocol::protocol::CreditsSnapshot {
+            has_credits: balance != "0",
+            unlimited: false,
+            balance: Some(balance.to_string()),
+        }),
+        plan_type: Some(AccountPlanType::Pro),
+        rate_limit_reached_type: None,
+    }
 }
 
 #[tokio::test]
@@ -466,12 +542,6 @@ async fn open_migrates_pre_phase_one_db_non_destructively() {
     .execute(&legacy_pool)
     .await
     .expect("legacy account should insert");
-    sqlx::query(
-        "INSERT INTO pool_state (key, value) VALUES ('selected_account_id', 'workspace-pre-phase')",
-    )
-    .execute(&legacy_pool)
-    .await
-    .expect("legacy selected account should insert");
     legacy_pool.close().await;
 
     let pool = ChatgptAccountPool::open(
@@ -489,7 +559,6 @@ async fn open_migrates_pre_phase_one_db_non_destructively() {
             email: Some("pre@example.com".to_string()),
             plan_type: Some("pro".to_string()),
             enabled: true,
-            is_default: true,
             is_selected: true,
             created_at: 100,
             updated_at: 110,
@@ -508,10 +577,26 @@ async fn open_migrates_pre_phase_one_db_non_destructively() {
             .await
             .expect("schema_version should be recorded");
     assert_eq!(schema_version, ACCOUNT_POOL_SCHEMA_VERSION);
+    assert_eq!(
+        account_column_names(&pool).await,
+        vec![
+            "account_id".to_string(),
+            "email".to_string(),
+            "plan_type".to_string(),
+            "enabled".to_string(),
+            "created_at".to_string(),
+            "updated_at".to_string(),
+            "last_used_at".to_string(),
+            "last_auth_refresh_at".to_string(),
+            "auth_status".to_string(),
+            "cooldown_until".to_string(),
+            "cooldown_reason".to_string(),
+        ]
+    );
 }
 
 #[tokio::test]
-async fn register_account_sets_default_and_selected() {
+async fn register_account_sets_selected() {
     let codex_home = TempDir::new().expect("tempdir");
     let pool = ChatgptAccountPool::open(
         codex_home.path().to_path_buf(),
@@ -525,7 +610,6 @@ async fn register_account_sets_default_and_selected() {
         .await
         .expect("register should succeed");
     assert_eq!(registered.account_id, "workspace-1");
-    assert!(registered.is_default);
     assert!(registered.is_selected);
 
     let selected = pool
@@ -534,6 +618,104 @@ async fn register_account_sets_default_and_selected() {
         .expect("selected auth lookup should succeed")
         .expect("selected auth should exist");
     assert_eq!(selected.0, "workspace-1");
+}
+
+#[tokio::test]
+async fn record_fetched_rate_limits_replaces_latest_snapshot_set_and_appends_history() {
+    let codex_home = TempDir::new().expect("tempdir");
+    let pool = ChatgptAccountPool::open(
+        codex_home.path().to_path_buf(),
+        AuthCredentialsStoreMode::File,
+        None,
+    )
+    .await
+    .expect("pool should open");
+    pool.register_account(&chatgpt_auth("one@example.com", "workspace-1", "pro"))
+        .await
+        .expect("account should register");
+
+    let first_codex = codex_snapshot(42.0);
+    let first_premium = premium_snapshot("3");
+    pool.record_fetched_rate_limits("workspace-1", &[first_codex.clone(), first_premium.clone()])
+        .await
+        .expect("first fetch should persist");
+
+    let second_codex = codex_snapshot(18.0);
+    let entry = pool
+        .record_fetched_rate_limits("workspace-1", &[second_codex.clone()])
+        .await
+        .expect("second fetch should persist");
+
+    assert_eq!(entry.account_id, "workspace-1");
+    assert!(entry.fetched_at.is_some());
+    assert_eq!(
+        entry.rate_limits,
+        BTreeMap::from([("codex".to_string(), second_codex.clone())])
+    );
+
+    let latest = pool
+        .list_rate_limits()
+        .await
+        .expect("rate limits should load");
+    assert_eq!(latest.len(), 1);
+    assert_eq!(latest[0].account_id, "workspace-1");
+    assert!(latest[0].fetched_at.is_some());
+    assert_eq!(
+        latest[0].rate_limits,
+        BTreeMap::from([("codex".to_string(), second_codex.clone())])
+    );
+
+    let history = usage_history_rows(&pool).await;
+    assert_eq!(history.len(), 3);
+    assert_eq!(history[0].snapshot, first_codex);
+    assert_eq!(history[1].snapshot, first_premium);
+    assert_eq!(history[2].snapshot, second_codex);
+}
+
+#[tokio::test]
+async fn record_rate_limit_snapshot_preserves_other_latest_buckets_and_appends_history() {
+    let codex_home = TempDir::new().expect("tempdir");
+    let pool = ChatgptAccountPool::open(
+        codex_home.path().to_path_buf(),
+        AuthCredentialsStoreMode::File,
+        None,
+    )
+    .await
+    .expect("pool should open");
+    pool.register_account(&chatgpt_auth("one@example.com", "workspace-1", "pro"))
+        .await
+        .expect("account should register");
+
+    let first_codex = codex_snapshot(42.0);
+    let first_premium = premium_snapshot("3");
+    pool.record_fetched_rate_limits("workspace-1", &[first_codex.clone(), first_premium.clone()])
+        .await
+        .expect("initial fetch should persist");
+
+    let updated_codex = codex_snapshot(26.0);
+    pool.record_rate_limit_snapshot("workspace-1", &updated_codex)
+        .await
+        .expect("single snapshot observation should persist");
+
+    let latest = pool
+        .list_rate_limits()
+        .await
+        .expect("rate limits should load");
+    assert_eq!(latest.len(), 1);
+    assert_eq!(latest[0].account_id, "workspace-1");
+    assert_eq!(
+        latest[0].rate_limits,
+        BTreeMap::from([
+            ("codex".to_string(), updated_codex.clone()),
+            ("premium".to_string(), first_premium.clone()),
+        ])
+    );
+
+    let history = usage_history_rows(&pool).await;
+    assert_eq!(history.len(), 3);
+    assert_eq!(history[0].snapshot, first_codex);
+    assert_eq!(history[1].snapshot, first_premium);
+    assert_eq!(history[2].snapshot, updated_codex);
 }
 
 #[tokio::test]
@@ -666,7 +848,6 @@ fn capacity_score_treats_missing_rate_limits_as_fresh() {
         email: Some("activity@example.com".to_string()),
         plan_type: Some("pro".to_string()),
         enabled: true,
-        is_default: false,
         is_selected: false,
         created_at: 1,
         updated_at: 1,

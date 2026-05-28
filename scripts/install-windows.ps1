@@ -4,8 +4,8 @@ $ErrorActionPreference = 'Stop'
 $RepoRoot   = Split-Path -Parent $PSScriptRoot
 $InstallDir = Join-Path $env:LOCALAPPDATA 'codex\bin'
 
-# Build the release binary first.
-& (Join-Path $PSScriptRoot 'build.ps1')
+# Build the release-like local binary first.
+& (Join-Path $PSScriptRoot 'build.ps1') -CargoProfile fast
 
 $Src = Join-Path $RepoRoot 'bin\codex.exe'
 if (-not (Test-Path $Src)) { throw "build did not produce $Src" }
