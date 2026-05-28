@@ -850,6 +850,19 @@ impl ChatgptAccountPool {
         )
         .execute(&self.pool)
         .await?;
+        // v1 → v2: drop the `is_default` column that was removed from the schema.
+        // `CREATE TABLE IF NOT EXISTS` never alters existing tables, so we must do
+        // this explicitly for databases created before schema version 2.
+        let legacy_column_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('accounts') WHERE name = 'is_default'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if legacy_column_count > 0 {
+            sqlx::query("ALTER TABLE accounts DROP COLUMN is_default")
+                .execute(&self.pool)
+                .await?;
+        }
         sqlx::query(
             r#"
             INSERT INTO pool_state (key, value)
@@ -1471,6 +1484,13 @@ fn map_plan_type(plan_type: BackendPlanType) -> AccountPlanType {
         | BackendPlanType::K12
         | BackendPlanType::Unknown => AccountPlanType::Unknown,
     }
+}
+
+pub(crate) fn non_empty_env(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn window_minutes_from_seconds(seconds: i32) -> Option<i64> {
