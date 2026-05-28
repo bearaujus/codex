@@ -228,7 +228,23 @@ impl ChatWidget {
         plan_type: Option<PlanType>,
         has_chatgpt_account: bool,
     ) {
-        self.status_account_display = status_account_display;
+        self.status_account_display =
+            match (status_account_display, self.status_account_display.as_ref()) {
+                (
+                    Some(StatusAccountDisplay::ChatGpt {
+                        email: next_email,
+                        plan: next_plan,
+                    }),
+                    Some(StatusAccountDisplay::ChatGpt {
+                        email: previous_email,
+                        plan: previous_plan,
+                    }),
+                ) => Some(StatusAccountDisplay::ChatGpt {
+                    email: next_email.or_else(|| previous_email.clone()),
+                    plan: next_plan.or_else(|| previous_plan.clone()),
+                }),
+                (next, _) => next,
+            };
         self.plan_type = plan_type;
         self.has_chatgpt_account = has_chatgpt_account;
         self.bottom_pane

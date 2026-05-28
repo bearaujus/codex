@@ -223,7 +223,6 @@ impl ChatgptAccountPool {
             pool,
         };
         this.initialize_schema().await?;
-        this.migrate_accounts_table_if_needed().await?;
         this.migrate_legacy_auth_if_needed().await?;
         Ok(this)
     }
@@ -839,91 +838,6 @@ impl ChatgptAccountPool {
         .bind(ACCOUNT_POOL_SCHEMA_VERSION)
         .execute(&self.pool)
         .await?;
-        Ok(())
-    }
-
-    async fn migrate_accounts_table_if_needed(&self) -> Result<(), ChatgptAccountPoolError> {
-        let has_is_default = sqlx::query("PRAGMA table_info(accounts)")
-            .fetch_all(&self.pool)
-            .await?
-            .into_iter()
-            .any(|row| row.get::<String, _>("name") == "is_default");
-        if !has_is_default {
-            return Ok(());
-        }
-
-        let selected_account_id = self.selected_account_id().await?;
-        let mut tx = self.pool.begin().await?;
-        sqlx::query(
-            r#"
-            CREATE TABLE accounts_without_default (
-                account_id TEXT PRIMARY KEY,
-                email TEXT,
-                plan_type TEXT,
-                enabled INTEGER NOT NULL,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                last_used_at INTEGER NULL,
-                last_auth_refresh_at INTEGER NULL,
-                auth_status TEXT NOT NULL,
-                cooldown_until INTEGER NULL,
-                cooldown_reason TEXT NULL
-            )
-            "#,
-        )
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            r#"
-            INSERT INTO accounts_without_default (
-                account_id,
-                email,
-                plan_type,
-                enabled,
-                created_at,
-                updated_at,
-                last_used_at,
-                last_auth_refresh_at,
-                auth_status,
-                cooldown_until,
-                cooldown_reason
-            )
-            SELECT
-                account_id,
-                email,
-                plan_type,
-                enabled,
-                created_at,
-                updated_at,
-                last_used_at,
-                last_auth_refresh_at,
-                auth_status,
-                cooldown_until,
-                cooldown_reason
-            FROM accounts
-            "#,
-        )
-        .execute(&mut *tx)
-        .await?;
-        if selected_account_id.is_none()
-            && let Some(default_account_id) =
-                sqlx::query("SELECT account_id FROM accounts WHERE is_default = 1 LIMIT 1")
-                    .fetch_optional(&mut *tx)
-                    .await?
-                    .map(|row| row.get::<String, _>("account_id"))
-        {
-            sqlx::query(
-                "INSERT INTO pool_state (key, value) VALUES ('selected_account_id', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            )
-            .bind(default_account_id)
-            .execute(&mut *tx)
-            .await?;
-        }
-        sqlx::query("DROP TABLE accounts").execute(&mut *tx).await?;
-        sqlx::query("ALTER TABLE accounts_without_default RENAME TO accounts")
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
         Ok(())
     }
 
