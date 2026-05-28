@@ -79,6 +79,48 @@ pub(super) struct CachedProjectRootName {
 }
 
 impl ChatWidget {
+    fn five_hour_limit_status_text(&self) -> Option<String> {
+        let (window, is_secondary) = self
+            .rate_limit_snapshots_by_limit_id
+            .get("codex")
+            .and_then(five_hour_status_window)?;
+        let label = limit_label_for_window(window.window_minutes, is_secondary);
+        self.status_line_limit_display(Some(window), &label)
+    }
+
+    fn weekly_limit_status_text(&self) -> Option<String> {
+        let (window, is_secondary) = self
+            .rate_limit_snapshots_by_limit_id
+            .get("codex")
+            .and_then(weekly_status_window)?;
+        let label = limit_label_for_window(window.window_minutes, is_secondary);
+        self.status_line_limit_display(Some(window), &label)
+    }
+
+    fn status_line_account_status(&self) -> Option<String> {
+        let base = match self.status_account_display.as_ref()? {
+            StatusAccountDisplay::ChatGpt { email, plan } => email
+                .clone()
+                .or_else(|| plan.clone())
+                .unwrap_or_else(|| "ChatGPT".to_string()),
+            StatusAccountDisplay::ApiKey => "API key configured".to_string(),
+        };
+
+        let mut limits = Vec::new();
+        if let Some(limit) = self.five_hour_limit_status_text() {
+            limits.push(limit);
+        }
+        if let Some(limit) = self.weekly_limit_status_text() {
+            limits.push(limit);
+        }
+
+        if limits.is_empty() {
+            Some(base)
+        } else {
+            Some(format!("{base} ({})", limits.join(", ")))
+        }
+    }
+
     fn status_surface_selections(&self) -> StatusSurfaceSelections {
         let (status_line_items, invalid_status_line_items) = self.status_line_items_with_invalids();
         let (terminal_title_items, invalid_terminal_title_items) =
@@ -604,22 +646,7 @@ impl ChatWidget {
             StatusLineItem::ContextUsed => self
                 .status_line_context_used_percent()
                 .map(|used| format!("Context {used}% used")),
-            StatusLineItem::FiveHourLimit => {
-                let (window, is_secondary) = self
-                    .rate_limit_snapshots_by_limit_id
-                    .get("codex")
-                    .and_then(five_hour_status_window)?;
-                let label = limit_label_for_window(window.window_minutes, is_secondary);
-                self.status_line_limit_display(Some(window), &label)
-            }
-            StatusLineItem::WeeklyLimit => {
-                let (window, is_secondary) = self
-                    .rate_limit_snapshots_by_limit_id
-                    .get("codex")
-                    .and_then(weekly_status_window)?;
-                let label = limit_label_for_window(window.window_minutes, is_secondary);
-                self.status_line_limit_display(Some(window), &label)
-            }
+            StatusLineItem::AccountStatus => self.status_line_account_status(),
             StatusLineItem::CodexVersion => Some(CODEX_CLI_VERSION.to_string()),
             StatusLineItem::ContextWindowSize => self
                 .status_line_context_window_size()
@@ -682,8 +709,17 @@ impl ChatWidget {
             StatusSurfacePreviewItem::ApprovalMode => StatusLineItem::ApprovalMode,
             StatusSurfacePreviewItem::ContextRemaining => StatusLineItem::ContextRemaining,
             StatusSurfacePreviewItem::ContextUsed => StatusLineItem::ContextUsed,
-            StatusSurfacePreviewItem::FiveHourLimit => StatusLineItem::FiveHourLimit,
-            StatusSurfacePreviewItem::WeeklyLimit => StatusLineItem::WeeklyLimit,
+            StatusSurfacePreviewItem::AccountStatus => StatusLineItem::AccountStatus,
+            StatusSurfacePreviewItem::FiveHourLimit => {
+                return self.terminal_title_value_for_item(
+                    TerminalTitleItem::FiveHourLimit,
+                    Instant::now(),
+                );
+            }
+            StatusSurfacePreviewItem::WeeklyLimit => {
+                return self
+                    .terminal_title_value_for_item(TerminalTitleItem::WeeklyLimit, Instant::now());
+            }
             StatusSurfacePreviewItem::CodexVersion => StatusLineItem::CodexVersion,
             StatusSurfacePreviewItem::ContextWindowSize => StatusLineItem::ContextWindowSize,
             StatusSurfacePreviewItem::UsedTokens => StatusLineItem::UsedTokens,
@@ -728,10 +764,10 @@ impl ChatWidget {
                 .status_line_value_for_item(StatusLineItem::ContextUsed)
                 .map(|value| Self::truncate_terminal_title_part(value, /*max_chars*/ 32)),
             TerminalTitleItem::FiveHourLimit => self
-                .status_line_value_for_item(StatusLineItem::FiveHourLimit)
+                .five_hour_limit_status_text()
                 .map(|value| Self::truncate_terminal_title_part(value, /*max_chars*/ 32)),
             TerminalTitleItem::WeeklyLimit => self
-                .status_line_value_for_item(StatusLineItem::WeeklyLimit)
+                .weekly_limit_status_text()
                 .map(|value| Self::truncate_terminal_title_part(value, /*max_chars*/ 32)),
             TerminalTitleItem::CodexVersion => self
                 .status_line_value_for_item(StatusLineItem::CodexVersion)

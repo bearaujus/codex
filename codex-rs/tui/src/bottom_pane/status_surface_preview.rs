@@ -20,6 +20,7 @@ pub(crate) enum StatusSurfacePreviewItem {
     ApprovalMode,
     ContextRemaining,
     ContextUsed,
+    AccountStatus,
     FiveHourLimit,
     WeeklyLimit,
     CodexVersion,
@@ -51,6 +52,9 @@ impl StatusSurfacePreviewItem {
             StatusSurfacePreviewItem::ApprovalMode => "on-request",
             StatusSurfacePreviewItem::ContextRemaining => "Context 0% left",
             StatusSurfacePreviewItem::ContextUsed => "Context 0% used",
+            StatusSurfacePreviewItem::AccountStatus => {
+                "user@example.com (5h 0% left, weekly 0% left)"
+            }
             StatusSurfacePreviewItem::FiveHourLimit => "primary 0%",
             StatusSurfacePreviewItem::WeeklyLimit => "secondary 0%",
             StatusSurfacePreviewItem::CodexVersion => "0.0.0",
@@ -82,6 +86,7 @@ impl StatusSurfacePreviewItem {
             Self::ApprovalMode,
             Self::ContextRemaining,
             Self::ContextUsed,
+            Self::AccountStatus,
             Self::FiveHourLimit,
             Self::WeeklyLimit,
             Self::CodexVersion,
