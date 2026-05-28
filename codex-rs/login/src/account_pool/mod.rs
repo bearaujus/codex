@@ -566,6 +566,31 @@ impl ChatgptAccountPool {
         Ok(())
     }
 
+    /// Probes the ChatGPT `/usage` endpoint with `auth` and returns `true` if
+    /// the token is accepted. On HTTP 401 the account is marked `Invalid` in
+    /// the pool so future startups skip it cleanly, and `false` is returned so
+    /// the caller can suppress the MCP layer entirely. Network errors and other
+    /// non-401 failures return `true` to avoid false positives.
+    pub async fn probe_token_or_mark_invalid(
+        &self,
+        account_id: &str,
+        auth: &CodexAuth,
+    ) -> bool {
+        match probe_usage_status(&self.chatgpt_base_url, auth).await {
+            Some(status) if status == reqwest::StatusCode::UNAUTHORIZED => {
+                tracing::warn!(
+                    %account_id,
+                    "ChatGPT account token rejected with 401; marking account invalid"
+                );
+                let _ = self
+                    .update_auth_status(account_id, ChatgptAccountPoolAuthStatus::Invalid)
+                    .await;
+                false
+            }
+            _ => true,
+        }
+    }
+
     pub async fn refresh_rate_limits(
         &self,
         account_id: &str,
@@ -1221,6 +1246,47 @@ fn latest_reset_at(snapshot: &RateLimitSnapshot) -> Option<i64> {
 
 fn window_exhausted(window: &RateLimitWindow) -> bool {
     window.used_percent >= 100.0
+}
+
+/// Makes a lightweight GET to the `/usage` endpoint and returns the HTTP
+/// status code. Returns `None` on connection errors so the caller treats the
+/// result as inconclusive.
+async fn probe_usage_status(base_url: &str, auth: &CodexAuth) -> Option<reqwest::StatusCode> {
+    let trimmed = base_url.trim_end_matches('/');
+    let path = if trimmed.contains("/backend-api") {
+        format!("{trimmed}/wham/usage")
+    } else {
+        format!("{trimmed}/api/codex/usage")
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        USER_AGENT,
+        HeaderValue::from_str(&get_codex_user_agent()).ok()?,
+    );
+    let token = auth.get_token().ok()?;
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {token}")).ok()?,
+    );
+    if let Some(account_id) = auth.get_account_id()
+        && let Ok(hname) = HeaderName::from_bytes(b"ChatGPT-Account-Id")
+        && let Ok(hval) = HeaderValue::from_str(&account_id)
+    {
+        headers.insert(hname, hval);
+    }
+    if auth.is_fedramp_account()
+        && let Ok(hname) = HeaderName::from_bytes(b"X-OpenAI-Fedramp")
+    {
+        headers.insert(hname, HeaderValue::from_static("true"));
+    }
+    let client = build_reqwest_client_with_custom_ca(reqwest::Client::builder()).ok()?;
+    client
+        .get(&path)
+        .headers(headers)
+        .send()
+        .await
+        .ok()
+        .map(|r| r.status())
 }
 
 async fn fetch_rate_limit_snapshots(

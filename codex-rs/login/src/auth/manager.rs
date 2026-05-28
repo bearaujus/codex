@@ -1347,7 +1347,7 @@ async fn load_startup_account_pool_auth(
     let managed_chatgpt_auth_loaded = managed_auth
         .as_ref()
         .is_some_and(|auth| matches!(auth, CodexAuth::Chatgpt(_)));
-    match selection {
+    let resolved = match selection {
         ChatgptAccountPoolSelectionOutcome::Unchanged => managed_auth,
         ChatgptAccountPoolSelectionOutcome::NoEligibleAccounts => {
             if managed_chatgpt_auth_loaded
@@ -1367,7 +1367,23 @@ async fn load_startup_account_pool_auth(
                 .flatten()
                 .or(managed_auth)
         }
+    };
+
+    // Probe /usage before handing auth to the MCP layer. A 401 means the
+    // token was revoked server-side; mark the account invalid now so the
+    // caller never attempts an MCP connection that would fail with a raw
+    // transport error dump.
+    if let Some(auth) = &resolved
+        && let Some(account_id) = auth.get_account_id()
+        && matches!(auth, CodexAuth::Chatgpt(_))
+        && !account_pool
+            .probe_token_or_mark_invalid(&account_id, auth)
+            .await
+    {
+        return None;
     }
+
+    resolved
 }
 
 impl AuthManager {
