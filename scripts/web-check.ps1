@@ -1,5 +1,5 @@
-# Fast compile check (inner dev loop) — no codegen, no optimized binary.
-# Optional crate name narrows scope, e.g. scripts/check.ps1 codex-login
+# Compile-check Rust code for the browser-oriented wasm target.
+# Narrow with a crate name, e.g. scripts/web-check.ps1 codex-login
 param(
     [string]$Crate,
     [Parameter(ValueFromRemainingArguments = $true)][string[]]$CargoArgs
@@ -9,10 +9,11 @@ $ErrorActionPreference = 'Stop'
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'rust-env.ps1')
 Enable-SccacheIfAvailable
+Assert-RustupTargetInstalled 'wasm32-unknown-unknown'
 
 Push-Location (Join-Path $RepoRoot 'codex-rs')
 try {
-    $CheckArgs = @('check')
+    $CheckArgs = @('check', '--target', 'wasm32-unknown-unknown')
     if ($Crate) {
         $CheckArgs += @('-p', $Crate)
     }
@@ -24,7 +25,7 @@ try {
     }
 
     & cargo @CheckArgs
-    if ($LASTEXITCODE -ne 0) { throw "cargo check failed (exit $LASTEXITCODE)" }
+    if ($LASTEXITCODE -ne 0) { throw "cargo check for wasm32-unknown-unknown failed (exit $LASTEXITCODE)" }
 }
 finally {
     Pop-Location

@@ -929,6 +929,9 @@ impl AccountRequestProcessor {
                 "failed to fetch codex rate limits: no snapshots returned",
             ));
         }
+        self.auth_manager
+            .record_account_pool_rate_limits_fetch(snapshots.as_slice())
+            .await;
 
         let rate_limits_by_limit_id: HashMap<String, CoreRateLimitSnapshot> = snapshots
             .iter()

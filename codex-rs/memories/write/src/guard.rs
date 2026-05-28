@@ -27,6 +27,9 @@ async fn rate_limits_check(auth_manager: &AuthManager, config: &Config) -> Optio
         .await
         .map_err(|err| warn!(%err, "failed to fetch rate limits"))
         .ok()?;
+    auth_manager
+        .record_account_pool_rate_limits_fetch(snapshots.as_slice())
+        .await;
 
     let snapshot = snapshots
         .iter()

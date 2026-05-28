@@ -48,7 +48,7 @@ const POOL_DB_DIR: &str = "account-pool";
 const POOL_DB_FILE: &str = "accounts.sqlite";
 const SECRET_ROOT_DIR: &str = "auth";
 const EVENT_LIMIT_DEFAULT: i64 = 100;
-const ACCOUNT_POOL_SCHEMA_VERSION: &str = "1";
+const ACCOUNT_POOL_SCHEMA_VERSION: &str = "2";
 
 /// Returns the path to the account-pool SQLite database for the given
 /// `codex_home`. External services that append accounts while the CLI is
@@ -128,7 +128,6 @@ pub struct ChatgptAccountPoolAccount {
     pub email: Option<String>,
     pub plan_type: Option<String>,
     pub enabled: bool,
-    pub is_default: bool,
     pub is_selected: bool,
     pub created_at: i64,
     pub updated_at: i64,
@@ -224,6 +223,7 @@ impl ChatgptAccountPool {
             pool,
         };
         this.initialize_schema().await?;
+        this.migrate_accounts_table_if_needed().await?;
         this.migrate_legacy_auth_if_needed().await?;
         Ok(this)
     }
@@ -239,7 +239,6 @@ impl ChatgptAccountPool {
                 email,
                 plan_type,
                 enabled,
-                is_default,
                 created_at,
                 updated_at,
                 last_used_at,
@@ -261,7 +260,6 @@ impl ChatgptAccountPool {
                     email: row.get("email"),
                     plan_type: row.get("plan_type"),
                     enabled: row.get::<i64, _>("enabled") != 0,
-                    is_default: row.get::<i64, _>("is_default") != 0,
                     is_selected: selected_account_id.as_deref() == Some(account_id.as_str()),
                     created_at: row.get("created_at"),
                     updated_at: row.get("updated_at"),
@@ -338,7 +336,6 @@ impl ChatgptAccountPool {
         let now = now_ts();
         let auth_status = ChatgptAccountPoolAuthStatus::Valid.as_str();
         let selected_account_id = self.selected_account_id().await?;
-        let has_default = self.has_default_account().await?;
         sqlx::query(
             r#"
             INSERT INTO accounts (
@@ -346,7 +343,6 @@ impl ChatgptAccountPool {
                 email,
                 plan_type,
                 enabled,
-                is_default,
                 created_at,
                 updated_at,
                 last_used_at,
@@ -355,7 +351,7 @@ impl ChatgptAccountPool {
                 cooldown_until,
                 cooldown_reason
             )
-            VALUES (?, ?, ?, 1, ?, ?, ?, NULL, ?, ?, NULL, NULL)
+            VALUES (?, ?, ?, 1, ?, ?, NULL, ?, ?, NULL, NULL)
             ON CONFLICT(account_id) DO UPDATE SET
                 email = excluded.email,
                 plan_type = excluded.plan_type,
@@ -370,7 +366,6 @@ impl ChatgptAccountPool {
         .bind(&metadata.account_id)
         .bind(&metadata.email)
         .bind(&metadata.plan_type)
-        .bind((!has_default) as i64)
         .bind(now)
         .bind(now)
         .bind(auth.last_refresh.map(|value| value.timestamp()))
@@ -378,7 +373,7 @@ impl ChatgptAccountPool {
         .execute(&self.pool)
         .await?;
         if selected_account_id.is_none() {
-            self.set_selected_account_id(Some(&metadata.account_id), /*change_default*/ false)
+            self.set_selected_account_id(Some(&metadata.account_id))
                 .await?;
         }
         self.append_event(
@@ -417,8 +412,7 @@ impl ChatgptAccountPool {
         account_id: &str,
     ) -> Result<ChatgptAccountPoolAccount, ChatgptAccountPoolError> {
         self.require_account(account_id).await?;
-        self.set_selected_account_id(Some(account_id), /*change_default*/ true)
-            .await?;
+        self.set_selected_account_id(Some(account_id)).await?;
         self.append_event(
             Some(account_id),
             "account_selected",
@@ -473,8 +467,7 @@ impl ChatgptAccountPool {
         };
         let failover = current_account_id.is_some_and(|current| current != best_account_id);
         if selected_account_id.as_deref() != Some(best_account_id) {
-            self.set_selected_account_id(Some(best_account_id), /*change_default*/ false)
-                .await?;
+            self.set_selected_account_id(Some(best_account_id)).await?;
             self.append_event(
                 Some(best_account_id),
                 "account_failover_selected",
@@ -497,6 +490,7 @@ impl ChatgptAccountPool {
         snapshot: Option<&RateLimitSnapshot>,
         resets_at: Option<DateTime<Utc>>,
     ) -> Result<(), ChatgptAccountPoolError> {
+        self.require_account(account_id).await?;
         let mut cooldown_until = resets_at.map(|value| value.timestamp());
         if let Some(snapshot) = snapshot {
             if let Some(primary_reset) = snapshot
@@ -582,28 +576,87 @@ impl ChatgptAccountPool {
             .await?
             .ok_or_else(|| ChatgptAccountPoolError::AccountNotFound(account_id.to_string()))?;
         let snapshots = fetch_rate_limit_snapshots(&self.chatgpt_base_url, &auth).await?;
-        let fetched_at = now_ts();
-        sqlx::query("DELETE FROM account_rate_limits WHERE account_id = ?")
-            .bind(account_id)
-            .execute(&self.pool)
+        let entry = self
+            .record_fetched_rate_limits(account_id, snapshots.as_slice())
             .await?;
+        if entry.fetched_at.is_some() {
+            self.append_event(
+                Some(account_id),
+                "rate_limits_refreshed",
+                format!(
+                    "Refreshed rate limits for ChatGPT account {}",
+                    account_suffix(account_id)
+                ),
+            )
+            .await?;
+        }
+        Ok(entry)
+    }
+
+    pub(crate) async fn record_fetched_rate_limits(
+        &self,
+        account_id: &str,
+        snapshots: &[RateLimitSnapshot],
+    ) -> Result<ChatgptAccountPoolRateLimitEntry, ChatgptAccountPoolError> {
+        self.require_account(account_id).await?;
+        if snapshots.is_empty() {
+            return Ok(ChatgptAccountPoolRateLimitEntry {
+                account_id: account_id.to_string(),
+                fetched_at: None,
+                rate_limits: BTreeMap::new(),
+            });
+        }
+
+        let fetched_at = now_ts();
         let mut cooldown_until = None;
         let mut grouped = BTreeMap::new();
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM account_rate_limits WHERE account_id = ?")
+            .bind(account_id)
+            .execute(&mut *tx)
+            .await?;
         for snapshot in snapshots {
-            if let Some(reset_at) = latest_reset_at(&snapshot) {
+            if let Some(reset_at) = latest_reset_at(snapshot) {
                 let exhausted = snapshot.primary.as_ref().is_some_and(window_exhausted)
                     || snapshot.secondary.as_ref().is_some_and(window_exhausted);
                 if exhausted {
                     cooldown_until = Some(cooldown_until.unwrap_or(reset_at).max(reset_at));
                 }
             }
-            self.store_rate_limit_snapshot(account_id, &snapshot, fetched_at)
-                .await?;
+
             let limit_id = snapshot
                 .limit_id
                 .clone()
                 .unwrap_or_else(|| "codex".to_string());
-            grouped.insert(limit_id, snapshot);
+            let snapshot_json = serde_json::to_string(snapshot)?;
+            sqlx::query(
+                r#"
+                INSERT INTO account_rate_limits (account_id, limit_id, snapshot_json, fetched_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(account_id, limit_id) DO UPDATE SET
+                    snapshot_json = excluded.snapshot_json,
+                    fetched_at = excluded.fetched_at
+                "#,
+            )
+            .bind(account_id)
+            .bind(limit_id.clone())
+            .bind(snapshot_json.clone())
+            .bind(fetched_at)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                r#"
+                INSERT INTO account_usage_history (account_id, limit_id, snapshot_json, fetched_at)
+                VALUES (?, ?, ?, ?)
+                "#,
+            )
+            .bind(account_id)
+            .bind(limit_id.clone())
+            .bind(snapshot_json)
+            .bind(fetched_at)
+            .execute(&mut *tx)
+            .await?;
+            grouped.insert(limit_id, snapshot.clone());
         }
         sqlx::query(
             r#"
@@ -624,22 +677,25 @@ impl ChatgptAccountPool {
         .bind(cooldown_until.map(|_| "rate_limits_refreshed"))
         .bind(ChatgptAccountPoolAuthStatus::Valid.as_str())
         .bind(account_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        self.append_event(
-            Some(account_id),
-            "rate_limits_refreshed",
-            format!(
-                "Refreshed rate limits for ChatGPT account {}",
-                account_suffix(account_id)
-            ),
-        )
-        .await?;
+        tx.commit().await?;
+
         Ok(ChatgptAccountPoolRateLimitEntry {
             account_id: account_id.to_string(),
             fetched_at: Some(fetched_at),
             rate_limits: grouped,
         })
+    }
+
+    pub(crate) async fn record_rate_limit_snapshot(
+        &self,
+        account_id: &str,
+        snapshot: &RateLimitSnapshot,
+    ) -> Result<(), ChatgptAccountPoolError> {
+        self.require_account(account_id).await?;
+        self.store_rate_limit_snapshot(account_id, snapshot, now_ts())
+            .await
     }
 
     async fn activate_account(
@@ -674,7 +730,6 @@ impl ChatgptAccountPool {
                 email TEXT,
                 plan_type TEXT,
                 enabled INTEGER NOT NULL,
-                is_default INTEGER NOT NULL,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
                 last_used_at INTEGER NULL,
@@ -787,6 +842,91 @@ impl ChatgptAccountPool {
         Ok(())
     }
 
+    async fn migrate_accounts_table_if_needed(&self) -> Result<(), ChatgptAccountPoolError> {
+        let has_is_default = sqlx::query("PRAGMA table_info(accounts)")
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .any(|row| row.get::<String, _>("name") == "is_default");
+        if !has_is_default {
+            return Ok(());
+        }
+
+        let selected_account_id = self.selected_account_id().await?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            r#"
+            CREATE TABLE accounts_without_default (
+                account_id TEXT PRIMARY KEY,
+                email TEXT,
+                plan_type TEXT,
+                enabled INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                last_used_at INTEGER NULL,
+                last_auth_refresh_at INTEGER NULL,
+                auth_status TEXT NOT NULL,
+                cooldown_until INTEGER NULL,
+                cooldown_reason TEXT NULL
+            )
+            "#,
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO accounts_without_default (
+                account_id,
+                email,
+                plan_type,
+                enabled,
+                created_at,
+                updated_at,
+                last_used_at,
+                last_auth_refresh_at,
+                auth_status,
+                cooldown_until,
+                cooldown_reason
+            )
+            SELECT
+                account_id,
+                email,
+                plan_type,
+                enabled,
+                created_at,
+                updated_at,
+                last_used_at,
+                last_auth_refresh_at,
+                auth_status,
+                cooldown_until,
+                cooldown_reason
+            FROM accounts
+            "#,
+        )
+        .execute(&mut *tx)
+        .await?;
+        if selected_account_id.is_none()
+            && let Some(default_account_id) =
+                sqlx::query("SELECT account_id FROM accounts WHERE is_default = 1 LIMIT 1")
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .map(|row| row.get::<String, _>("account_id"))
+        {
+            sqlx::query(
+                "INSERT INTO pool_state (key, value) VALUES ('selected_account_id', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            )
+            .bind(default_account_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query("DROP TABLE accounts").execute(&mut *tx).await?;
+        sqlx::query("ALTER TABLE accounts_without_default RENAME TO accounts")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn migrate_legacy_auth_if_needed(&self) -> Result<(), ChatgptAccountPoolError> {
         let Some(auth) = load_auth_dot_json(&self.codex_home, self.auth_credentials_store_mode)?
         else {
@@ -861,6 +1001,7 @@ impl ChatgptAccountPool {
             .limit_id
             .clone()
             .unwrap_or_else(|| "codex".to_string());
+        let snapshot_json = serde_json::to_string(snapshot)?;
         sqlx::query(
             r#"
             INSERT INTO account_rate_limits (account_id, limit_id, snapshot_json, fetched_at)
@@ -871,8 +1012,20 @@ impl ChatgptAccountPool {
             "#,
         )
         .bind(account_id)
+        .bind(limit_id.clone())
+        .bind(snapshot_json.clone())
+        .bind(fetched_at)
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO account_usage_history (account_id, limit_id, snapshot_json, fetched_at)
+            VALUES (?, ?, ?, ?)
+            "#,
+        )
+        .bind(account_id)
         .bind(limit_id)
-        .bind(serde_json::to_string(snapshot)?)
+        .bind(snapshot_json)
         .bind(fetched_at)
         .execute(&self.pool)
         .await?;
@@ -900,7 +1053,6 @@ impl ChatgptAccountPool {
     async fn set_selected_account_id(
         &self,
         account_id: Option<&str>,
-        change_default: bool,
     ) -> Result<(), ChatgptAccountPoolError> {
         sqlx::query(
             "INSERT INTO pool_state (key, value) VALUES ('selected_account_id', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -908,20 +1060,6 @@ impl ChatgptAccountPool {
         .bind(account_id)
         .execute(&self.pool)
         .await?;
-        if change_default {
-            self.set_default_account_id(account_id).await?;
-        }
-        Ok(())
-    }
-
-    async fn set_default_account_id(
-        &self,
-        account_id: Option<&str>,
-    ) -> Result<(), ChatgptAccountPoolError> {
-        sqlx::query("UPDATE accounts SET is_default = CASE WHEN account_id = ? THEN 1 ELSE 0 END")
-            .bind(account_id)
-            .execute(&self.pool)
-            .await?;
         Ok(())
     }
 
@@ -930,17 +1068,6 @@ impl ChatgptAccountPool {
             .fetch_optional(&self.pool)
             .await?;
         Ok(row.and_then(|row| row.get::<Option<String>, _>("value")))
-    }
-
-    async fn default_account_id(&self) -> Result<Option<String>, ChatgptAccountPoolError> {
-        let row = sqlx::query("SELECT account_id FROM accounts WHERE is_default = 1 LIMIT 1")
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(row.map(|row| row.get("account_id")))
-    }
-
-    async fn has_default_account(&self) -> Result<bool, ChatgptAccountPoolError> {
-        Ok(self.default_account_id().await?.is_some())
     }
 
     async fn account_exists(&self, account_id: &str) -> Result<bool, ChatgptAccountPoolError> {

@@ -2098,6 +2098,10 @@ async fn try_run_sampling_request(
                 sess.set_server_reasoning_included(included).await;
             }
             ResponseEvent::RateLimits(snapshot) => {
+                sess.services
+                    .auth_manager
+                    .record_account_pool_rate_limit_snapshot(&snapshot)
+                    .await;
                 // Update internal state with latest rate limits, but defer sending until
                 // token usage is available to avoid duplicate TokenCount events.
                 sess.record_rate_limits_info(snapshot).await;
