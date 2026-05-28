@@ -2213,28 +2213,41 @@ impl AuthManager {
             .await
             .map_err(|err| RefreshTokenError::Transient(std::io::Error::other(err)))?;
         if !acquired {
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            self.reload_active_auth_from_pool_copy(account_id).await?;
-            let reloaded_auth = self.auth_cached().ok_or_else(|| {
-                RefreshTokenError::Transient(std::io::Error::other("Token data is not available."))
-            })?;
-            let reloaded_auth_dot_json =
-                reloaded_auth.get_current_auth_json().ok_or_else(|| {
+            // Another process holds the lock and is refreshing the token. Poll
+            // until the token is no longer stale or the lock TTL elapses, so we
+            // don't return a spurious transient error when the peer finishes within
+            // the normal ~500 ms–2 s HTTP round-trip window.
+            const POLL_INTERVAL_MS: u64 = 500;
+            let max_wait_ms: u64 = ChatgptAccountPool::token_refresh_lock_ttl().as_millis() as u64;
+            let mut waited_ms: u64 = 0;
+            loop {
+                tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+                waited_ms += POLL_INTERVAL_MS;
+                self.reload_active_auth_from_pool_copy(account_id).await?;
+                let reloaded_auth = self.auth_cached().ok_or_else(|| {
                     RefreshTokenError::Transient(std::io::Error::other(
                         "Token data is not available.",
                     ))
                 })?;
-            if ChatgptAccountPool::account_auth_needs_token_refresh(
-                &reloaded_auth_dot_json,
-                Utc::now(),
-            ) {
-                return Err(RefreshTokenError::Transient(std::io::Error::other(
-                    format!(
-                        "pool-managed token refresh for account {account_id} did not complete before reload"
-                    ),
-                )));
+                let reloaded_auth_dot_json =
+                    reloaded_auth.get_current_auth_json().ok_or_else(|| {
+                        RefreshTokenError::Transient(std::io::Error::other(
+                            "Token data is not available.",
+                        ))
+                    })?;
+                if !ChatgptAccountPool::account_auth_needs_token_refresh(
+                    &reloaded_auth_dot_json,
+                    Utc::now(),
+                ) {
+                    return Ok(());
+                }
+                if waited_ms >= max_wait_ms {
+                    return Err(RefreshTokenError::Transient(std::io::Error::other(format!(
+                        "pool-managed token refresh for account {account_id} did not complete \
+                         within {max_wait_ms}ms"
+                    ))));
+                }
             }
-            return Ok(());
         }
 
         let result = async {

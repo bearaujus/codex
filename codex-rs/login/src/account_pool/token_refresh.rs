@@ -1,4 +1,3 @@
-use std::env;
 use std::time::Duration;
 
 use chrono::DateTime;
@@ -153,8 +152,8 @@ impl ChatgptAccountPool {
 
     pub(crate) fn token_refresh_lock_owner() -> String {
         let host = host_name()
-            .or_else(|| non_empty_env("HOSTNAME"))
-            .or_else(|| non_empty_env("COMPUTERNAME"))
+            .or_else(|| super::non_empty_env("HOSTNAME"))
+            .or_else(|| super::non_empty_env("COMPUTERNAME"))
             .unwrap_or_else(|| "unknown".to_string());
         format!("{host}:{}", std::process::id())
     }
@@ -162,11 +161,4 @@ impl ChatgptAccountPool {
     pub(crate) fn token_refresh_lock_ttl() -> Duration {
         Duration::from_secs(ACCOUNT_TOKEN_REFRESH_LOCK_TTL_SECONDS as u64)
     }
-}
-
-fn non_empty_env(key: &str) -> Option<String> {
-    env::var(key)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
 }

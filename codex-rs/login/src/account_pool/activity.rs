@@ -1,5 +1,3 @@
-use std::env;
-
 use codex_config::host_name;
 
 use super::ChatgptAccountPool;
@@ -124,14 +122,7 @@ fn current_account_activity_owner() -> AccountActivityOwner {
 
 fn current_account_activity_host() -> String {
     host_name()
-        .or_else(|| non_empty_env("HOSTNAME"))
-        .or_else(|| non_empty_env("COMPUTERNAME"))
+        .or_else(|| super::non_empty_env("HOSTNAME"))
+        .or_else(|| super::non_empty_env("COMPUTERNAME"))
         .unwrap_or_else(|| "unknown".to_string())
-}
-
-fn non_empty_env(key: &str) -> Option<String> {
-    env::var(key)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
 }
