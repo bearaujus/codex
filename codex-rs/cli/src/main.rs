@@ -46,6 +46,7 @@ mod app_cmd;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod desktop_app;
 mod doctor;
+mod info_cmd;
 mod marketplace_cmd;
 mod mcp_cmd;
 mod plugin_cmd;
@@ -59,6 +60,7 @@ use crate::plugin_cmd::PluginCli;
 use crate::plugin_cmd::PluginSubcommand;
 use crate::remote_control_cmd::RemoteControlCommand;
 use doctor::DoctorCommand;
+use info_cmd::InfoCommand;
 use state_db_recovery as local_state_db;
 
 use codex_config::LoaderOverrides;
@@ -97,6 +99,16 @@ use codex_terminal_detection::TerminalName;
     override_usage = "codex [OPTIONS] [PROMPT]\n       codex [OPTIONS] <COMMAND> [ARGS]"
 )]
 struct MultitoolCli {
+    /// Override the Codex home directory (defaults to ~/.codex or $CODEX_HOME).
+    /// The directory is created automatically if it does not exist, making this
+    /// convenient for project-scoped or workspace-scoped Codex invocations.
+    ///
+    /// Examples:
+    ///   codex --codex-home /projects/myapp/.codex
+    ///   codex --codex-home ~/workspaces/myapp
+    #[arg(long = "codex-home", global = true, value_name = "PATH")]
+    pub codex_home: Option<std::path::PathBuf>,
+
     #[clap(flatten)]
     pub config_overrides: CliConfigOverrides,
 
@@ -155,6 +167,9 @@ enum Subcommand {
 
     /// Diagnose local Codex installation, config, auth, and runtime health.
     Doctor(DoctorCommand),
+
+    /// Print the client metadata and headers Codex derives for API requests.
+    Info(InfoCommand),
 
     /// Run commands within a Codex-provided sandbox.
     Sandbox(HostSandboxArgs),
@@ -821,14 +836,61 @@ fn stage_str(stage: Stage) -> &'static str {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Apply `--codex-home` here, before `arg0_dispatch_or_else` starts a
+    // multi-threaded Tokio runtime. Mutating the environment is only sound
+    // while the process is single-threaded, which is no longer true once the
+    // runtime (and its worker threads) exist.
+    apply_codex_home_override_from_args()?;
     arg0_dispatch_or_else(|arg0_paths: Arg0DispatchPaths| async move {
         cli_main(arg0_paths).await?;
         Ok(())
     })
 }
 
+/// Scans the raw process arguments for `--codex-home <PATH>` (or
+/// `--codex-home=<PATH>`) and, when present, creates the directory and points
+/// `CODEX_HOME` at it. The clap flag on [`MultitoolCli`] still documents and
+/// validates the option; this early pass exists only so the `set_var` runs
+/// while the process is still single-threaded. Auto-creation is intentionally
+/// limited to this explicit flag — a missing ambient `CODEX_HOME` remains an
+/// error (see `codex_utils_home_dir::find_codex_home`).
+fn apply_codex_home_override_from_args() -> anyhow::Result<()> {
+    let mut args = std::env::args_os().skip(1);
+    let mut override_path: Option<std::path::PathBuf> = None;
+    while let Some(arg) = args.next() {
+        let Some(arg) = arg.to_str() else {
+            // A non-UTF-8 token cannot be one of our ASCII flags; skip it.
+            continue;
+        };
+        if arg == "--" {
+            break;
+        }
+        if arg == "--codex-home" {
+            override_path = args.next().map(std::path::PathBuf::from);
+        } else if let Some(value) = arg.strip_prefix("--codex-home=") {
+            override_path = Some(std::path::PathBuf::from(value));
+        }
+    }
+    if let Some(path) = override_path {
+        std::fs::create_dir_all(&path).map_err(|err| {
+            anyhow::anyhow!("failed to create --codex-home {}: {err}", path.display())
+        })?;
+        // SAFETY: called from `main()` before the async runtime starts, so the
+        // process is single-threaded and no other thread can be reading the
+        // environment concurrently.
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::set_var("CODEX_HOME", &path);
+        }
+    }
+    Ok(())
+}
+
 async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
     let MultitoolCli {
+        // `--codex-home` is applied in `main()` before the runtime starts; see
+        // `apply_codex_home_override_from_args`.
+        codex_home: _,
         config_overrides: mut root_config_overrides,
         feature_toggles,
         remote,
@@ -959,6 +1021,14 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
                     plugin_cmd::run_plugin_remove(overrides, args).await?;
                 }
             }
+        }
+        Some(Subcommand::Info(info)) => {
+            reject_remote_mode_for_subcommand(
+                root_remote.as_deref(),
+                root_remote_auth_token_env.as_deref(),
+                "info",
+            )?;
+            info_cmd::run_info(info)?;
         }
         Some(Subcommand::AppServer(app_server_cli)) => {
             let AppServerCommand {
@@ -1890,6 +1960,7 @@ fn unsupported_subcommand_name_for_strict_config(
         Some(Subcommand::RemoteControl(remote_control)) => Some(remote_control.subcommand_name()),
         Some(Subcommand::Mcp(_)) => Some("mcp"),
         Some(Subcommand::Plugin(_)) => Some("plugin"),
+        Some(Subcommand::Info(_)) => Some("info"),
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         Some(Subcommand::App(_)) => Some("app"),
         Some(Subcommand::Login(_)) => Some("login"),
@@ -2273,6 +2344,7 @@ mod tests {
         let cli = MultitoolCli::try_parse_from(args).expect("parse");
         let MultitoolCli {
             interactive,
+            codex_home: _,
             config_overrides: root_overrides,
             subcommand,
             feature_toggles: _,
@@ -2306,6 +2378,7 @@ mod tests {
         let cli = MultitoolCli::try_parse_from(args).expect("parse");
         let MultitoolCli {
             interactive,
+            codex_home: _,
             config_overrides: root_overrides,
             subcommand,
             feature_toggles: _,
@@ -2394,6 +2467,16 @@ mod tests {
         assert!(args.last);
         assert_eq!(args.session_id, None);
         assert_eq!(args.prompt.as_deref(), Some("2+2"));
+    }
+
+    #[test]
+    fn info_command_accepts_json_flag() {
+        let cli = MultitoolCli::try_parse_from(["codex", "info", "--json"])
+            .expect("parse should succeed");
+        let Some(Subcommand::Info(InfoCommand { json })) = cli.subcommand else {
+            panic!("expected info subcommand");
+        };
+        assert!(json);
     }
 
     #[test]
