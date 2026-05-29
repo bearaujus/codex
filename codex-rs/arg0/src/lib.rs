@@ -174,22 +174,46 @@ pub fn arg0_dispatch() -> Option<Arg0PathEntryGuard> {
 /// in this workspace that depends on these helper CLIs.
 pub fn arg0_dispatch_or_else<F, Fut>(main_fn: F) -> anyhow::Result<()>
 where
-    F: FnOnce(Arg0DispatchPaths) -> Fut,
+    F: FnOnce(Arg0DispatchPaths) -> Fut + Send + 'static,
     Fut: Future<Output = anyhow::Result<()>>,
 {
     // Retain the TempDir so it exists for the lifetime of the invocation of
     // this executable. Admittedly, we could invoke `keep()` on it, but it
     // would be nice to avoid leaving temporary directories behind, if possible.
+    //
+    // arg0 dispatch mutates the `PATH` environment variable, so it must run on
+    // the initial thread before we spawn any additional threads.
     let path_entry_guard = arg0_dispatch();
+    let current_exe = std::env::current_exe().ok();
 
-    // Regular invocation – create a Tokio runtime and execute the provided
-    // async entry-point.
-    let runtime = build_runtime()?;
-    runtime.block_on(run_main_with_arg0_guard(
-        path_entry_guard,
-        std::env::current_exe().ok(),
-        main_fn,
-    ))
+    // `runtime.block_on` drives the root future on the thread that calls it. On
+    // Windows the process main thread is created with the default (~1 MiB)
+    // stack, which the deeply nested async state machines in the TUI can
+    // overflow (e.g. the `/new` flow), crashing with "thread 'main' has
+    // overflowed its stack". Tokio worker threads already get
+    // `TOKIO_WORKER_STACK_SIZE_BYTES`; run the runtime and the root future on a
+    // dedicated thread with the same large stack so every async task has
+    // consistent headroom regardless of platform.
+    let worker = std::thread::Builder::new()
+        .name("codex-main".to_string())
+        .stack_size(TOKIO_WORKER_STACK_SIZE_BYTES)
+        .spawn(move || -> anyhow::Result<()> {
+            // Regular invocation – create a Tokio runtime and execute the
+            // provided async entry-point.
+            let runtime = build_runtime()?;
+            runtime.block_on(run_main_with_arg0_guard(
+                path_entry_guard,
+                current_exe,
+                main_fn,
+            ))
+        })?;
+
+    match worker.join() {
+        Ok(result) => result,
+        // Preserve the original panic so the standard panic hook output and exit
+        // behavior are unchanged.
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
 }
 
 async fn run_main_with_arg0_guard<F, Fut>(
