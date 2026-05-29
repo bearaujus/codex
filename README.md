@@ -1,3 +1,78 @@
+> **This is a patched fork of [openai/codex](https://github.com/openai/codex).** The sections below document the fork workflow and build system. The original upstream README follows.
+
+---
+
+## Fork Layout
+
+| Branch | Purpose |
+|---|---|
+| `main` | Your working branch — custom patches on top of upstream |
+| `upstream` | Mirrors `openai/codex` main, no custom commits |
+
+## Prerequisites (Windows)
+
+- [Rust toolchain](https://rustup.rs/) (`rustup`, `cargo`)
+- `make` (via [Chocolatey](https://chocolatey.org/): `choco install make`, or [GnuWin32](https://gnuwin32.sourceforge.net/packages/make.htm))
+- PowerShell 5.1+
+
+## Make Commands
+
+| Command | Description |
+|---|---|
+| `make build` | Quick dev build into `./bin` (small profile, fast compile) |
+| `make build-fast` | Release-like build into `./bin` |
+| `make run` | Build + run the local binary |
+| `make install` | Build + install to `%LOCALAPPDATA%\codex\bin` (adds to PATH) |
+| `make check` | Cargo check only — fastest inner loop, no binary output |
+| `make lint` | Clippy with deny lints — run before committing |
+| `make fmt` | Format the Rust workspace |
+| `make test` | Run tests with nextest |
+| `make test-full` | Tests + benchmark smoke pass |
+| `make bench-smoke` | Benchmark smoke pass only |
+| `make web-check` | Compile-check for the WASM browser target |
+| `make web-build` | Build WASM artifact for the browser target |
+| `make clean` | Remove repo-local build artifacts |
+
+All commands accept optional `p=<crate>` and `args=<flags>` to narrow scope, e.g.:
+
+```
+make check p=codex-login
+make test p=codex-login args="--no-run"
+make lint p=codex-tui args="--features foo"
+```
+
+## Daily Workflow
+
+### Sync upstream into the `upstream` branch
+
+```
+git fetch upstream
+git checkout upstream
+git merge upstream/main --ff-only
+git push origin upstream
+```
+
+### Rebase your work onto the latest upstream
+
+```
+git checkout main
+git rebase origin/upstream
+git push --force-with-lease origin main
+```
+
+### Dev loop
+
+```
+make check          # fast compile feedback
+make lint           # before committing
+make test           # run test suite
+make build          # build local binary
+make run            # build + run
+make install        # install to PATH
+```
+
+---
+
 <p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
 <p align="center">
   <img src="https://github.com/openai/codex/blob/main/.github/codex-cli-splash.png" alt="Codex CLI splash" width="80%" />
