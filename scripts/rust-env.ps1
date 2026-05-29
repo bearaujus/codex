@@ -369,11 +369,123 @@ function Enable-SccacheIfAvailable {
     $Wrapper = $Sccache.Source
     $env:RUSTC_WRAPPER = $Wrapper
     $env:CARGO_BUILD_RUSTC_WRAPPER = $Wrapper
-    if (-not $env:SCCACHE_NO_DAEMON) {
-        $env:SCCACHE_NO_DAEMON = '1'
-        Write-Output 'Enabled SCCACHE_NO_DAEMON=1 to avoid local server startup timeouts'
-    }
+    # SCCACHE_NO_DAEMON=1 forces sccache to spin up a fresh one-shot server for
+    # every rustc invocation (including cargo's `rustc -vV` probe), which is what
+    # was timing out and disabling caching entirely. Use a persistent daemon
+    # instead: start it once up front so the first compile connects to a server
+    # that is already listening rather than racing its startup.
+    Remove-Item Env:SCCACHE_NO_DAEMON -ErrorAction SilentlyContinue
+    Start-SccacheServer
     Write-Output "Using sccache wrapper: $Wrapper"
+}
+
+function Get-SccacheServerPort {
+    if ($env:SCCACHE_SERVER_PORT) {
+        return [int]$env:SCCACHE_SERVER_PORT
+    }
+
+    return 4226
+}
+
+function Test-SccacheServerListening {
+    $Port = Get-SccacheServerPort
+    $Listener = Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue
+    return [bool]$Listener
+}
+
+function Invoke-SccacheControl {
+    param(
+        [Parameter(Mandatory = $true)][string]$Action,
+        [switch]$Quiet
+    )
+
+    # sccache control commands write to stderr and exit non-zero in benign cases
+    # (e.g. "couldn't connect to server" when none is running, "Address in use"
+    # when one already is). Isolate them from the caller's
+    # $ErrorActionPreference = 'Stop' so they can never abort the build, and
+    # surface their output for visibility (via Write-Host so this helper never
+    # pollutes the success/pipeline stream) unless -Quiet is requested.
+    $PreviousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & sccache $Action 2>&1 | ForEach-Object {
+            if (-not $Quiet) {
+                Write-Host "$_"
+            }
+        }
+    }
+    catch {
+        if (-not $Quiet) {
+            Write-Host "sccache $Action failed (ignored): $($_.Exception.Message)"
+        }
+    }
+    finally {
+        $ErrorActionPreference = $PreviousErrorActionPreference
+    }
+}
+
+function Get-RustcPathForProbe {
+    $Rustc = Get-Command rustc -CommandType Application -ErrorAction SilentlyContinue
+    if ($Rustc) {
+        return $Rustc.Source
+    }
+
+    return $null
+}
+
+function Test-SccacheCompilePathReady {
+    # The decisive readiness check: does the *compile* request path answer? A
+    # wedged/zombie sccache server can keep its control port listening (so
+    # --show-stats / --stop-server still work) while every `sccache rustc ...`
+    # request times out with "Timed out waiting for server startup" -- which is
+    # exactly what cargo issues. Mirror cargo by running `sccache rustc -vV`
+    # (a fast, special-cased version query) and trust only its exit code.
+    $Rustc = Get-RustcPathForProbe
+    if (-not $Rustc) {
+        # Can't run the authoritative probe; fall back to a liveness signal.
+        return (Test-SccacheServerListening)
+    }
+
+    $PreviousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & sccache $Rustc -vV 2>&1 | Out-Null
+        return ($LASTEXITCODE -eq 0)
+    }
+    catch {
+        return $false
+    }
+    finally {
+        $ErrorActionPreference = $PreviousErrorActionPreference
+    }
+}
+
+function Start-SccacheServer {
+    # Goal: leave a sccache daemon that actually answers *compile* requests
+    # before cargo runs, so cargo's first `sccache rustc -vV` probe connects
+    # instead of timing out on a wedged server or racing an auto-spawned one.
+    #
+    # "Port is listening" is NOT sufficient: a zombie server can listen yet time
+    # out every compile request. So readiness is defined by the compile path
+    # (Test-SccacheCompilePathReady). If a healthy server is already up, reuse it
+    # untouched (and avoid a needless restart race). Otherwise force the clean
+    # stop -> start that reliably produces a working server, then re-verify.
+    if ((Test-SccacheServerListening) -and (Test-SccacheCompilePathReady)) {
+        Write-Output 'Reusing healthy sccache server'
+        return
+    }
+
+    Write-Output 'Starting a fresh sccache server (no healthy server detected)'
+    Invoke-SccacheControl -Action '--stop-server' -Quiet
+    # A zombie can ignore --stop-server while still holding the port; clear any
+    # stragglers so the fresh --start-server can bind 127.0.0.1:<port>.
+    Get-Process sccache -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 400
+    Invoke-SccacheControl -Action '--start-server'
+
+    if (-not (Test-SccacheCompilePathReady)) {
+        Write-Warning 'sccache server is not answering compile requests; the build will fall back to no sccache if it times out'
+    }
 }
 
 function Enable-LocalFastProfileIncremental {
@@ -417,13 +529,22 @@ function Invoke-CargoWithSccacheFallback {
     $OutputText = $Output | Out-String
     if ($OutputText -match 'sccache: error: Timed out waiting for server startup') {
         Write-Warning 'sccache timed out starting; stopping any stale server and retrying once with sccache'
-        $ResetOutput = & sccache --stop-server 2>&1 | ForEach-Object {
-            $Line = "$_"
-            Write-Host $Line
-            $Line
+        # `sccache --stop-server` writes to stderr and exits non-zero when no
+        # server is running. Under the caller's $ErrorActionPreference = 'Stop'
+        # that stderr line is promoted to a terminating NativeCommandError, which
+        # would abort the whole fallback. Isolate it so it can never terminate.
+        $PreviousStopErrorActionPreference = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            & sccache --stop-server 2>&1 | ForEach-Object {
+                Write-Host "$_"
+            }
         }
-        if ($ResetOutput) {
-            $null = $ResetOutput
+        catch {
+            Write-Host "sccache --stop-server failed (ignored): $($_.Exception.Message)"
+        }
+        finally {
+            $ErrorActionPreference = $PreviousStopErrorActionPreference
         }
 
         Write-Phase ("Retrying " + (Format-CommandForDisplay -Executable 'cargo' -Arguments $CargoArgs) + ' after sccache reset')
