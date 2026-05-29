@@ -3399,6 +3399,7 @@ mod tests {
             auth_mode: Some(codex_app_server_protocol::AuthMode::ApiKey),
             openai_api_key: None,
             tokens: None,
+            pool_account_id: None,
             last_refresh: None,
             agent_identity: None,
         };
@@ -3416,6 +3417,7 @@ mod tests {
             auth_mode: None,
             openai_api_key: None,
             tokens: None,
+            pool_account_id: None,
             last_refresh: None,
             agent_identity: None,
         };
@@ -3435,6 +3437,7 @@ mod tests {
             auth_mode: Some(codex_app_server_protocol::AuthMode::ApiKey),
             openai_api_key: Some("sk-test".to_string()),
             tokens: None,
+            pool_account_id: None,
             last_refresh: None,
             agent_identity: None,
         };

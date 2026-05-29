@@ -149,6 +149,7 @@ pub fn write_chatgpt_auth(
 ) -> Result<()> {
     let id_token_raw = encode_id_token(&fixture.claims)?;
     let id_token = parse_chatgpt_jwt_claims(&id_token_raw).context("parse id token")?;
+    let pool_account_id = fixture.account_id.clone();
     let tokens = TokenData {
         id_token,
         access_token: fixture.access_token,
@@ -162,6 +163,7 @@ pub fn write_chatgpt_auth(
         auth_mode: Some(AuthMode::Chatgpt),
         openai_api_key: None,
         tokens: Some(tokens),
+        pool_account_id,
         last_refresh,
         agent_identity: None,
     };

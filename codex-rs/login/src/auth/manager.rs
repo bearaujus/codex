@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use chrono::DateTime;
 use chrono::Utc;
 use reqwest::StatusCode;
 use serde::Deserialize;
@@ -14,6 +15,7 @@ use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio::sync::watch;
 
@@ -23,9 +25,14 @@ use codex_app_server_protocol::AuthMode;
 use codex_app_server_protocol::AuthMode as ApiAuthMode;
 use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::ModelProviderAuthInfo;
+use codex_protocol::protocol::RateLimitSnapshot;
 
 use super::external_bearer::BearerTokenRefresher;
 use super::revoke::revoke_auth_tokens;
+use crate::account_pool::ChatgptAccountPool;
+use crate::account_pool::ChatgptAccountPoolError;
+use crate::account_pool::ChatgptAccountPoolSelectionOutcome;
+use crate::account_pool::account_pool_secret_dir;
 pub use crate::auth::agent_identity::AgentIdentityAuth;
 pub use crate::auth::storage::AgentIdentityAuthRecord;
 pub use crate::auth::storage::AuthDotJson;
@@ -35,6 +42,7 @@ use crate::auth::util::try_parse_error_message;
 use crate::default_client::build_reqwest_client;
 use crate::default_client::create_client;
 use crate::token_data::TokenData;
+use crate::token_data::derive_pool_account_id;
 use crate::token_data::parse_chatgpt_jwt_claims;
 use crate::token_data::parse_jwt_expiration;
 use codex_client::CodexHttpClient;
@@ -344,6 +352,18 @@ impl CodexAuth {
         }
     }
 
+    /// Returns the pool row identifier used for ChatGPT account-pool storage.
+    pub fn get_pool_account_id(&self) -> Option<String> {
+        match self {
+            Self::AgentIdentity(_) => None,
+            _ => self.get_current_auth_json().and_then(|auth| {
+                auth.pool_account_id
+                    .clone()
+                    .or_else(|| derive_pool_account_id_from_auth(&auth))
+            }),
+        }
+    }
+
     /// Returns false if Codex backend auth omits the FedRAMP claim.
     pub fn is_fedramp_account(&self) -> bool {
         match self {
@@ -420,6 +440,7 @@ impl CodexAuth {
                 refresh_token: "test".to_string(),
                 account_id: Some("account_id".to_string()),
             }),
+            pool_account_id: Some(derive_pool_account_id("account_id", None)),
             last_refresh: Some(Utc::now()),
             agent_identity: None,
         };
@@ -536,6 +557,7 @@ pub fn login_with_api_key(
         auth_mode: Some(ApiAuthMode::ApiKey),
         openai_api_key: Some(api_key.to_string()),
         tokens: None,
+        pool_account_id: None,
         last_refresh: None,
         agent_identity: None,
     };
@@ -558,6 +580,7 @@ pub async fn login_with_access_token(
         auth_mode: Some(ApiAuthMode::AgentIdentity),
         openai_api_key: None,
         tokens: None,
+        pool_account_id: None,
         last_refresh: None,
         agent_identity: Some(access_token.to_string()),
     };
@@ -786,16 +809,12 @@ async fn load_auth(
 }
 
 // Persist refreshed tokens into auth storage and update last_refresh.
-fn persist_tokens(
-    storage: &Arc<dyn AuthStorageBackend>,
+fn apply_refreshed_tokens(
+    mut auth_dot_json: AuthDotJson,
     id_token: Option<String>,
     access_token: Option<String>,
     refresh_token: Option<String>,
 ) -> std::io::Result<AuthDotJson> {
-    let mut auth_dot_json = storage
-        .load()?
-        .ok_or(std::io::Error::other("Token data is not available."))?;
-
     let tokens = auth_dot_json.tokens.get_or_insert_with(TokenData::default);
     if let Some(id_token) = id_token {
         tokens.id_token = parse_chatgpt_jwt_claims(&id_token).map_err(std::io::Error::other)?;
@@ -807,6 +826,21 @@ fn persist_tokens(
         tokens.refresh_token = refresh_token;
     }
     auth_dot_json.last_refresh = Some(Utc::now());
+    Ok(auth_dot_json)
+}
+
+// Persist refreshed tokens into auth storage and update last_refresh.
+fn persist_tokens(
+    storage: &Arc<dyn AuthStorageBackend>,
+    id_token: Option<String>,
+    access_token: Option<String>,
+    refresh_token: Option<String>,
+) -> std::io::Result<AuthDotJson> {
+    let auth_dot_json = storage
+        .load()?
+        .ok_or(std::io::Error::other("Token data is not available."))?;
+    let auth_dot_json =
+        apply_refreshed_tokens(auth_dot_json, id_token, access_token, refresh_token)?;
     storage.save(&auth_dot_json)?;
     Ok(auth_dot_json)
 }
@@ -955,11 +989,16 @@ impl AuthDotJson {
             refresh_token: String::new(),
             account_id: Some(chatgpt_metadata.account_id.clone()),
         };
+        let pool_account_id = Some(derive_pool_account_id(
+            &chatgpt_metadata.account_id,
+            tokens.id_token.member_identity_key().as_deref(),
+        ));
 
         Ok(Self {
             auth_mode: Some(ApiAuthMode::ChatgptAuthTokens),
             openai_api_key: None,
             tokens: Some(tokens),
+            pool_account_id,
             last_refresh: Some(Utc::now()),
             agent_identity: None,
         })
@@ -998,6 +1037,18 @@ impl AuthDotJson {
             auth_credentials_store_mode
         }
     }
+}
+
+fn derive_pool_account_id_from_auth(auth: &AuthDotJson) -> Option<String> {
+    let tokens = auth.tokens.as_ref()?;
+    let workspace_account_id = tokens
+        .account_id
+        .as_deref()
+        .or(tokens.id_token.chatgpt_account_id.as_deref())?;
+    Some(derive_pool_account_id(
+        workspace_account_id,
+        tokens.id_token.member_identity_key().as_deref(),
+    ))
 }
 
 /// Internal cached auth state.
@@ -1094,7 +1145,9 @@ impl UnauthorizedRecoveryStepResult {
 impl UnauthorizedRecovery {
     fn new(manager: Arc<AuthManager>) -> Self {
         let cached_auth = manager.auth_cached();
-        let expected_account_id = cached_auth.as_ref().and_then(CodexAuth::get_account_id);
+        let expected_account_id = cached_auth
+            .as_ref()
+            .and_then(CodexAuth::get_pool_account_id);
         let mode = if manager.has_external_api_key_auth()
             || cached_auth
                 .as_ref()
@@ -1182,6 +1235,13 @@ impl UnauthorizedRecovery {
         }
     }
 
+    pub fn current_auth_is_chatgpt(&self) -> bool {
+        self.manager
+            .auth_cached()
+            .as_ref()
+            .is_some_and(CodexAuth::is_chatgpt_auth)
+    }
+
     pub async fn next(&mut self) -> Result<UnauthorizedRecoveryStepResult, RefreshTokenError> {
         if !self.has_next() {
             return Err(RefreshTokenError::Permanent(RefreshTokenFailedError::new(
@@ -1219,7 +1279,7 @@ impl UnauthorizedRecovery {
                 }
             }
             UnauthorizedRecoveryStep::RefreshToken => {
-                self.manager.refresh_token_from_authority().await?;
+                self.manager.refresh_token_from_authority_forced().await?;
                 self.step = UnauthorizedRecoveryStep::Done;
                 return Ok(UnauthorizedRecoveryStepResult {
                     auth_state_changed: Some(true),
@@ -1260,6 +1320,7 @@ pub struct AuthManager {
     chatgpt_base_url: Option<String>,
     refresh_lock: Semaphore,
     external_auth: RwLock<Option<Arc<dyn ExternalAuth>>>,
+    account_pool: Option<ChatgptAccountPool>,
 }
 
 /// Configuration view required to construct a shared [`AuthManager`].
@@ -1298,8 +1359,120 @@ impl Debug for AuthManager {
             )
             .field("chatgpt_base_url", &self.chatgpt_base_url)
             .field("has_external_auth", &self.has_external_auth())
+            .field("has_account_pool", &self.account_pool.is_some())
             .finish_non_exhaustive()
     }
+}
+
+fn should_consider_account_pool_auth(auth: Option<&CodexAuth>) -> bool {
+    matches!(auth, Some(CodexAuth::Chatgpt(_)))
+}
+
+async fn load_startup_account_pool_auth(
+    codex_home: &Path,
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
+    chatgpt_base_url: Option<&str>,
+    managed_auth: Option<CodexAuth>,
+    account_pool: Option<&ChatgptAccountPool>,
+) -> Option<CodexAuth> {
+    let Some(account_pool) = account_pool else {
+        return managed_auth;
+    };
+    let managed_chatgpt_auth_loaded = managed_auth
+        .as_ref()
+        .is_some_and(|auth| matches!(auth, CodexAuth::Chatgpt(_)));
+    let candidate_auth = managed_auth;
+    if managed_chatgpt_auth_loaded {
+        let Some(current_account_id) = candidate_auth
+            .as_ref()
+            .and_then(CodexAuth::get_pool_account_id)
+        else {
+            return candidate_auth;
+        };
+        match account_pool
+            .account_last_auth_refresh_at(&current_account_id)
+            .await
+        {
+            Ok(_) => {}
+            Err(ChatgptAccountPoolError::AccountNotFound(_)) => {
+                return candidate_auth;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    account_id = current_account_id,
+                    error = %err,
+                    "failed to check whether startup ChatGPT auth belongs to the account pool; keeping existing managed auth"
+                );
+                return candidate_auth;
+            }
+        }
+    }
+    let fallback_auth = candidate_auth.clone();
+    let current_account_id = fallback_auth
+        .as_ref()
+        .and_then(CodexAuth::get_pool_account_id);
+    let selection = match account_pool
+        .resolve_turn_selection(
+            current_account_id.as_deref(),
+            /*current_refresh_failed_permanently*/ false,
+        )
+        .await
+    {
+        Ok(selection) => selection,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "failed to resolve ChatGPT account-pool startup selection; \
+                 keeping existing managed auth"
+            );
+            return candidate_auth;
+        }
+    };
+    let resolved = match selection {
+        ChatgptAccountPoolSelectionOutcome::Unchanged => candidate_auth.clone(),
+        ChatgptAccountPoolSelectionOutcome::NoEligibleAccounts => {
+            if managed_chatgpt_auth_loaded
+                && let Err(err) = logout(codex_home, auth_credentials_store_mode)
+            {
+                tracing::warn!("failed to clear stale ChatGPT auth after pool selection: {err}");
+            }
+            return None;
+        }
+        ChatgptAccountPoolSelectionOutcome::Activated { auth, .. } => {
+            if save_auth(codex_home, &auth, auth_credentials_store_mode).is_err() {
+                return candidate_auth;
+            }
+            CodexAuth::from_auth_dot_json(
+                codex_home,
+                auth,
+                auth_credentials_store_mode,
+                chatgpt_base_url,
+            )
+            .await
+            .ok()
+            .or(candidate_auth.clone())
+        }
+    };
+
+    // Probe /usage before handing auth to the MCP layer. A 401 here is not
+    // authoritative enough to rotate or invalidate the selected account at
+    // startup, so keep the current auth and let the normal runtime refresh
+    // and failover paths make the final decision with fresher context.
+    if let Some(auth) = &resolved
+        && let Some(account_id) = auth.get_account_id()
+        && matches!(auth, CodexAuth::Chatgpt(_))
+        && account_pool
+            .probe_token_status(chatgpt_base_url, auth)
+            .await
+            == Some(reqwest::StatusCode::UNAUTHORIZED)
+    {
+        tracing::warn!(
+            account_id,
+            "startup probe got 401; keeping current auth because /usage 401 is non-authoritative at startup"
+        );
+    }
+
+    resolved
 }
 
 impl AuthManager {
@@ -1322,6 +1495,29 @@ impl AuthManager {
         .await
         .ok()
         .flatten();
+        let account_pool = ChatgptAccountPool::open(
+            codex_home.clone(),
+            auth_credentials_store_mode,
+            chatgpt_base_url.clone(),
+        )
+        .await
+        .map_err(|err| {
+            tracing::warn!("failed to initialize ChatGPT account pool: {err}");
+            err
+        })
+        .ok();
+        let managed_auth = if should_consider_account_pool_auth(managed_auth.as_ref()) {
+            load_startup_account_pool_auth(
+                &codex_home,
+                auth_credentials_store_mode,
+                chatgpt_base_url.as_deref(),
+                managed_auth,
+                account_pool.as_ref(),
+            )
+            .await
+        } else {
+            managed_auth
+        };
         let (auth_change_tx, _auth_change_rx) = watch::channel(0);
         Self {
             codex_home,
@@ -1336,6 +1532,7 @@ impl AuthManager {
             chatgpt_base_url,
             refresh_lock: Semaphore::new(/*permits*/ 1),
             external_auth: RwLock::new(None),
+            account_pool,
         }
     }
 
@@ -1357,6 +1554,7 @@ impl AuthManager {
             chatgpt_base_url: None,
             refresh_lock: Semaphore::new(/*permits*/ 1),
             external_auth: RwLock::new(None),
+            account_pool: None,
         })
     }
 
@@ -1377,6 +1575,7 @@ impl AuthManager {
             chatgpt_base_url: None,
             refresh_lock: Semaphore::new(/*permits*/ 1),
             external_auth: RwLock::new(None),
+            account_pool: None,
         })
     }
 
@@ -1397,6 +1596,7 @@ impl AuthManager {
             external_auth: RwLock::new(Some(
                 Arc::new(BearerTokenRefresher::new(config)) as Arc<dyn ExternalAuth>
             )),
+            account_pool: None,
         })
     }
 
@@ -1429,11 +1629,15 @@ impl AuthManager {
         }
 
         let auth = self.auth_cached()?;
+        if let Err(err) = self.maybe_reload_pool_managed_auth_from_ack(&auth).await {
+            tracing::error!("Failed to reload pool-managed auth from account pool: {err}");
+        }
+        let auth = self.auth_cached().unwrap_or(auth);
         if Self::is_stale_for_proactive_refresh(&auth)
             && let Err(err) = self.refresh_token().await
         {
             tracing::error!("Failed to refresh token: {}", err);
-            return Some(auth);
+            return self.auth_cached().or(Some(auth));
         }
         self.auth_cached()
     }
@@ -1459,7 +1663,7 @@ impl AuthManager {
         };
 
         let new_auth = self.load_auth_from_storage().await;
-        let new_account_id = new_auth.as_ref().and_then(CodexAuth::get_account_id);
+        let new_account_id = new_auth.as_ref().and_then(CodexAuth::get_pool_account_id);
 
         if new_account_id.as_deref() != Some(expected_account_id) {
             let found_account_id = new_account_id.as_deref().unwrap_or("unknown");
@@ -1636,6 +1840,216 @@ impl AuthManager {
         auth_manager
     }
 
+    pub fn chatgpt_account_pool(&self) -> Option<ChatgptAccountPool> {
+        self.account_pool.clone()
+    }
+
+    pub async fn record_account_pool_activity(&self) {
+        let Some(account_pool) = self.account_pool.as_ref() else {
+            return;
+        };
+        let current_auth = self.auth_cached();
+        let account_id = current_auth
+            .as_ref()
+            .filter(|auth| matches!(auth, CodexAuth::Chatgpt(_)))
+            .and_then(CodexAuth::get_pool_account_id);
+        let Some(account_id) = account_id else {
+            return;
+        };
+        account_pool.record_account_activity(&account_id).await;
+    }
+
+    pub async fn clear_account_pool_activity(&self) {
+        let Some(account_pool) = self.account_pool.as_ref() else {
+            return;
+        };
+        let current_auth = self.auth_cached();
+        let account_id = current_auth
+            .as_ref()
+            .filter(|auth| matches!(auth, CodexAuth::Chatgpt(_)))
+            .and_then(CodexAuth::get_pool_account_id);
+        let Some(account_id) = account_id else {
+            return;
+        };
+        account_pool.clear_account_activity(&account_id).await;
+    }
+
+    pub async fn record_account_pool_rate_limits_fetch(&self, snapshots: &[RateLimitSnapshot]) {
+        if snapshots.is_empty() {
+            return;
+        }
+        let Some(account_pool) = self.account_pool.as_ref() else {
+            return;
+        };
+        let current_auth = self.auth_cached();
+        let account_id = current_auth
+            .as_ref()
+            .filter(|auth| matches!(auth, CodexAuth::Chatgpt(_)))
+            .and_then(CodexAuth::get_pool_account_id);
+        let Some(account_id) = account_id else {
+            return;
+        };
+        if let Err(err) = account_pool
+            .record_fetched_rate_limits(&account_id, snapshots)
+            .await
+        {
+            tracing::warn!(
+                account_id,
+                error = %err,
+                "failed to persist fetched ChatGPT account-pool rate limits"
+            );
+        }
+    }
+
+    pub async fn record_account_pool_rate_limit_snapshot(&self, snapshot: &RateLimitSnapshot) {
+        let Some(account_pool) = self.account_pool.as_ref() else {
+            return;
+        };
+        let current_auth = self.auth_cached();
+        let account_id = current_auth
+            .as_ref()
+            .filter(|auth| matches!(auth, CodexAuth::Chatgpt(_)))
+            .and_then(CodexAuth::get_pool_account_id);
+        let Some(account_id) = account_id else {
+            return;
+        };
+        if let Err(err) = account_pool
+            .record_rate_limit_snapshot(&account_id, snapshot)
+            .await
+        {
+            tracing::warn!(
+                account_id,
+                error = %err,
+                "failed to persist observed ChatGPT account-pool rate limits"
+            );
+        }
+    }
+
+    pub async fn prepare_chatgpt_account_pool_for_turn(
+        &self,
+    ) -> Result<(), ChatgptAccountPoolError> {
+        if !should_consider_account_pool_auth(self.auth_cached().as_ref()) {
+            return Ok(());
+        }
+        let Some(account_pool) = self.account_pool.as_ref() else {
+            return Ok(());
+        };
+        let current_auth = self.auth_cached();
+        let current_account_id = current_auth
+            .as_ref()
+            .and_then(CodexAuth::get_pool_account_id);
+        let current_refresh_failed_permanently = current_auth
+            .as_ref()
+            .and_then(|auth| self.refresh_failure_for_auth(auth))
+            .is_some();
+        match account_pool
+            .resolve_turn_selection(
+                current_account_id.as_deref(),
+                current_refresh_failed_permanently,
+            )
+            .await?
+        {
+            ChatgptAccountPoolSelectionOutcome::Unchanged => Ok(()),
+            ChatgptAccountPoolSelectionOutcome::NoEligibleAccounts => {
+                if current_auth
+                    .as_ref()
+                    .is_some_and(|auth| matches!(auth, CodexAuth::Chatgpt(_)))
+                {
+                    logout(&self.codex_home, self.auth_credentials_store_mode)?;
+                    self.reload().await;
+                }
+                Err(ChatgptAccountPoolError::NoEligibleAccounts)
+            }
+            ChatgptAccountPoolSelectionOutcome::Activated { auth, .. } => {
+                save_auth(&self.codex_home, &auth, self.auth_credentials_store_mode)?;
+                self.reload().await;
+                Ok(())
+            }
+        }
+    }
+
+    pub async fn handle_chatgpt_account_pool_usage_limit(
+        &self,
+        safe_to_retry: bool,
+        snapshot: Option<&RateLimitSnapshot>,
+        resets_at: Option<DateTime<Utc>>,
+    ) -> Result<bool, ChatgptAccountPoolError> {
+        let Some(account_pool) = self.account_pool.as_ref() else {
+            return Ok(false);
+        };
+        let current_auth = self.auth_cached();
+        let Some(current_auth) = current_auth.as_ref() else {
+            return Ok(false);
+        };
+        if !matches!(current_auth, CodexAuth::Chatgpt(_)) {
+            return Ok(false);
+        }
+        let Some(account_id) = current_auth.get_pool_account_id() else {
+            return Ok(false);
+        };
+        account_pool
+            .mark_current_account_rate_limited(&account_id, snapshot, resets_at)
+            .await?;
+        if !safe_to_retry {
+            return Ok(false);
+        }
+        match account_pool
+            .resolve_turn_selection(
+                Some(account_id.as_str()),
+                /*current_refresh_failed_permanently*/ false,
+            )
+            .await?
+        {
+            ChatgptAccountPoolSelectionOutcome::Activated { auth, failover, .. } if failover => {
+                save_auth(&self.codex_home, &auth, self.auth_credentials_store_mode)?;
+                self.reload().await;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    pub async fn handle_chatgpt_account_pool_auth_failure(
+        &self,
+        safe_to_retry: bool,
+        error: &RefreshTokenFailedError,
+    ) -> Result<bool, ChatgptAccountPoolError> {
+        let Some(account_pool) = self.account_pool.as_ref() else {
+            return Ok(false);
+        };
+        let current_auth = self.auth_cached();
+        let Some(current_auth) = current_auth.as_ref() else {
+            return Ok(false);
+        };
+        if !matches!(current_auth, CodexAuth::Chatgpt(_)) {
+            return Ok(false);
+        }
+        let Some(account_id) = current_auth.get_pool_account_id() else {
+            return Ok(false);
+        };
+        account_pool
+            .mark_account_auth_failed(&account_id, &error.to_string())
+            .await?;
+        self.record_permanent_refresh_failure_if_unchanged(current_auth, error);
+        if !safe_to_retry {
+            return Ok(false);
+        }
+        match account_pool
+            .resolve_turn_selection(
+                Some(account_id.as_str()),
+                /*current_refresh_failed_permanently*/ false,
+            )
+            .await?
+        {
+            ChatgptAccountPoolSelectionOutcome::Activated { auth, failover, .. } if failover => {
+                save_auth(&self.codex_home, &auth, self.auth_credentials_store_mode)?;
+                self.reload().await;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     pub fn unauthorized_recovery(self: &Arc<Self>) -> UnauthorizedRecovery {
         UnauthorizedRecovery::new(Arc::clone(self))
     }
@@ -1686,6 +2100,12 @@ impl AuthManager {
                 REFRESH_TOKEN_UNKNOWN_MESSAGE.to_string(),
             ))
         })?;
+        if let Some(auth) = self.auth_cached() {
+            if auth.is_api_key_auth() {
+                return Ok(());
+            }
+            self.maybe_reload_pool_managed_auth_from_ack(&auth).await?;
+        }
         let auth_before_reload = self.auth_cached();
         if auth_before_reload
             .as_ref()
@@ -1695,7 +2115,7 @@ impl AuthManager {
         }
         let expected_account_id = auth_before_reload
             .as_ref()
-            .and_then(CodexAuth::get_account_id);
+            .and_then(CodexAuth::get_pool_account_id);
 
         match self
             .reload_if_account_id_matches(expected_account_id.as_deref())
@@ -1705,7 +2125,10 @@ impl AuthManager {
                 tracing::info!("Skipping token refresh because auth changed after guarded reload.");
                 Ok(())
             }
-            ReloadOutcome::ReloadedNoChange => self.refresh_token_from_authority_impl().await,
+            ReloadOutcome::ReloadedNoChange => {
+                self.refresh_token_from_authority_impl(/*forced=*/ false)
+                    .await
+            }
             ReloadOutcome::Skipped => {
                 Err(RefreshTokenError::Permanent(RefreshTokenFailedError::new(
                     RefreshTokenFailedReason::Other,
@@ -1720,20 +2143,45 @@ impl AuthManager {
     /// observe refreshed token. If the token refresh fails, returns the error to
     /// the caller.
     pub async fn refresh_token_from_authority(&self) -> Result<(), RefreshTokenError> {
+        self.refresh_token_from_authority_with_forced(/*forced=*/ false)
+            .await
+    }
+
+    /// Like [`refresh_token_from_authority`] but bypasses the "token looks
+    /// valid by expiry" short-circuit inside the pool-managed refresh path.
+    /// Call this when responding to a server-side 401 — the server has already
+    /// told us the token is invalid, so expiry-based skipping is wrong.
+    pub(crate) async fn refresh_token_from_authority_forced(
+        &self,
+    ) -> Result<(), RefreshTokenError> {
+        self.refresh_token_from_authority_with_forced(/*forced=*/ true)
+            .await
+    }
+
+    async fn refresh_token_from_authority_with_forced(
+        &self,
+        forced: bool,
+    ) -> Result<(), RefreshTokenError> {
         let _refresh_guard = self.refresh_lock.acquire().await.map_err(|_| {
             RefreshTokenError::Permanent(RefreshTokenFailedError::new(
                 RefreshTokenFailedReason::Other,
                 REFRESH_TOKEN_UNKNOWN_MESSAGE.to_string(),
             ))
         })?;
-        self.refresh_token_from_authority_impl().await
+        self.refresh_token_from_authority_impl(forced).await
     }
 
-    async fn refresh_token_from_authority_impl(&self) -> Result<(), RefreshTokenError> {
+    async fn refresh_token_from_authority_impl(
+        &self,
+        forced: bool,
+    ) -> Result<(), RefreshTokenError> {
         tracing::info!("Refreshing token");
 
         let auth = match self.auth_cached() {
-            Some(auth) => auth,
+            Some(auth) => {
+                self.maybe_reload_pool_managed_auth_from_ack(&auth).await?;
+                self.auth_cached().unwrap_or(auth)
+            }
             None => return Ok(()),
         };
         if let Some(error) = self.refresh_failure_for_auth(&auth) {
@@ -1741,24 +2189,281 @@ impl AuthManager {
         }
 
         let attempted_auth = auth.clone();
-        let result = match auth {
-            CodexAuth::ChatgptAuthTokens(_) => {
-                self.refresh_external_auth(ExternalAuthRefreshReason::Unauthorized)
-                    .await
+        let result = if let Some((account_pool, chatgpt_auth, account_id)) =
+            self.pool_managed_chatgpt_refresh_context(&auth).await?
+        {
+            self.refresh_pool_managed_chatgpt_token(
+                &account_pool,
+                &chatgpt_auth,
+                &account_id,
+                forced,
+            )
+            .await
+        } else {
+            match auth {
+                CodexAuth::ChatgptAuthTokens(_) => {
+                    self.refresh_external_auth(ExternalAuthRefreshReason::Unauthorized)
+                        .await
+                }
+                CodexAuth::Chatgpt(chatgpt_auth) => {
+                    let token_data = chatgpt_auth.current_token_data().ok_or_else(|| {
+                        RefreshTokenError::Transient(std::io::Error::other(
+                            "Token data is not available.",
+                        ))
+                    })?;
+                    self.refresh_and_persist_chatgpt_token(&chatgpt_auth, token_data.refresh_token)
+                        .await
+                }
+                CodexAuth::ApiKey(_) | CodexAuth::AgentIdentity(_) => Ok(()),
             }
-            CodexAuth::Chatgpt(chatgpt_auth) => {
-                let token_data = chatgpt_auth.current_token_data().ok_or_else(|| {
+        };
+        if let Err(RefreshTokenError::Permanent(error)) = &result {
+            self.record_permanent_refresh_failure_if_unchanged(&attempted_auth, error);
+        }
+        result
+    }
+
+    // Pool-managed ChatGPT token refresh coordination.
+    async fn maybe_reload_pool_managed_auth_from_ack(
+        &self,
+        auth: &CodexAuth,
+    ) -> Result<bool, RefreshTokenError> {
+        let Some((account_pool, _, account_id)) =
+            self.pool_managed_chatgpt_refresh_context(auth).await?
+        else {
+            return Ok(false);
+        };
+        let last_loaded_refresh_at = auth
+            .get_current_auth_json()
+            .and_then(|auth_dot_json| auth_dot_json.last_refresh.map(|value| value.timestamp()));
+        let last_persisted_refresh_at = account_pool
+            .account_last_auth_refresh_at(&account_id)
+            .await
+            .map_err(|err| RefreshTokenError::Transient(std::io::Error::other(err)))?;
+        if last_persisted_refresh_at <= last_loaded_refresh_at {
+            return Ok(false);
+        }
+        self.reload_active_auth_from_pool_copy(&account_id).await
+    }
+
+    async fn pool_managed_chatgpt_refresh_context(
+        &self,
+        auth: &CodexAuth,
+    ) -> Result<Option<(ChatgptAccountPool, ChatgptAuth, String)>, RefreshTokenError> {
+        let Some(account_pool) = self.account_pool.clone() else {
+            return Ok(None);
+        };
+        let CodexAuth::Chatgpt(chatgpt_auth) = auth else {
+            return Ok(None);
+        };
+        let Some(account_id) = auth.get_pool_account_id() else {
+            return Ok(None);
+        };
+        match account_pool.account_last_auth_refresh_at(&account_id).await {
+            Ok(_) => Ok(Some((account_pool, chatgpt_auth.clone(), account_id))),
+            Err(ChatgptAccountPoolError::AccountNotFound(_)) => Ok(None),
+            Err(err) => Err(RefreshTokenError::Transient(std::io::Error::other(err))),
+        }
+    }
+
+    async fn reload_active_auth_from_pool_copy(
+        &self,
+        account_id: &str,
+    ) -> Result<bool, RefreshTokenError> {
+        let pool_secret_home = account_pool_secret_dir(&self.codex_home, account_id);
+        let pool_auth =
+            match load_auth_dot_json(&pool_secret_home, self.auth_credentials_store_mode)
+                .map_err(RefreshTokenError::Transient)?
+            {
+                Some(pool_auth) => pool_auth,
+                None => {
+                    if let Some(account_pool) = self.account_pool.as_ref() {
+                        self.failover_from_missing_pool_secret(account_pool, account_id)
+                            .await?;
+                        return Ok(true);
+                    }
+                    return Err(RefreshTokenError::Transient(std::io::Error::other(
+                        format!("pool auth secret missing for account {account_id}"),
+                    )));
+                }
+            };
+        let loaded_account_id = pool_auth.pool_account_id.as_deref();
+        if loaded_account_id != Some(account_id) {
+            return Err(RefreshTokenError::Permanent(RefreshTokenFailedError::new(
+                RefreshTokenFailedReason::Other,
+                REFRESH_TOKEN_ACCOUNT_MISMATCH_MESSAGE.to_string(),
+            )));
+        }
+        save_auth(
+            &self.codex_home,
+            &pool_auth,
+            self.auth_credentials_store_mode,
+        )
+        .map_err(RefreshTokenError::Transient)?;
+        Ok(self.reload().await)
+    }
+
+    async fn failover_from_missing_pool_secret(
+        &self,
+        account_pool: &ChatgptAccountPool,
+        account_id: &str,
+    ) -> Result<(), RefreshTokenError> {
+        account_pool
+            .mark_account_missing_secret(account_id)
+            .await
+            .map_err(|err| RefreshTokenError::Transient(std::io::Error::other(err)))?;
+        match account_pool
+            .resolve_turn_selection(
+                Some(account_id),
+                /*current_refresh_failed_permanently*/ false,
+            )
+            .await
+            .map_err(|err| RefreshTokenError::Transient(std::io::Error::other(err)))?
+        {
+            ChatgptAccountPoolSelectionOutcome::Activated { auth, failover, .. } if failover => {
+                save_auth(&self.codex_home, &auth, self.auth_credentials_store_mode)
+                    .map_err(RefreshTokenError::Transient)?;
+                let _ = self.reload().await;
+                Ok(())
+            }
+            _ => Err(RefreshTokenError::Transient(std::io::Error::other(
+                format!("pool auth secret missing for account {account_id}",),
+            ))),
+        }
+    }
+
+    async fn refresh_pool_managed_chatgpt_token(
+        &self,
+        account_pool: &ChatgptAccountPool,
+        chatgpt_auth: &ChatgptAuth,
+        account_id: &str,
+        // When true, the current in-memory token should not be trusted just
+        // because its expiry still looks fresh. Pass true when responding to a
+        // server 401. We still reload from the pool copy when another refresher
+        // already rotated the token.
+        forced: bool,
+    ) -> Result<(), RefreshTokenError> {
+        let cached_auth_dot_json = chatgpt_auth.current_auth_json();
+        let owner = ChatgptAccountPool::token_refresh_lock_owner();
+        let acquired = account_pool
+            .try_acquire_token_refresh_lock(
+                account_id,
+                &owner,
+                ChatgptAccountPool::token_refresh_lock_ttl(),
+            )
+            .await
+            .map_err(|err| RefreshTokenError::Transient(std::io::Error::other(err)))?;
+        if !acquired {
+            // Another process holds the lock and is refreshing the token. Poll
+            // until the token is no longer stale or the lock TTL elapses, so we
+            // don't return a spurious transient error when the peer finishes within
+            // the normal ~500 ms–2 s HTTP round-trip window. Worst case the lock
+            // holder crashed mid-refresh: we wait out the full TTL and return a
+            // transient error, but the next turn re-acquires the now-expired lock
+            // and refreshes, so the stall is bounded to a single TTL window.
+            const POLL_INTERVAL_MS: u64 = 500;
+            let max_wait_ms: u64 = ChatgptAccountPool::token_refresh_lock_ttl().as_millis() as u64;
+            let mut waited_ms: u64 = 0;
+            loop {
+                tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+                waited_ms += POLL_INTERVAL_MS;
+                self.reload_active_auth_from_pool_copy(account_id).await?;
+                let reloaded_auth = self.auth_cached().ok_or_else(|| {
                     RefreshTokenError::Transient(std::io::Error::other(
                         "Token data is not available.",
                     ))
                 })?;
-                self.refresh_and_persist_chatgpt_token(&chatgpt_auth, token_data.refresh_token)
-                    .await
+                let reloaded_auth_dot_json =
+                    reloaded_auth.get_current_auth_json().ok_or_else(|| {
+                        RefreshTokenError::Transient(std::io::Error::other(
+                            "Token data is not available.",
+                        ))
+                    })?;
+                if !ChatgptAccountPool::account_auth_needs_token_refresh(
+                    &reloaded_auth_dot_json,
+                    Utc::now(),
+                ) {
+                    return Ok(());
+                }
+                if waited_ms >= max_wait_ms {
+                    return Err(RefreshTokenError::Transient(std::io::Error::other(
+                        format!(
+                            "pool-managed token refresh for account {account_id} did not complete \
+                         within {max_wait_ms}ms"
+                        ),
+                    )));
+                }
             }
-            CodexAuth::ApiKey(_) | CodexAuth::AgentIdentity(_) => Ok(()),
-        };
-        if let Err(RefreshTokenError::Permanent(error)) = &result {
-            self.record_permanent_refresh_failure_if_unchanged(&attempted_auth, error);
+        }
+
+        let result = async {
+            let pool_secret_home = account_pool_secret_dir(&self.codex_home, account_id);
+            let auth_dot_json =
+                match load_auth_dot_json(&pool_secret_home, self.auth_credentials_store_mode)
+                    .map_err(RefreshTokenError::Transient)?
+                {
+                    Some(auth_dot_json) => auth_dot_json,
+                    None => {
+                        self.failover_from_missing_pool_secret(account_pool, account_id)
+                            .await?;
+                        return Ok(());
+                    }
+                };
+            let loaded_account_id = auth_dot_json.pool_account_id.as_deref();
+            if loaded_account_id != Some(account_id) {
+                return Err(RefreshTokenError::Permanent(RefreshTokenFailedError::new(
+                    RefreshTokenFailedReason::Other,
+                    REFRESH_TOKEN_ACCOUNT_MISMATCH_MESSAGE.to_string(),
+                )));
+            }
+            let pool_auth_needs_refresh =
+                ChatgptAccountPool::account_auth_needs_token_refresh(&auth_dot_json, Utc::now());
+            let pool_auth_changed = cached_auth_dot_json.as_ref() != Some(&auth_dot_json);
+            if pool_auth_changed && !pool_auth_needs_refresh {
+                self.reload_active_auth_from_pool_copy(account_id).await?;
+                return Ok(());
+            }
+            if !forced && !pool_auth_needs_refresh {
+                self.reload_active_auth_from_pool_copy(account_id).await?;
+                return Ok(());
+            }
+            let refresh_token = auth_dot_json
+                .tokens
+                .as_ref()
+                .ok_or_else(|| {
+                    RefreshTokenError::Transient(std::io::Error::other(
+                        "Token data is not available.",
+                    ))
+                })?
+                .refresh_token
+                .clone();
+            let refresh_response =
+                request_chatgpt_token_refresh(refresh_token, chatgpt_auth.client()).await?;
+            let persisted_auth = apply_refreshed_tokens(
+                auth_dot_json,
+                refresh_response.id_token,
+                refresh_response.access_token,
+                refresh_response.refresh_token,
+            )
+            .map_err(RefreshTokenError::Transient)?;
+            account_pool
+                .persist_refreshed_account_auth(account_id, &persisted_auth)
+                .await
+                .map_err(|err| RefreshTokenError::Transient(std::io::Error::other(err)))?;
+            self.reload_active_auth_from_pool_copy(account_id).await?;
+            Ok(())
+        }
+        .await;
+
+        if let Err(err) = account_pool
+            .release_token_refresh_lock(account_id, &owner)
+            .await
+        {
+            tracing::warn!(
+                account_id,
+                owner,
+                "failed to release pool-managed token refresh lock: {err}"
+            );
         }
         result
     }

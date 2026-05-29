@@ -118,6 +118,7 @@ async fn list_apps_returns_empty_with_api_key_auth() -> Result<()> {
             auth_mode: Some(AuthMode::ApiKey),
             openai_api_key: Some("test-api-key".to_string()),
             tokens: None,
+            pool_account_id: None,
             last_refresh: None,
             agent_identity: None,
         },

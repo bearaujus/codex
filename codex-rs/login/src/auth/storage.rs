@@ -41,6 +41,9 @@ pub struct AuthDotJson {
     pub tokens: Option<TokenData>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_account_id: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_refresh: Option<DateTime<Utc>>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]

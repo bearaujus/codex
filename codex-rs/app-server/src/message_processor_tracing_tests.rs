@@ -25,11 +25,13 @@ use codex_app_server_protocol::UserInput;
 use codex_arg0::Arg0DispatchPaths;
 use codex_config::CloudRequirementsLoader;
 use codex_config::LoaderOverrides;
+use codex_config::types::AuthCredentialsStoreMode;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_exec_server::EnvironmentManager;
 use codex_feedback::CodexFeedback;
 use codex_login::AuthManager;
+use codex_login::login_with_api_key;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::W3cTraceContext;
 use opentelemetry::global;
@@ -109,6 +111,7 @@ struct TracingHarness {
     _server: MockServer,
     _codex_home: TempDir,
     processor: Arc<MessageProcessor>,
+    auth_manager: Arc<AuthManager>,
     outgoing_rx: mpsc::Receiver<crate::outgoing_message::OutgoingEnvelope>,
     session: Arc<ConnectionSessionState>,
     tracing: &'static TestTracing,
@@ -119,7 +122,7 @@ impl TracingHarness {
         let server = create_mock_responses_server_repeating_assistant("Done").await;
         let codex_home = TempDir::new()?;
         let config = Arc::new(build_test_config(codex_home.path(), &server.uri()).await?);
-        let (processor, outgoing_rx) = build_test_processor(config).await;
+        let (processor, auth_manager, outgoing_rx) = build_test_processor(config).await;
         let tracing = init_test_tracing();
         tracing.exporter.reset();
         tracing::callsite::rebuild_interest_cache();
@@ -127,6 +130,7 @@ impl TracingHarness {
             _server: server,
             _codex_home: codex_home,
             processor,
+            auth_manager,
             outgoing_rx,
             session: Arc::new(ConnectionSessionState::new()),
             tracing,
@@ -230,6 +234,7 @@ async fn build_test_processor(
     config: Arc<Config>,
 ) -> (
     Arc<MessageProcessor>,
+    Arc<AuthManager>,
     mpsc::Receiver<crate::outgoing_message::OutgoingEnvelope>,
 ) {
     let (outgoing_tx, outgoing_rx) = mpsc::channel(16);
@@ -262,13 +267,13 @@ async fn build_test_processor(
         state_db: None,
         config_warnings: Vec::new(),
         session_source: SessionSource::VSCode,
-        auth_manager,
+        auth_manager: Arc::clone(&auth_manager),
         installation_id: "11111111-1111-4111-8111-111111111111".to_string(),
         rpc_transport: AppServerRpcTransport::Stdio,
         remote_control_handle: None,
         plugin_startup_tasks: crate::PluginStartupTasks::Start,
     }));
-    (processor, outgoing_rx)
+    (processor, auth_manager, outgoing_rx)
 }
 
 fn run_current_thread_test_with_stack<F>(name: &str, future: F) -> Result<()>
@@ -706,5 +711,56 @@ async fn turn_start_jsonrpc_span_parents_core_turn_spans() -> Result<()> {
     assert_span_descends_from(&spans, core_turn_span, server_request_span);
     harness.shutdown().await;
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial(app_server_tracing)]
+async fn account_updated_notifier_survives_unrelated_connection_close() -> Result<()> {
+    let mut harness = TracingHarness::new().await?;
+    let disconnected_session = Arc::new(ConnectionSessionState::new());
+
+    harness
+        .processor
+        .connection_closed(ConnectionId(8), &disconnected_session)
+        .await;
+    login_with_api_key(
+        harness._codex_home.path(),
+        "sk-test-key",
+        AuthCredentialsStoreMode::File,
+    )?;
+    harness.auth_manager.reload().await;
+
+    let payload = loop {
+        let envelope = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            harness.outgoing_rx.recv(),
+        )
+        .await
+        .expect("timed out waiting for account/updated notification")
+        .expect("outgoing channel closed");
+        let notification = match envelope {
+            crate::outgoing_message::OutgoingEnvelope::Broadcast { message }
+            | crate::outgoing_message::OutgoingEnvelope::ToConnection { message, .. } => {
+                let crate::outgoing_message::OutgoingMessage::AppServerNotification(notification) =
+                    message
+                else {
+                    continue;
+                };
+                notification
+            }
+        };
+        let codex_app_server_protocol::ServerNotification::AccountUpdated(payload) = notification
+        else {
+            continue;
+        };
+        break payload;
+    };
+
+    assert_eq!(
+        payload.auth_mode,
+        Some(codex_app_server_protocol::AuthMode::ApiKey)
+    );
+    harness.shutdown().await;
     Ok(())
 }

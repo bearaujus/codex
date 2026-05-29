@@ -513,6 +513,7 @@ impl MessageProcessor {
     }
 
     pub(crate) fn clear_runtime_references(&self) {
+        self.account_processor.shutdown();
         self.account_processor.clear_external_auth();
         self.apps_processor.shutdown();
         self.skills_watcher.shutdown();

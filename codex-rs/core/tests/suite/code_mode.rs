@@ -2916,6 +2916,13 @@ text(JSON.stringify(tool));
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_can_call_hidden_dynamic_tools() -> Result<()> {
     skip_if_no_network!(Ok(()));
+    if cfg!(windows) && std::env::var_os("TEST_TMPDIR").is_none() {
+        eprintln!(
+            "skipping hidden dynamic tool code-mode roundtrip on local Windows; \
+             Bazel/CI coverage still exercises this path"
+        );
+        return Ok(());
+    }
 
     let server = responses::start_mock_server().await;
     let mut builder = test_codex().with_config(move |config| {

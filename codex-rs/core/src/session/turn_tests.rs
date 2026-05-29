@@ -2,6 +2,13 @@ use super::*;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::TurnItemContributor;
 use codex_protocol::items::AgentMessageContent;
+use codex_protocol::items::AgentMessageItem;
+use codex_protocol::items::HookPromptFragment;
+use codex_protocol::items::HookPromptItem;
+use codex_protocol::items::ReasoningItem;
+use codex_protocol::items::UserMessageItem;
+use codex_protocol::items::WebSearchItem;
+use codex_protocol::models::WebSearchAction;
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
 
@@ -61,5 +68,56 @@ async fn plan_mode_uses_contributed_turn_item_for_last_agent_message() {
     assert_eq!(
         last_agent_message.as_deref(),
         Some("plan contributed assistant text")
+    );
+}
+
+#[test]
+fn turn_item_blocks_account_pool_retry_ignores_only_user_originated_items() {
+    assert_eq!(
+        turn_item_blocks_account_pool_retry(&TurnItem::UserMessage(UserMessageItem {
+            id: "user".to_string(),
+            content: Vec::new(),
+        })),
+        false
+    );
+    assert_eq!(
+        turn_item_blocks_account_pool_retry(&TurnItem::HookPrompt(HookPromptItem {
+            id: "hook".to_string(),
+            fragments: vec![HookPromptFragment {
+                text: "hook".to_string(),
+                hook_run_id: "run-1".to_string(),
+            }],
+        })),
+        false
+    );
+    assert_eq!(
+        turn_item_blocks_account_pool_retry(&TurnItem::AgentMessage(AgentMessageItem {
+            id: "assistant".to_string(),
+            content: vec![AgentMessageContent::Text {
+                text: "hello".to_string(),
+            }],
+            phase: None,
+            memory_citation: None,
+        })),
+        true
+    );
+    assert_eq!(
+        turn_item_blocks_account_pool_retry(&TurnItem::Reasoning(ReasoningItem {
+            id: "reasoning".to_string(),
+            summary_text: vec!["thinking".to_string()],
+            raw_content: Vec::new(),
+        })),
+        true
+    );
+    assert_eq!(
+        turn_item_blocks_account_pool_retry(&TurnItem::WebSearch(WebSearchItem {
+            id: "search".to_string(),
+            query: "codex".to_string(),
+            action: WebSearchAction::Search {
+                query: Some("codex".to_string()),
+                queries: None,
+            },
+        })),
+        true
     );
 }

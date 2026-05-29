@@ -17,6 +17,7 @@ async fn file_storage_load_returns_auth_dot_json() -> anyhow::Result<()> {
         auth_mode: Some(AuthMode::ApiKey),
         openai_api_key: Some("test-key".to_string()),
         tokens: None,
+        pool_account_id: None,
         last_refresh: Some(Utc::now()),
         agent_identity: None,
     };
@@ -38,6 +39,7 @@ async fn file_storage_save_persists_auth_dot_json() -> anyhow::Result<()> {
         auth_mode: Some(AuthMode::ApiKey),
         openai_api_key: Some("test-key".to_string()),
         tokens: None,
+        pool_account_id: None,
         last_refresh: Some(Utc::now()),
         agent_identity: None,
     };
@@ -71,6 +73,7 @@ async fn file_storage_round_trips_agent_identity_auth() -> anyhow::Result<()> {
         auth_mode: Some(AuthMode::AgentIdentity),
         openai_api_key: None,
         tokens: None,
+        pool_account_id: None,
         last_refresh: None,
         agent_identity: Some(agent_identity),
     };
@@ -120,6 +123,7 @@ fn file_storage_delete_removes_auth_file() -> anyhow::Result<()> {
         auth_mode: Some(AuthMode::ApiKey),
         openai_api_key: Some("sk-test-key".to_string()),
         tokens: None,
+        pool_account_id: None,
         last_refresh: None,
         agent_identity: None,
     };
@@ -144,6 +148,7 @@ fn ephemeral_storage_save_load_delete_is_in_memory_only() -> anyhow::Result<()> 
         auth_mode: Some(AuthMode::ApiKey),
         openai_api_key: Some("sk-ephemeral".to_string()),
         tokens: None,
+        pool_account_id: None,
         last_refresh: Some(Utc::now()),
         agent_identity: None,
     };
@@ -243,6 +248,7 @@ fn auth_with_prefix(prefix: &str) -> AuthDotJson {
             refresh_token: format!("{prefix}-refresh"),
             account_id: Some(format!("{prefix}-account-id")),
         }),
+        pool_account_id: Some(format!("{prefix}-account-id")),
         last_refresh: None,
         agent_identity: None,
     }
@@ -268,6 +274,7 @@ fn keyring_auth_storage_load_returns_deserialized_auth() -> anyhow::Result<()> {
         auth_mode: Some(AuthMode::ApiKey),
         openai_api_key: Some("sk-test".to_string()),
         tokens: None,
+        pool_account_id: None,
         last_refresh: None,
         agent_identity: None,
     };
@@ -311,6 +318,7 @@ fn keyring_auth_storage_save_persists_and_removes_fallback_file() -> anyhow::Res
             refresh_token: "refresh".to_string(),
             account_id: Some("account".to_string()),
         }),
+        pool_account_id: Some("account".to_string()),
         last_refresh: Some(Utc::now()),
         agent_identity: None,
     };

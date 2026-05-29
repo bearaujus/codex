@@ -1,5 +1,4 @@
 use super::*;
-
 // Duration before a browser ChatGPT login attempt is abandoned.
 const LOGIN_CHATGPT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 // The override is intentionally available only in debug builds, matching the login path below.
@@ -61,6 +60,7 @@ pub(crate) struct AccountRequestProcessor {
     config: Arc<Config>,
     config_manager: ConfigManager,
     active_login: Arc<Mutex<Option<ActiveLogin>>>,
+    account_updated_notifier_shutdown: CancellationToken,
 }
 
 impl AccountRequestProcessor {
@@ -71,14 +71,22 @@ impl AccountRequestProcessor {
         config: Arc<Config>,
         config_manager: ConfigManager,
     ) -> Self {
-        Self {
+        let account_updated_notifier_shutdown = CancellationToken::new();
+        let this = Self {
             auth_manager,
             thread_manager,
             outgoing,
             config,
             config_manager,
             active_login: Arc::new(Mutex::new(None)),
-        }
+            account_updated_notifier_shutdown: account_updated_notifier_shutdown.clone(),
+        };
+        Self::spawn_account_updated_notifier(
+            this.auth_manager.clone(),
+            this.outgoing.clone(),
+            account_updated_notifier_shutdown,
+        );
+        this
     }
 
     pub(crate) async fn login_account(
@@ -151,12 +159,41 @@ impl AccountRequestProcessor {
         self.auth_manager.clear_external_auth();
     }
 
-    fn current_account_updated_notification(&self) -> AccountUpdatedNotification {
-        let auth = self.auth_manager.auth_cached();
+    pub(crate) fn shutdown(&self) {
+        self.account_updated_notifier_shutdown.cancel();
+    }
+
+    fn account_updated_notification(auth: Option<&CodexAuth>) -> AccountUpdatedNotification {
         AccountUpdatedNotification {
-            auth_mode: auth.as_ref().map(CodexAuth::api_auth_mode),
-            plan_type: auth.as_ref().and_then(CodexAuth::account_plan_type),
+            auth_mode: auth.map(CodexAuth::api_auth_mode),
+            plan_type: auth.and_then(CodexAuth::account_plan_type),
+            account_email: auth.and_then(CodexAuth::get_account_email),
         }
+    }
+
+    fn spawn_account_updated_notifier(
+        auth_manager: Arc<AuthManager>,
+        outgoing: Arc<OutgoingMessageSender>,
+        shutdown: CancellationToken,
+    ) {
+        let mut auth_change_rx = auth_manager.auth_change_receiver();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    changed = auth_change_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                    }
+                }
+                let payload =
+                    Self::account_updated_notification(auth_manager.auth_cached().as_ref());
+                outgoing
+                    .send_server_notification(ServerNotification::AccountUpdated(payload))
+                    .await;
+            }
+        });
     }
 
     async fn maybe_refresh_remote_installed_plugins_cache_for_current_config(
@@ -615,12 +652,6 @@ impl AccountRequestProcessor {
                 payload_login_completed,
             ))
             .await;
-
-        self.outgoing
-            .send_server_notification(ServerNotification::AccountUpdated(
-                self.current_account_updated_notification(),
-            ))
-            .await;
     }
 
     async fn send_chatgpt_login_completion_notifications(
@@ -657,13 +688,6 @@ impl AccountRequestProcessor {
                 auth.clone(),
             )
             .await;
-            let payload_v2 = AccountUpdatedNotification {
-                auth_mode: auth.as_ref().map(CodexAuth::api_auth_mode),
-                plan_type: auth.as_ref().and_then(CodexAuth::account_plan_type),
-            };
-            outgoing
-                .send_server_notification(ServerNotification::AccountUpdated(payload_v2))
-                .await;
         }
     }
 
@@ -700,24 +724,9 @@ impl AccountRequestProcessor {
 
     async fn logout_v2(&self, request_id: ConnectionRequestId) -> Result<(), JSONRPCErrorError> {
         let result = self.logout_common().await;
-        let account_updated =
-            result
-                .as_ref()
-                .ok()
-                .cloned()
-                .map(|auth_mode| AccountUpdatedNotification {
-                    auth_mode,
-                    plan_type: None,
-                });
         self.outgoing
             .send_result(request_id, result.map(|_| LogoutAccountResponse {}))
             .await;
-
-        if let Some(payload) = account_updated {
-            self.outgoing
-                .send_server_notification(ServerNotification::AccountUpdated(payload))
-                .await;
-        }
         Ok(())
     }
 
@@ -742,6 +751,7 @@ impl AccountRequestProcessor {
     ) -> Result<GetAuthStatusResponse, JSONRPCErrorError> {
         let include_token = params.include_token.unwrap_or(false);
         let do_refresh = params.refresh_token.unwrap_or(false);
+        let auth_before_request = self.auth_manager.auth_cached();
 
         self.refresh_token_if_requested(do_refresh).await;
 
@@ -778,10 +788,10 @@ impl AccountRequestProcessor {
                                     let tok = if include_token { Some(token) } else { None };
                                     (Some(auth_mode), tok)
                                 }
-                                Ok(_) => (None, None),
+                                Ok(_) => (Some(auth_mode), None),
                                 Err(err) => {
                                     tracing::warn!("failed to get token for auth status: {err}");
-                                    (None, None)
+                                    (Some(auth_mode), None)
                                 }
                             }
                         };
@@ -792,7 +802,7 @@ impl AccountRequestProcessor {
                     }
                 }
                 None => GetAuthStatusResponse {
-                    auth_method: None,
+                    auth_method: auth_before_request.as_ref().map(CodexAuth::api_auth_mode),
                     auth_token: None,
                     requires_openai_auth: Some(true),
                 },
@@ -930,6 +940,9 @@ impl AccountRequestProcessor {
                 "failed to fetch codex rate limits: no snapshots returned",
             ));
         }
+        self.auth_manager
+            .record_account_pool_rate_limits_fetch(snapshots.as_slice())
+            .await;
 
         let rate_limits_by_limit_id: HashMap<String, CoreRateLimitSnapshot> = snapshots
             .iter()

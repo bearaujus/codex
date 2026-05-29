@@ -7,11 +7,13 @@ use super::X_CODEX_PARENT_THREAD_ID_HEADER;
 use super::X_CODEX_TURN_METADATA_HEADER;
 use super::X_CODEX_WINDOW_ID_HEADER;
 use super::X_OPENAI_SUBAGENT_HEADER;
+use super::handle_unauthorized;
 use crate::AttestationContext;
 use crate::AttestationProvider;
 use crate::GenerateAttestationFuture;
 use codex_api::ApiError;
 use codex_api::ResponseEvent;
+use codex_api::TransportError;
 use codex_app_server_protocol::AuthMode;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
@@ -23,6 +25,7 @@ use codex_model_provider_info::create_oss_provider_with_base_url;
 use codex_otel::SessionTelemetry;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
+use codex_protocol::error::CodexErr;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
@@ -476,6 +479,28 @@ fn auth_request_telemetry_context_tracks_attached_auth_and_retry_phase() {
     assert!(auth_context.retry_after_unauthorized);
     assert_eq!(auth_context.recovery_mode, Some("managed"));
     assert_eq!(auth_context.recovery_phase, Some("refresh_token"));
+}
+
+#[tokio::test]
+async fn handle_unauthorized_does_not_reclassify_api_key_401s() {
+    let manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("sk-test-key"));
+    let mut auth_recovery = Some(manager.unauthorized_recovery());
+
+    let err = handle_unauthorized(
+        TransportError::Http {
+            status: http::StatusCode::UNAUTHORIZED,
+            url: Some("https://example.com/v1/responses".to_string()),
+            headers: None,
+            body: Some(r#"{"error":{"message":"backend unauthorized"}}"#.to_string()),
+        },
+        &mut auth_recovery,
+        &test_session_telemetry(),
+    )
+    .await
+    .expect_err("API-key 401 should remain an HTTP auth error");
+
+    assert!(!matches!(err, CodexErr::RefreshTokenFailed(_)));
+    assert_eq!(err.http_status_code_value(), Some(401));
 }
 
 fn model_client_with_counting_attestation(

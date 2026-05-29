@@ -107,6 +107,7 @@ mod tests {
                 refresh_token: "refresh-token".to_string(),
                 account_id: Some("workspace-1".to_string()),
             }),
+            pool_account_id: None,
             last_refresh: Some(Utc::now()),
             agent_identity: None,
         };
@@ -154,6 +155,7 @@ mod tests {
                 auth_mode: Some(AuthMode::ApiKey),
                 openai_api_key: Some("sk-test".to_string()),
                 tokens: None,
+                pool_account_id: None,
                 last_refresh: None,
                 agent_identity: None,
             },

@@ -209,6 +209,7 @@ c2ln",
             refresh_token: "test".to_string(),
             account_id: Some("account_id".to_string()),
         }),
+        pool_account_id: None,
         last_refresh: Some(Utc::now()),
         agent_identity: None,
     };

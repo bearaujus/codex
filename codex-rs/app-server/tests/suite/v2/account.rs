@@ -226,6 +226,7 @@ async fn logout_account_removes_auth_and_notifies() -> Result<()> {
         "auth_method should be None after logout"
     );
     assert_eq!(payload.plan_type, None);
+    assert_eq!(payload.account_email, None);
 
     assert!(
         !codex_home.path().join("auth.json").exists(),
@@ -297,6 +298,10 @@ async fn set_auth_token_updates_account_and_notifies() -> Result<()> {
     };
     assert_eq!(payload.auth_mode, Some(AuthMode::ChatgptAuthTokens));
     assert_eq!(payload.plan_type, Some(AccountPlanType::Pro));
+    assert_eq!(
+        payload.account_email.as_deref(),
+        Some("embedded@example.com")
+    );
 
     let get_id = mcp
         .send_get_account_request(GetAccountParams {
@@ -940,6 +945,7 @@ async fn login_account_api_key_succeeds_and_notifies() -> Result<()> {
     };
     pretty_assertions::assert_eq!(payload.auth_mode, Some(AuthMode::ApiKey));
     pretty_assertions::assert_eq!(payload.plan_type, None);
+    pretty_assertions::assert_eq!(payload.account_email, None);
 
     assert!(codex_home.path().join("auth.json").exists());
     Ok(())
@@ -1136,6 +1142,7 @@ async fn login_account_chatgpt_device_code_succeeds_and_notifies() -> Result<()>
     };
     assert_eq!(payload.auth_mode, Some(AuthMode::Chatgpt));
     assert_eq!(payload.plan_type, Some(AccountPlanType::Pro));
+    assert_eq!(payload.account_email.as_deref(), Some("device@example.com"));
     assert!(
         codex_home.path().join("auth.json").exists(),
         "auth.json should be created when device code login succeeds"

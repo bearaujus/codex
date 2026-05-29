@@ -1,4 +1,5 @@
 use super::*;
+use crate::account_pool::ChatgptAccountPoolAuthStatus;
 use crate::auth::storage::FileAuthStorage;
 use crate::auth::storage::get_auth_file;
 use crate::token_data::IdTokenInfo;
@@ -13,18 +14,36 @@ use codex_protocol::config_types::ModelProviderAuthInfo;
 use pretty_assertions::assert_eq;
 use serde::Serialize;
 use serde_json::json;
+use sqlx::Connection;
+use sqlx::SqliteConnection;
+use sqlx::sqlite::SqliteConnectOptions;
 use std::sync::Arc;
 use tempfile::TempDir;
 use tempfile::tempdir;
 use wiremock::Mock;
 use wiremock::MockServer;
 use wiremock::ResponseTemplate;
+use wiremock::matchers::header;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 
 const WORKSPACE_ID_ALLOWED: &str = "123e4567-e89b-42d3-a456-426614174000";
 const WORKSPACE_ID_SECOND_ALLOWED: &str = "123e4567-e89b-42d3-a456-426614174001";
 const WORKSPACE_ID_DISALLOWED: &str = "123e4567-e89b-42d3-a456-426614174002";
+
+fn chatgpt_backend_base_url(server: &MockServer) -> String {
+    format!("{}/backend-api", server.uri())
+}
+
+async fn mount_usage_probe(server: &MockServer, account_id: &str, status: u16) {
+    Mock::given(method("GET"))
+        .and(path("/backend-api/wham/usage"))
+        .and(header("ChatGPT-Account-Id", account_id))
+        .respond_with(ResponseTemplate::new(status))
+        .expect(1)
+        .mount(server)
+        .await;
+}
 
 #[tokio::test]
 async fn refresh_without_id_token() {
@@ -193,6 +212,480 @@ async fn missing_auth_json_returns_none() {
 
 #[tokio::test]
 #[serial(codex_auth_env)]
+async fn startup_pool_selection_keeps_chatgpt_auth_when_pool_does_not_know_account() {
+    let codex_home = tempdir().unwrap();
+    let _access_token_guard = remove_access_token_env_var();
+    let pool = ChatgptAccountPool::open(
+        codex_home.path().to_path_buf(),
+        AuthCredentialsStoreMode::File,
+        None,
+    )
+    .await
+    .expect("pool should open");
+    let _jwt = write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".to_string()),
+            chatgpt_account_id: Some(WORKSPACE_ID_ALLOWED.to_string()),
+        },
+        codex_home.path(),
+    )
+    .expect("failed to write auth file");
+    let mut pool_managed_auth = CodexAuth::from_auth_storage(
+        codex_home.path(),
+        AuthCredentialsStoreMode::File,
+        /*chatgpt_base_url*/ None,
+    )
+    .await
+    .expect("auth load should succeed")
+    .expect("managed auth should exist")
+    .get_current_auth_json()
+    .expect("auth json should exist");
+    pool_managed_auth
+        .tokens
+        .as_mut()
+        .expect("tokens should exist")
+        .account_id = Some(WORKSPACE_ID_ALLOWED.to_string());
+    save_auth(
+        codex_home.path(),
+        &pool_managed_auth,
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("updated auth should save");
+    let managed_auth = CodexAuth::from_auth_storage(
+        codex_home.path(),
+        AuthCredentialsStoreMode::File,
+        /*chatgpt_base_url*/ None,
+    )
+    .await
+    .expect("auth reload should succeed");
+
+    let selected_auth = load_startup_account_pool_auth(
+        codex_home.path(),
+        AuthCredentialsStoreMode::File,
+        /*chatgpt_base_url*/ None,
+        managed_auth,
+        Some(&pool),
+    )
+    .await;
+
+    assert!(selected_auth.is_some());
+    assert!(
+        get_auth_file(codex_home.path()).exists(),
+        "plain auth.json should be kept when the pool has no matching account"
+    );
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn startup_pool_selection_keeps_selected_account_after_probe_401() {
+    let codex_home = tempdir().unwrap();
+    let _access_token_guard = remove_access_token_env_var();
+
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".to_string()),
+            chatgpt_account_id: Some(WORKSPACE_ID_ALLOWED.to_string()),
+        },
+        codex_home.path(),
+    )
+    .expect("failed to write first auth file");
+    let mut first_auth = load_auth_dot_json(codex_home.path(), AuthCredentialsStoreMode::File)
+        .expect("first auth should load")
+        .expect("first auth should exist");
+    first_auth
+        .tokens
+        .as_mut()
+        .expect("tokens should exist")
+        .account_id = Some(WORKSPACE_ID_ALLOWED.to_string());
+    first_auth
+        .tokens
+        .as_mut()
+        .expect("tokens should exist")
+        .access_token = fake_access_token(WORKSPACE_ID_ALLOWED, Utc::now().timestamp() + 3600);
+    save_auth(
+        codex_home.path(),
+        &first_auth,
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("first auth should save");
+    let pool = ChatgptAccountPool::open(
+        codex_home.path().to_path_buf(),
+        AuthCredentialsStoreMode::File,
+        None,
+    )
+    .await
+    .expect("pool should open for first account");
+
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".to_string()),
+            chatgpt_account_id: Some(WORKSPACE_ID_SECOND_ALLOWED.to_string()),
+        },
+        codex_home.path(),
+    )
+    .expect("failed to write second auth file");
+    let mut second_auth = load_auth_dot_json(codex_home.path(), AuthCredentialsStoreMode::File)
+        .expect("second auth should load")
+        .expect("second auth should exist");
+    second_auth
+        .tokens
+        .as_mut()
+        .expect("tokens should exist")
+        .account_id = Some(WORKSPACE_ID_SECOND_ALLOWED.to_string());
+    second_auth
+        .tokens
+        .as_mut()
+        .expect("tokens should exist")
+        .access_token =
+        fake_access_token(WORKSPACE_ID_SECOND_ALLOWED, Utc::now().timestamp() + 3600);
+    save_auth(
+        codex_home.path(),
+        &second_auth,
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("second auth should save");
+    ChatgptAccountPool::open(
+        codex_home.path().to_path_buf(),
+        AuthCredentialsStoreMode::File,
+        None,
+    )
+    .await
+    .expect("pool should open for second account");
+
+    save_auth(
+        codex_home.path(),
+        &first_auth,
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("active auth should be reset to first account");
+    let managed_auth = CodexAuth::from_auth_storage(
+        codex_home.path(),
+        AuthCredentialsStoreMode::File,
+        /*chatgpt_base_url*/ None,
+    )
+    .await
+    .expect("managed auth should load");
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/backend-api/wham/usage"))
+        .and(header("ChatGPT-Account-Id", WORKSPACE_ID_ALLOWED))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let selected_auth = load_startup_account_pool_auth(
+        codex_home.path(),
+        AuthCredentialsStoreMode::File,
+        Some(&format!("{}/backend-api", server.uri())),
+        managed_auth,
+        Some(&pool),
+    )
+    .await
+    .expect("startup should keep the selected account");
+
+    assert_eq!(
+        selected_auth.get_account_id().as_deref(),
+        Some(WORKSPACE_ID_ALLOWED)
+    );
+
+    let accounts = pool.list_accounts().await.expect("accounts should list");
+    assert_eq!(
+        accounts
+            .iter()
+            .find(|account| account.account_id == WORKSPACE_ID_ALLOWED)
+            .expect("first account should remain in pool")
+            .auth_status,
+        ChatgptAccountPoolAuthStatus::Valid
+    );
+    assert_eq!(
+        load_auth_dot_json(codex_home.path(), AuthCredentialsStoreMode::File)
+            .expect("active auth should load")
+            .expect("active auth should exist")
+            .tokens
+            .expect("tokens should exist")
+            .account_id
+            .as_deref(),
+        Some(WORKSPACE_ID_ALLOWED)
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn startup_pool_selection_refreshes_selected_account_after_probe_401() {
+    let codex_home = tempdir().unwrap();
+    let _access_token_guard = remove_access_token_env_var();
+
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".to_string()),
+            chatgpt_account_id: Some(WORKSPACE_ID_ALLOWED.to_string()),
+        },
+        codex_home.path(),
+    )
+    .expect("failed to write auth file");
+    let mut auth_dot_json = load_auth_dot_json(codex_home.path(), AuthCredentialsStoreMode::File)
+        .expect("auth should load")
+        .expect("auth should exist");
+    auth_dot_json
+        .tokens
+        .as_mut()
+        .expect("tokens should exist")
+        .account_id = Some(WORKSPACE_ID_ALLOWED.to_string());
+    auth_dot_json
+        .tokens
+        .as_mut()
+        .expect("tokens should exist")
+        .access_token = fake_access_token(WORKSPACE_ID_ALLOWED, Utc::now().timestamp() + 3600);
+    auth_dot_json
+        .tokens
+        .as_mut()
+        .expect("tokens should exist")
+        .refresh_token = "refresh-initial".to_string();
+    save_auth(
+        codex_home.path(),
+        &auth_dot_json,
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("auth should save");
+    let pool = ChatgptAccountPool::open(
+        codex_home.path().to_path_buf(),
+        AuthCredentialsStoreMode::File,
+        None,
+    )
+    .await
+    .expect("pool should open");
+    let managed_auth = CodexAuth::from_auth_storage(
+        codex_home.path(),
+        AuthCredentialsStoreMode::File,
+        /*chatgpt_base_url*/ None,
+    )
+    .await
+    .expect("managed auth should load");
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/backend-api/wham/usage"))
+        .and(header("ChatGPT-Account-Id", WORKSPACE_ID_ALLOWED))
+        .and(header(
+            "Authorization",
+            format!(
+                "Bearer {}",
+                auth_dot_json.tokens.as_ref().expect("tokens").access_token
+            ),
+        ))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let selected_auth = load_startup_account_pool_auth(
+        codex_home.path(),
+        AuthCredentialsStoreMode::File,
+        Some(&format!("{}/backend-api", server.uri())),
+        managed_auth,
+        Some(&pool),
+    )
+    .await
+    .expect("startup should keep the selected account");
+
+    assert_eq!(
+        selected_auth.get_account_id().as_deref(),
+        Some(WORKSPACE_ID_ALLOWED)
+    );
+    assert_eq!(
+        selected_auth
+            .get_current_auth_json()
+            .expect("auth json should exist")
+            .tokens
+            .expect("tokens should exist")
+            .refresh_token,
+        "refresh-initial".to_string()
+    );
+
+    let account = pool
+        .list_accounts()
+        .await
+        .expect("accounts should load")
+        .into_iter()
+        .find(|account| account.account_id == WORKSPACE_ID_ALLOWED)
+        .expect("selected account should remain in pool");
+    assert_eq!(account.auth_status, ChatgptAccountPoolAuthStatus::Valid);
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn startup_pool_selection_does_not_return_401_auth_after_transient_refresh_failure() {
+    let codex_home = tempdir().unwrap();
+    let _access_token_guard = remove_access_token_env_var();
+
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".to_string()),
+            chatgpt_account_id: Some(WORKSPACE_ID_ALLOWED.to_string()),
+        },
+        codex_home.path(),
+    )
+    .expect("failed to write auth file");
+    let mut auth_dot_json = load_auth_dot_json(codex_home.path(), AuthCredentialsStoreMode::File)
+        .expect("auth should load")
+        .expect("auth should exist");
+    auth_dot_json
+        .tokens
+        .as_mut()
+        .expect("tokens should exist")
+        .account_id = Some(WORKSPACE_ID_ALLOWED.to_string());
+    auth_dot_json
+        .tokens
+        .as_mut()
+        .expect("tokens should exist")
+        .access_token = fake_access_token(WORKSPACE_ID_ALLOWED, Utc::now().timestamp() + 3600);
+    auth_dot_json
+        .tokens
+        .as_mut()
+        .expect("tokens should exist")
+        .refresh_token = "refresh-initial".to_string();
+    save_auth(
+        codex_home.path(),
+        &auth_dot_json,
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("auth should save");
+    let pool = ChatgptAccountPool::open(
+        codex_home.path().to_path_buf(),
+        AuthCredentialsStoreMode::File,
+        None,
+    )
+    .await
+    .expect("pool should open");
+    let managed_auth = CodexAuth::from_auth_storage(
+        codex_home.path(),
+        AuthCredentialsStoreMode::File,
+        /*chatgpt_base_url*/ None,
+    )
+    .await
+    .expect("managed auth should load");
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/backend-api/wham/usage"))
+        .and(header("ChatGPT-Account-Id", WORKSPACE_ID_ALLOWED))
+        .and(header(
+            "Authorization",
+            format!(
+                "Bearer {}",
+                auth_dot_json.tokens.as_ref().expect("tokens").access_token
+            ),
+        ))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let selected_auth = load_startup_account_pool_auth(
+        codex_home.path(),
+        AuthCredentialsStoreMode::File,
+        Some(&format!("{}/backend-api", server.uri())),
+        managed_auth,
+        Some(&pool),
+    )
+    .await;
+
+    assert_eq!(
+        selected_auth
+            .as_ref()
+            .and_then(CodexAuth::get_account_id)
+            .as_deref(),
+        Some(WORKSPACE_ID_ALLOWED)
+    );
+    let account = pool
+        .list_accounts()
+        .await
+        .expect("accounts should load")
+        .into_iter()
+        .find(|account| account.account_id == WORKSPACE_ID_ALLOWED)
+        .expect("selected account should remain in pool");
+    assert_eq!(account.auth_status, ChatgptAccountPoolAuthStatus::Valid);
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn startup_pool_selection_keeps_managed_auth_when_pool_selection_errors() {
+    let codex_home = tempdir().unwrap();
+    let _access_token_guard = remove_access_token_env_var();
+
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".to_string()),
+            chatgpt_account_id: Some(WORKSPACE_ID_ALLOWED.to_string()),
+        },
+        codex_home.path(),
+    )
+    .expect("failed to write auth file");
+    let mut auth_dot_json = load_auth_dot_json(codex_home.path(), AuthCredentialsStoreMode::File)
+        .expect("auth should load")
+        .expect("auth should exist");
+    auth_dot_json
+        .tokens
+        .as_mut()
+        .expect("tokens should exist")
+        .account_id = Some(WORKSPACE_ID_ALLOWED.to_string());
+    save_auth(
+        codex_home.path(),
+        &auth_dot_json,
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("auth should save");
+    let pool = ChatgptAccountPool::open(
+        codex_home.path().to_path_buf(),
+        AuthCredentialsStoreMode::File,
+        None,
+    )
+    .await
+    .expect("pool should open");
+    let managed_auth = CodexAuth::from_auth_storage(
+        codex_home.path(),
+        AuthCredentialsStoreMode::File,
+        /*chatgpt_base_url*/ None,
+    )
+    .await
+    .expect("managed auth load should succeed");
+
+    let mut conn = SqliteConnection::connect_with(
+        &SqliteConnectOptions::new()
+            .filename(crate::account_pool_db_path(codex_home.path()))
+            .create_if_missing(false),
+    )
+    .await
+    .expect("schema connection should open");
+    sqlx::query("DROP TABLE accounts")
+        .execute(&mut conn)
+        .await
+        .expect("accounts table should drop");
+
+    let selected_auth = load_startup_account_pool_auth(
+        codex_home.path(),
+        AuthCredentialsStoreMode::File,
+        /*chatgpt_base_url*/ None,
+        managed_auth.clone(),
+        Some(&pool),
+    )
+    .await;
+
+    assert_eq!(selected_auth, managed_auth);
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
 async fn pro_account_with_no_api_key_uses_chatgpt_auth() {
     let codex_home = tempdir().unwrap();
     let _access_token_guard = remove_access_token_env_var();
@@ -235,6 +728,7 @@ async fn pro_account_with_no_api_key_uses_chatgpt_auth() {
                     email: Some("user@example.com".to_string()),
                     chatgpt_plan_type: Some(InternalPlanType::Known(InternalKnownPlan::Pro)),
                     chatgpt_user_id: Some("user-12345".to_string()),
+                    subject: None,
                     chatgpt_account_id: None,
                     chatgpt_account_is_fedramp: false,
                     raw_jwt: fake_jwt,
@@ -243,6 +737,7 @@ async fn pro_account_with_no_api_key_uses_chatgpt_auth() {
                 refresh_token: "test-refresh-token".to_string(),
                 account_id: None,
             }),
+            pool_account_id: None,
             last_refresh: Some(last_refresh),
             agent_identity: None,
         },
@@ -284,6 +779,7 @@ fn logout_removes_auth_file() -> Result<(), std::io::Error> {
         auth_mode: Some(ApiAuthMode::ApiKey),
         openai_api_key: Some("sk-test-key".to_string()),
         tokens: None,
+        pool_account_id: None,
         last_refresh: None,
         agent_identity: None,
     };
@@ -293,6 +789,142 @@ fn logout_removes_auth_file() -> Result<(), std::io::Error> {
     assert!(logout(dir.path(), AuthCredentialsStoreMode::File)?);
     assert!(!auth_file.exists());
     Ok(())
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn startup_does_not_reactivate_logged_out_account_pool_auth() {
+    let codex_home = tempdir().unwrap();
+    let _access_token_guard = remove_access_token_env_var();
+
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".to_string()),
+            chatgpt_account_id: Some(WORKSPACE_ID_ALLOWED.to_string()),
+        },
+        codex_home.path(),
+    )
+    .expect("failed to write auth file");
+    let mut auth_dot_json = load_auth_dot_json(codex_home.path(), AuthCredentialsStoreMode::File)
+        .expect("auth should load")
+        .expect("auth should exist");
+    auth_dot_json
+        .tokens
+        .as_mut()
+        .expect("tokens should exist")
+        .account_id = Some(WORKSPACE_ID_ALLOWED.to_string());
+    save_auth(
+        codex_home.path(),
+        &auth_dot_json,
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("auth should save");
+    ChatgptAccountPool::open(
+        codex_home.path().to_path_buf(),
+        AuthCredentialsStoreMode::File,
+        None,
+    )
+    .await
+    .expect("pool should open");
+
+    let manager = AuthManager::new(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+        /*chatgpt_base_url*/ None,
+    )
+    .await;
+    assert!(manager.auth_cached().is_some(), "auth should be cached");
+
+    assert!(manager.logout().await.expect("logout should succeed"));
+    assert!(
+        manager.auth_cached().is_none(),
+        "logout should clear cached auth"
+    );
+    assert!(
+        !get_auth_file(codex_home.path()).exists(),
+        "logout should keep auth.json deleted"
+    );
+
+    let restarted = AuthManager::new(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+        /*chatgpt_base_url*/ None,
+    )
+    .await;
+    assert!(
+        restarted.auth_cached().is_none(),
+        "startup should not reactivate logged-out pool auth"
+    );
+    assert!(
+        !get_auth_file(codex_home.path()).exists(),
+        "startup should not rewrite auth.json from the pool"
+    );
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn prepare_chatgpt_account_pool_for_turn_skips_pool_after_logout() {
+    let codex_home = tempdir().unwrap();
+    let _access_token_guard = remove_access_token_env_var();
+
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".to_string()),
+            chatgpt_account_id: Some(WORKSPACE_ID_ALLOWED.to_string()),
+        },
+        codex_home.path(),
+    )
+    .expect("failed to write auth file");
+    let mut auth_dot_json = load_auth_dot_json(codex_home.path(), AuthCredentialsStoreMode::File)
+        .expect("auth should load")
+        .expect("auth should exist");
+    auth_dot_json
+        .tokens
+        .as_mut()
+        .expect("tokens should exist")
+        .account_id = Some(WORKSPACE_ID_ALLOWED.to_string());
+    save_auth(
+        codex_home.path(),
+        &auth_dot_json,
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("auth should save");
+    ChatgptAccountPool::open(
+        codex_home.path().to_path_buf(),
+        AuthCredentialsStoreMode::File,
+        None,
+    )
+    .await
+    .expect("pool should open");
+    let pool_secret_home = crate::account_pool_secret_dir(codex_home.path(), WORKSPACE_ID_ALLOWED);
+
+    let manager = AuthManager::new(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+        /*chatgpt_base_url*/ None,
+    )
+    .await;
+    assert!(manager.logout().await.expect("logout should succeed"));
+    std::fs::remove_file(pool_secret_home.join("auth.json"))
+        .expect("pool secret should be removable");
+
+    manager
+        .prepare_chatgpt_account_pool_for_turn()
+        .await
+        .expect("auth-free turns should skip account-pool selection after logout");
+    assert!(
+        manager.auth_cached().is_none(),
+        "turn preparation should not reactivate logged-out auth"
+    );
+    assert!(
+        !get_auth_file(codex_home.path()).exists(),
+        "turn preparation should not recreate auth.json"
+    );
 }
 
 #[tokio::test]
@@ -375,6 +1007,494 @@ async fn refresh_failure_is_scoped_to_the_matching_auth_snapshot() {
 
     assert_eq!(manager.refresh_failure_for_auth(&auth), Some(error));
     assert_eq!(manager.refresh_failure_for_auth(&updated_auth), None);
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn pool_managed_auth_failure_marks_cached_refresh_failure() {
+    let codex_home = tempdir().unwrap();
+    let _access_token_guard = remove_access_token_env_var();
+    let server = MockServer::start().await;
+    mount_usage_probe(&server, WORKSPACE_ID_ALLOWED, 200).await;
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".to_string()),
+            chatgpt_account_id: Some(WORKSPACE_ID_ALLOWED.to_string()),
+        },
+        codex_home.path(),
+    )
+    .expect("failed to write auth file");
+    let mut auth_dot_json = load_auth_dot_json(codex_home.path(), AuthCredentialsStoreMode::File)
+        .expect("auth should load")
+        .expect("auth should exist");
+    auth_dot_json
+        .tokens
+        .as_mut()
+        .expect("tokens should exist")
+        .account_id = Some(WORKSPACE_ID_ALLOWED.to_string());
+    save_auth(
+        codex_home.path(),
+        &auth_dot_json,
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("updated auth should save");
+
+    let manager = AuthManager::new(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+        Some(chatgpt_backend_base_url(&server)),
+    )
+    .await;
+    let auth = manager.auth_cached().expect("auth should be cached");
+    let error = RefreshTokenFailedError::new(
+        RefreshTokenFailedReason::Exhausted,
+        "refresh token already used",
+    );
+
+    let failover = manager
+        .handle_chatgpt_account_pool_auth_failure(/*safe_to_retry*/ false, &error)
+        .await
+        .expect("auth failure handling should succeed");
+
+    assert!(!failover);
+    assert_eq!(manager.refresh_failure_for_auth(&auth), Some(error));
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn non_forced_pool_refresh_reloads_newer_pool_copy_even_when_cached_token_looks_fresh() {
+    let codex_home = tempdir().unwrap();
+    let _access_token_guard = remove_access_token_env_var();
+    let server = MockServer::start().await;
+    mount_usage_probe(&server, WORKSPACE_ID_ALLOWED, 200).await;
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".to_string()),
+            chatgpt_account_id: Some(WORKSPACE_ID_ALLOWED.to_string()),
+        },
+        codex_home.path(),
+    )
+    .expect("failed to write auth file");
+
+    let mut active_auth_dot_json =
+        load_auth_dot_json(codex_home.path(), AuthCredentialsStoreMode::File)
+            .expect("auth should load")
+            .expect("auth should exist");
+    let initial_access_token =
+        fake_access_token(WORKSPACE_ID_ALLOWED, Utc::now().timestamp() + 3600);
+    let active_tokens = active_auth_dot_json
+        .tokens
+        .as_mut()
+        .expect("tokens should exist");
+    active_tokens.access_token = initial_access_token.clone();
+    active_tokens.account_id = Some(WORKSPACE_ID_ALLOWED.to_string());
+    save_auth(
+        codex_home.path(),
+        &active_auth_dot_json,
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("updated auth should save");
+
+    let manager = AuthManager::new(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+        Some(chatgpt_backend_base_url(&server)),
+    )
+    .await;
+    let cached_before = manager.auth_cached().expect("auth should be cached");
+    assert_eq!(
+        cached_before
+            .get_current_auth_json()
+            .expect("auth json should exist")
+            .tokens
+            .expect("tokens should exist")
+            .access_token,
+        initial_access_token
+    );
+
+    let pool_secret_home = crate::account_pool_secret_dir(codex_home.path(), WORKSPACE_ID_ALLOWED);
+    let mut pool_auth_dot_json =
+        load_auth_dot_json(&pool_secret_home, AuthCredentialsStoreMode::File)
+            .expect("pool auth should load")
+            .expect("pool auth should exist");
+    let reloaded_access_token =
+        fake_access_token(WORKSPACE_ID_ALLOWED, Utc::now().timestamp() + 7200);
+    pool_auth_dot_json
+        .tokens
+        .as_mut()
+        .expect("tokens should exist")
+        .access_token = reloaded_access_token.clone();
+    save_auth(
+        &pool_secret_home,
+        &pool_auth_dot_json,
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("pool auth should save");
+
+    manager
+        .refresh_token_from_authority()
+        .await
+        .expect("non-forced refresh should reload newer pool copy");
+
+    let cached_after = manager.auth_cached().expect("auth should remain cached");
+    assert_eq!(
+        cached_after
+            .get_current_auth_json()
+            .expect("auth json should exist")
+            .tokens
+            .expect("tokens should exist")
+            .access_token,
+        reloaded_access_token
+    );
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn auth_keeps_current_pool_managed_account_until_this_process_hits_failure() {
+    let codex_home = tempdir().unwrap();
+    let _access_token_guard = remove_access_token_env_var();
+    let server = MockServer::start().await;
+    mount_usage_probe(&server, WORKSPACE_ID_ALLOWED, 200).await;
+
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".to_string()),
+            chatgpt_account_id: Some(WORKSPACE_ID_ALLOWED.to_string()),
+        },
+        codex_home.path(),
+    )
+    .expect("failed to write first auth file");
+    let mut first_auth = load_auth_dot_json(codex_home.path(), AuthCredentialsStoreMode::File)
+        .expect("first auth should load")
+        .expect("first auth should exist");
+    first_auth
+        .tokens
+        .as_mut()
+        .expect("tokens should exist")
+        .account_id = Some(WORKSPACE_ID_ALLOWED.to_string());
+    first_auth
+        .tokens
+        .as_mut()
+        .expect("tokens should exist")
+        .access_token = fake_access_token(WORKSPACE_ID_ALLOWED, Utc::now().timestamp() + 3600);
+    save_auth(
+        codex_home.path(),
+        &first_auth,
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("first auth should save");
+    let pool = ChatgptAccountPool::open(
+        codex_home.path().to_path_buf(),
+        AuthCredentialsStoreMode::File,
+        None,
+    )
+    .await
+    .expect("pool should open for first account");
+
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".to_string()),
+            chatgpt_account_id: Some(WORKSPACE_ID_SECOND_ALLOWED.to_string()),
+        },
+        codex_home.path(),
+    )
+    .expect("failed to write second auth file");
+    let mut second_auth = load_auth_dot_json(codex_home.path(), AuthCredentialsStoreMode::File)
+        .expect("second auth should load")
+        .expect("second auth should exist");
+    second_auth
+        .tokens
+        .as_mut()
+        .expect("tokens should exist")
+        .account_id = Some(WORKSPACE_ID_SECOND_ALLOWED.to_string());
+    second_auth
+        .tokens
+        .as_mut()
+        .expect("tokens should exist")
+        .access_token =
+        fake_access_token(WORKSPACE_ID_SECOND_ALLOWED, Utc::now().timestamp() + 3600);
+    save_auth(
+        codex_home.path(),
+        &second_auth,
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("second auth should save");
+    ChatgptAccountPool::open(
+        codex_home.path().to_path_buf(),
+        AuthCredentialsStoreMode::File,
+        None,
+    )
+    .await
+    .expect("pool should open for second account");
+
+    save_auth(
+        codex_home.path(),
+        &first_auth,
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("active auth should be reset to first account");
+    let manager = AuthManager::new(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+        Some(chatgpt_backend_base_url(&server)),
+    )
+    .await;
+
+    pool.mark_current_account_rate_limited(
+        WORKSPACE_ID_ALLOWED,
+        Some(&RateLimitSnapshot {
+            limit_id: Some("codex".to_string()),
+            limit_name: None,
+            primary: Some(codex_protocol::protocol::RateLimitWindow {
+                used_percent: 100.0,
+                window_minutes: Some(300),
+                resets_at: Some(Utc::now().timestamp() + 3600),
+            }),
+            secondary: None,
+            credits: None,
+            plan_type: None,
+            rate_limit_reached_type: Some(
+                codex_protocol::protocol::RateLimitReachedType::RateLimitReached,
+            ),
+        }),
+        None,
+    )
+    .await
+    .expect("current account should become rate limited");
+    let selection = pool
+        .resolve_turn_selection(Some(WORKSPACE_ID_ALLOWED), false)
+        .await
+        .expect("fallback selection should succeed");
+    let ChatgptAccountPoolSelectionOutcome::Activated {
+        account_id,
+        failover,
+        ..
+    } = selection
+    else {
+        panic!("expected fallback activation");
+    };
+    assert_eq!(account_id, WORKSPACE_ID_SECOND_ALLOWED);
+    assert!(failover);
+
+    let auth = manager.auth().await.expect("auth should still resolve");
+    assert_eq!(auth.get_account_id().as_deref(), Some(WORKSPACE_ID_ALLOWED));
+    assert_eq!(
+        manager
+            .auth_cached()
+            .expect("cached auth should remain on the original account")
+            .get_account_id()
+            .as_deref(),
+        Some(WORKSPACE_ID_ALLOWED)
+    );
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn non_forced_pool_refresh_reloads_newer_pool_copy_with_ephemeral_store() {
+    let codex_home = tempdir().unwrap();
+    let _access_token_guard = remove_access_token_env_var();
+    let server = MockServer::start().await;
+    mount_usage_probe(&server, WORKSPACE_ID_ALLOWED, 200).await;
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".to_string()),
+            chatgpt_account_id: Some(WORKSPACE_ID_ALLOWED.to_string()),
+        },
+        codex_home.path(),
+    )
+    .expect("failed to write auth file");
+
+    let mut active_auth_dot_json =
+        load_auth_dot_json(codex_home.path(), AuthCredentialsStoreMode::File)
+            .expect("auth should load")
+            .expect("auth should exist");
+    let initial_access_token =
+        fake_access_token(WORKSPACE_ID_ALLOWED, Utc::now().timestamp() + 3600);
+    let active_tokens = active_auth_dot_json
+        .tokens
+        .as_mut()
+        .expect("tokens should exist");
+    active_tokens.access_token = initial_access_token.clone();
+    active_tokens.account_id = Some(WORKSPACE_ID_ALLOWED.to_string());
+    save_auth(
+        codex_home.path(),
+        &active_auth_dot_json,
+        AuthCredentialsStoreMode::Ephemeral,
+    )
+    .expect("updated auth should save");
+
+    let manager = AuthManager::new(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::Ephemeral,
+        Some(chatgpt_backend_base_url(&server)),
+    )
+    .await;
+    let cached_before = manager.auth_cached().expect("auth should be cached");
+    assert_eq!(
+        cached_before
+            .get_current_auth_json()
+            .expect("auth json should exist")
+            .tokens
+            .expect("tokens should exist")
+            .access_token,
+        initial_access_token
+    );
+
+    let pool_secret_home = crate::account_pool_secret_dir(codex_home.path(), WORKSPACE_ID_ALLOWED);
+    let mut pool_auth_dot_json =
+        load_auth_dot_json(&pool_secret_home, AuthCredentialsStoreMode::Ephemeral)
+            .expect("pool auth should load")
+            .expect("pool auth should exist");
+    let reloaded_access_token =
+        fake_access_token(WORKSPACE_ID_ALLOWED, Utc::now().timestamp() + 7200);
+    pool_auth_dot_json
+        .tokens
+        .as_mut()
+        .expect("tokens should exist")
+        .access_token = reloaded_access_token.clone();
+    save_auth(
+        &pool_secret_home,
+        &pool_auth_dot_json,
+        AuthCredentialsStoreMode::Ephemeral,
+    )
+    .expect("pool auth should save");
+
+    manager
+        .refresh_token_from_authority()
+        .await
+        .expect("non-forced refresh should reload newer pool copy");
+
+    let cached_after = manager.auth_cached().expect("auth should remain cached");
+    assert_eq!(
+        cached_after
+            .get_current_auth_json()
+            .expect("auth json should exist")
+            .tokens
+            .expect("tokens should exist")
+            .access_token,
+        reloaded_access_token
+    );
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn pool_managed_refresh_fails_over_when_current_pool_secret_is_missing() {
+    let codex_home = tempdir().unwrap();
+    let _access_token_guard = remove_access_token_env_var();
+    let server = MockServer::start().await;
+    mount_usage_probe(&server, WORKSPACE_ID_ALLOWED, 200).await;
+
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".to_string()),
+            chatgpt_account_id: Some(WORKSPACE_ID_ALLOWED.to_string()),
+        },
+        codex_home.path(),
+    )
+    .expect("failed to write first auth file");
+    let mut first_auth = load_auth_dot_json(codex_home.path(), AuthCredentialsStoreMode::File)
+        .expect("first auth should load")
+        .expect("first auth should exist");
+    first_auth
+        .tokens
+        .as_mut()
+        .expect("tokens should exist")
+        .account_id = Some(WORKSPACE_ID_ALLOWED.to_string());
+    first_auth
+        .tokens
+        .as_mut()
+        .expect("tokens should exist")
+        .access_token = fake_access_token(WORKSPACE_ID_ALLOWED, Utc::now().timestamp() - 60);
+    save_auth(
+        codex_home.path(),
+        &first_auth,
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("first auth should save");
+    ChatgptAccountPool::open(
+        codex_home.path().to_path_buf(),
+        AuthCredentialsStoreMode::File,
+        None,
+    )
+    .await
+    .expect("pool should open for first account");
+
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".to_string()),
+            chatgpt_account_id: Some(WORKSPACE_ID_SECOND_ALLOWED.to_string()),
+        },
+        codex_home.path(),
+    )
+    .expect("failed to write second auth file");
+    let mut second_auth = load_auth_dot_json(codex_home.path(), AuthCredentialsStoreMode::File)
+        .expect("second auth should load")
+        .expect("second auth should exist");
+    second_auth
+        .tokens
+        .as_mut()
+        .expect("tokens should exist")
+        .account_id = Some(WORKSPACE_ID_SECOND_ALLOWED.to_string());
+    second_auth
+        .tokens
+        .as_mut()
+        .expect("tokens should exist")
+        .access_token =
+        fake_access_token(WORKSPACE_ID_SECOND_ALLOWED, Utc::now().timestamp() + 3600);
+    save_auth(
+        codex_home.path(),
+        &second_auth,
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("second auth should save");
+    ChatgptAccountPool::open(
+        codex_home.path().to_path_buf(),
+        AuthCredentialsStoreMode::File,
+        None,
+    )
+    .await
+    .expect("pool should open for second account");
+
+    save_auth(
+        codex_home.path(),
+        &first_auth,
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("active auth should be reset to first account");
+    std::fs::remove_file(
+        crate::account_pool_secret_dir(codex_home.path(), WORKSPACE_ID_ALLOWED).join("auth.json"),
+    )
+    .expect("first pool secret should be removable");
+
+    let manager = AuthManager::new(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+        Some(chatgpt_backend_base_url(&server)),
+    )
+    .await;
+
+    manager
+        .refresh_token_from_authority()
+        .await
+        .expect("refresh should fail over to the other pool account");
+
+    let cached_after = manager.auth_cached().expect("auth should remain cached");
+    assert_eq!(
+        cached_after.get_account_id().as_deref(),
+        Some(WORKSPACE_ID_SECOND_ALLOWED)
+    );
 }
 
 #[test]
@@ -604,14 +1724,17 @@ struct AuthFileParams {
 
 fn write_auth_file(params: AuthFileParams, codex_home: &Path) -> std::io::Result<String> {
     let fake_jwt = fake_jwt_for_auth_file_params(&params)?;
+    let pool_account_id = params.chatgpt_account_id.clone();
     let auth_file = get_auth_file(codex_home);
     let auth_json_data = json!({
         "OPENAI_API_KEY": params.openai_api_key,
         "tokens": {
             "id_token": fake_jwt,
             "access_token": "test-access-token",
-            "refresh_token": "test-refresh-token"
+            "refresh_token": "test-refresh-token",
+            "account_id": params.chatgpt_account_id,
         },
+        "pool_account_id": pool_account_id,
         "last_refresh": Utc::now(),
     });
     let auth_json = serde_json::to_string_pretty(&auth_json_data)?;
@@ -653,6 +1776,30 @@ fn fake_jwt_for_auth_file_params(params: &AuthFileParams) -> std::io::Result<Str
     let payload_b64 = b64(&serde_json::to_vec(&payload)?);
     let signature_b64 = b64(b"sig");
     Ok(format!("{header_b64}.{payload_b64}.{signature_b64}"))
+}
+
+fn fake_access_token(account_id: &str, exp: i64) -> String {
+    #[derive(Serialize)]
+    struct Header {
+        alg: &'static str,
+        typ: &'static str,
+    }
+
+    let header = Header {
+        alg: "none",
+        typ: "JWT",
+    };
+    let payload = json!({
+        "exp": exp,
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": account_id,
+        },
+    });
+    let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+    let header_b64 = b64(&serde_json::to_vec(&header).expect("header should serialize"));
+    let payload_b64 = b64(&serde_json::to_vec(&payload).expect("payload should serialize"));
+    let signature_b64 = b64(b"sig");
+    format!("{header_b64}.{payload_b64}.{signature_b64}")
 }
 
 async fn build_config(
@@ -936,6 +2083,7 @@ async fn enforce_login_restrictions_logs_out_for_agent_identity_workspace_mismat
             auth_mode: Some(ApiAuthMode::AgentIdentity),
             openai_api_key: None,
             tokens: None,
+            pool_account_id: None,
             last_refresh: None,
             agent_identity: Some(agent_identity),
         },
