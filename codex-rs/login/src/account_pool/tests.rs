@@ -3,6 +3,7 @@ use super::token_refresh::ACCOUNT_TOKEN_REFRESH_LOCK_TTL_SECONDS;
 use super::*;
 
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 
 use base64::Engine;
 use chrono::TimeZone;
@@ -12,6 +13,11 @@ use serde::Serialize;
 use serde_json::json;
 use sqlx::Row;
 use tempfile::TempDir;
+use wiremock::Mock;
+use wiremock::MockServer;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
 
 use crate::token_data::TokenData;
 use crate::token_data::parse_chatgpt_jwt_claims;
@@ -1195,6 +1201,186 @@ async fn resolve_turn_selection_prefers_validated_fallback_over_unvalidated_acco
     };
     assert_eq!(account_id, "workspace-2");
     assert!(failover);
+}
+
+fn pending_account(
+    account_id: &str,
+    enabled: bool,
+    cooldown_until: Option<i64>,
+) -> ChatgptAccountPoolAccount {
+    ChatgptAccountPoolAccount {
+        account_id: account_id.to_string(),
+        workspace_account_id: account_id.to_string(),
+        member_identity_key: None,
+        chatgpt_user_id: None,
+        subject: None,
+        email: None,
+        plan_type: Some("pro".to_string()),
+        enabled,
+        is_selected: false,
+        created_at: 1,
+        updated_at: 1,
+        last_used_at: None,
+        last_auth_refresh_at: None,
+        auth_status: ChatgptAccountPoolAuthStatus::PendingValidation,
+        cooldown_until,
+        cooldown_reason: None,
+        rate_limits: BTreeMap::new(),
+    }
+}
+
+#[test]
+fn capacity_score_treats_pending_validation_as_full_capacity() {
+    // A pending account scores above an idle valid account ((false, 100)) so the
+    // scorer prefers bringing fresh capacity online.
+    let account = pending_account("pending", true, None);
+    assert_eq!(capacity_score(&account, 1_000), (true, 100));
+}
+
+#[test]
+fn select_best_candidate_prefers_pending_over_idle_valid_and_skips_ineligible() {
+    let now = 1_000;
+    // An idle valid account with no usage data scores (false, 100).
+    let mut idle_valid = pending_account("idle-valid", true, None);
+    idle_valid.auth_status = ChatgptAccountPoolAuthStatus::Valid;
+    let accounts = vec![
+        idle_valid,
+        pending_account("pending-cooldown", true, Some(now + 600)),
+        pending_account("pending-disabled", false, None),
+        pending_account("pending-probed", true, None),
+        pending_account("pending-ok", true, None),
+    ];
+
+    let mut probed = HashSet::new();
+    probed.insert("pending-probed".to_string());
+    assert_eq!(
+        select_best_candidate(&accounts, now, &probed),
+        Some("pending-ok"),
+        "a usable pending account outranks an idle valid one; ineligible pending \
+         accounts (cooled down / disabled / already probed) are skipped"
+    );
+
+    probed.insert("pending-ok".to_string());
+    assert_eq!(
+        select_best_candidate(&accounts, now, &probed),
+        Some("idle-valid"),
+        "once no usable pending account remains, selection falls back to the valid one"
+    );
+}
+
+async fn set_pending_validation(pool: &ChatgptAccountPool, account_id: &str) {
+    sqlx::query("UPDATE accounts SET auth_status = 'pending_validation' WHERE account_id = ?")
+        .bind(account_id)
+        .execute(&pool.pool)
+        .await
+        .expect("account should move to pending_validation");
+}
+
+fn chatgpt_auth_with_live_token(email: &str, account_id: &str) -> AuthDotJson {
+    let mut auth = chatgpt_auth(email, account_id, "pro");
+    auth.tokens
+        .as_mut()
+        .expect("tokens should exist")
+        .access_token = fake_access_token(account_id, Utc::now().timestamp() + 3600);
+    auth
+}
+
+#[tokio::test]
+async fn resolve_turn_selection_validates_pending_account_on_pickup() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/backend-api/wham/usage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "plan_type": "pro" })))
+        .mount(&server)
+        .await;
+    let base_url = format!("{}/backend-api", server.uri());
+
+    let codex_home = TempDir::new().expect("tempdir");
+    let pool = ChatgptAccountPool::open(
+        codex_home.path().to_path_buf(),
+        AuthCredentialsStoreMode::File,
+        Some(base_url),
+    )
+    .await
+    .expect("pool should open");
+    pool.register_account(&chatgpt_auth_with_live_token("one@example.com", "workspace-1"))
+        .await
+        .expect("account should register");
+    set_pending_validation(&pool, "workspace-1").await;
+
+    let selection = pool
+        .resolve_turn_selection(None, false)
+        .await
+        .expect("selection should succeed");
+    let ChatgptAccountPoolSelectionOutcome::Activated { account_id, .. } = selection else {
+        panic!("expected activation after validate-on-pickup, got {selection:?}");
+    };
+    assert_eq!(account_id, "workspace-1");
+
+    let accounts = pool.list_accounts().await.expect("accounts should list");
+    assert_eq!(
+        accounts
+            .iter()
+            .find(|account| account.account_id == "workspace-1")
+            .expect("account should remain")
+            .auth_status,
+        ChatgptAccountPoolAuthStatus::Valid,
+        "a successful pickup probe promotes the account to valid"
+    );
+    assert!(
+        usage_history_rows(&pool)
+            .await
+            .iter()
+            .any(|row| row.account_id == "workspace-1"),
+        "the usage snapshot fetched during validation should be stored"
+    );
+}
+
+#[tokio::test]
+async fn resolve_turn_selection_marks_pending_account_invalid_on_probe_401() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/backend-api/wham/usage"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    let base_url = format!("{}/backend-api", server.uri());
+
+    let codex_home = TempDir::new().expect("tempdir");
+    let pool = ChatgptAccountPool::open(
+        codex_home.path().to_path_buf(),
+        AuthCredentialsStoreMode::File,
+        Some(base_url),
+    )
+    .await
+    .expect("pool should open");
+    pool.register_account(&chatgpt_auth_with_live_token("one@example.com", "workspace-1"))
+        .await
+        .expect("account should register");
+    set_pending_validation(&pool, "workspace-1").await;
+
+    let selection = pool
+        .resolve_turn_selection(None, false)
+        .await
+        .expect("selection should succeed");
+    assert!(
+        matches!(
+            selection,
+            ChatgptAccountPoolSelectionOutcome::NoEligibleAccounts
+        ),
+        "a 401 during validation leaves no usable account, got {selection:?}"
+    );
+
+    let accounts = pool.list_accounts().await.expect("accounts should list");
+    assert_eq!(
+        accounts
+            .iter()
+            .find(|account| account.account_id == "workspace-1")
+            .expect("account should remain")
+            .auth_status,
+        ChatgptAccountPoolAuthStatus::Invalid,
+        "an authoritative 401 marks the pending account invalid"
+    );
 }
 
 #[tokio::test]

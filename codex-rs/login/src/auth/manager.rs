@@ -1365,7 +1365,14 @@ impl Debug for AuthManager {
 }
 
 fn should_consider_account_pool_auth(auth: Option<&CodexAuth>) -> bool {
-    matches!(auth, Some(CodexAuth::Chatgpt(_)))
+    // Consult the account pool when we hold a managed ChatGPT auth, or when we
+    // hold no auth at all. The auth-free case matters because a previous turn
+    // may have logged out after the pool reported no eligible accounts; without
+    // it a pool account that becomes idle again mid-session (a cooldown expires
+    // or a new account is registered) is never picked up until the user
+    // restarts or re-authenticates by hand. This mirrors the startup selection
+    // path. An explicit non-pool credential (e.g. an API key) is left untouched.
+    matches!(auth, None | Some(CodexAuth::Chatgpt(_)))
 }
 
 async fn load_startup_account_pool_auth(

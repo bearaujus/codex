@@ -1,5 +1,6 @@
 use super::*;
 use crate::account_pool::ChatgptAccountPoolAuthStatus;
+use crate::account_pool::ChatgptAccountPoolError;
 use crate::auth::storage::FileAuthStorage;
 use crate::auth::storage::get_auth_file;
 use crate::token_data::IdTokenInfo;
@@ -870,7 +871,78 @@ async fn startup_reactivates_logged_out_account_pool_auth_when_eligible() {
 
 #[tokio::test]
 #[serial(codex_auth_env)]
-async fn prepare_chatgpt_account_pool_for_turn_skips_pool_after_logout() {
+async fn prepare_chatgpt_account_pool_for_turn_reactivates_logged_out_account_when_eligible() {
+    let codex_home = tempdir().unwrap();
+    let _access_token_guard = remove_access_token_env_var();
+
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".to_string()),
+            chatgpt_account_id: Some(WORKSPACE_ID_ALLOWED.to_string()),
+        },
+        codex_home.path(),
+    )
+    .expect("failed to write auth file");
+    let mut auth_dot_json = load_auth_dot_json(codex_home.path(), AuthCredentialsStoreMode::File)
+        .expect("auth should load")
+        .expect("auth should exist");
+    auth_dot_json
+        .tokens
+        .as_mut()
+        .expect("tokens should exist")
+        .account_id = Some(WORKSPACE_ID_ALLOWED.to_string());
+    save_auth(
+        codex_home.path(),
+        &auth_dot_json,
+        AuthCredentialsStoreMode::File,
+    )
+    .expect("auth should save");
+    ChatgptAccountPool::open(
+        codex_home.path().to_path_buf(),
+        AuthCredentialsStoreMode::File,
+        None,
+    )
+    .await
+    .expect("pool should open");
+
+    let manager = AuthManager::new(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+        /*chatgpt_base_url*/ None,
+    )
+    .await;
+    assert!(manager.logout().await.expect("logout should succeed"));
+    assert!(
+        manager.auth_cached().is_none(),
+        "logout should clear cached auth"
+    );
+
+    // After a prior turn logged out following a no-eligible-accounts result, an
+    // auth-free turn must reconsult the pool and reactivate the now-eligible
+    // account rather than staying logged out until restart.
+    manager
+        .prepare_chatgpt_account_pool_for_turn()
+        .await
+        .expect("auth-free turns should reactivate an eligible pool account");
+    let reactivated = manager
+        .auth_cached()
+        .expect("turn preparation should reactivate the eligible pool account");
+    assert_eq!(
+        reactivated.get_account_id().as_deref(),
+        Some(WORKSPACE_ID_ALLOWED),
+        "turn preparation should reselect the eligible pool account"
+    );
+    assert!(
+        get_auth_file(codex_home.path()).exists(),
+        "turn preparation should rewrite auth.json from the pool"
+    );
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn prepare_chatgpt_account_pool_for_turn_reports_no_eligible_accounts_after_logout() {
     let codex_home = tempdir().unwrap();
     let _access_token_guard = remove_access_token_env_var();
 
@@ -914,20 +986,22 @@ async fn prepare_chatgpt_account_pool_for_turn_skips_pool_after_logout() {
     )
     .await;
     assert!(manager.logout().await.expect("logout should succeed"));
+    // Make the only pool account ineligible so selection cannot recover.
     std::fs::remove_file(pool_secret_home.join("auth.json"))
         .expect("pool secret should be removable");
 
-    manager
-        .prepare_chatgpt_account_pool_for_turn()
-        .await
-        .expect("auth-free turns should skip account-pool selection after logout");
+    let result = manager.prepare_chatgpt_account_pool_for_turn().await;
+    assert!(
+        matches!(result, Err(ChatgptAccountPoolError::NoEligibleAccounts)),
+        "turn preparation should surface NoEligibleAccounts when nothing is selectable, got {result:?}"
+    );
     assert!(
         manager.auth_cached().is_none(),
-        "turn preparation should not reactivate logged-out auth"
+        "turn preparation should not reactivate auth when no account is eligible"
     );
     assert!(
         !get_auth_file(codex_home.path()).exists(),
-        "turn preparation should not recreate auth.json"
+        "turn preparation should not recreate auth.json when no account is eligible"
     );
 }
 

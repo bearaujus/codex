@@ -2,6 +2,7 @@ mod activity;
 mod token_refresh;
 
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -460,10 +461,14 @@ impl ChatgptAccountPool {
                 ChatgptAccountPoolSelectionOutcome::Unchanged
             });
         }
-        // Each iteration either returns or marks one account as missing_secret; cap
-        // iterations at 2× the pool size to guard against unexpected DB races.
-        let max_retries = (accounts.len() * 2).max(8);
+        // Each iteration either returns, marks one account as missing_secret, or
+        // probes one pending_validation account exactly once (tracked below); cap
+        // iterations at 3× the pool size to guard against unexpected DB races.
+        let max_retries = (accounts.len() * 3).max(8);
         let mut retries = 0usize;
+        // Pending accounts already probed this call, so a transient probe failure
+        // never causes us to re-probe the same account in a tight loop.
+        let mut probed_pending: HashSet<String> = HashSet::new();
         loop {
             if retries >= max_retries {
                 tracing::warn!(
@@ -493,9 +498,35 @@ impl ChatgptAccountPool {
                 }
             }
 
-            let Some(best_account_id) = select_best_account(&accounts, now) else {
+            // Score valid accounts and not-yet-validated accounts together.
+            // A pending_validation account is treated as having full capacity
+            // (see `capacity_score`) so the scorer prefers bringing fresh
+            // capacity online over reusing an idle valid account.
+            let Some(best_account_id) = select_best_candidate(&accounts, now, &probed_pending)
+            else {
                 return Ok(ChatgptAccountPoolSelectionOutcome::NoEligibleAccounts);
             };
+            let best_account_id = best_account_id.to_string();
+
+            // If the scorer picked a not-yet-validated account, validate it on
+            // pickup: probe /usage, store the snapshot, and promote it to valid
+            // (or mark it invalid on a 401). The next pass then rescores with
+            // its real capacity, selecting it only if it is actually usable.
+            if accounts.iter().any(|account| {
+                account.account_id == best_account_id
+                    && matches!(
+                        account.auth_status,
+                        ChatgptAccountPoolAuthStatus::PendingValidation
+                    )
+            }) {
+                probed_pending.insert(best_account_id.clone());
+                self.validate_pending_account(&best_account_id).await?;
+                selected_account_id = self.selected_account_id().await?;
+                accounts = self.list_accounts().await?;
+                continue;
+            }
+
+            let best_account_id = best_account_id.as_str();
             let failover = current_account_id.is_some_and(|current| current != best_account_id);
             if selected_account_id.as_deref() != Some(best_account_id) {
                 self.set_selected_account_id(Some(best_account_id)).await?;
@@ -772,6 +803,65 @@ impl ChatgptAccountPool {
             auth,
             failover,
         })
+    }
+
+    /// Validates a `pending_validation` account on demand during failover by
+    /// probing the `/usage` endpoint:
+    /// - On success the usage snapshot is stored (and history recorded) and the
+    ///   account is promoted to `valid`, so the next selection pass can pick it
+    ///   up if it is not also in cooldown.
+    /// - On an authoritative 401 the account is marked `invalid` so it is never
+    ///   retried until an external service re-validates it.
+    /// - Missing secrets and transient failures leave the account untouched
+    ///   (still `pending_validation`) for a later attempt.
+    async fn validate_pending_account(
+        &self,
+        account_id: &str,
+    ) -> Result<(), ChatgptAccountPoolError> {
+        let Some(auth) = self.load_account_codex_auth(account_id).await? else {
+            self.mark_account_missing_secret(account_id).await?;
+            return Ok(());
+        };
+        match fetch_usage_snapshots_with_status(&self.chatgpt_base_url, &auth).await {
+            UsageFetchOutcome::Snapshots(snapshots) => {
+                // Persists the usage snapshot + history, refreshes cooldown, and
+                // promotes pending_validation -> valid (terminal states are kept).
+                self.record_fetched_rate_limits(account_id, snapshots.as_slice())
+                    .await?;
+                self.append_event(
+                    Some(account_id),
+                    "account_validated_on_pickup",
+                    format!(
+                        "Validated ChatGPT account {} on pickup",
+                        account_suffix(account_id)
+                    ),
+                )
+                .await?;
+                Ok(())
+            }
+            UsageFetchOutcome::Unauthorized => {
+                self.update_auth_status(account_id, ChatgptAccountPoolAuthStatus::Invalid)
+                    .await?;
+                self.append_event(
+                    Some(account_id),
+                    "account_validation_failed",
+                    format!(
+                        "ChatGPT account {} failed validation on pickup (401); marked invalid",
+                        account_suffix(account_id)
+                    ),
+                )
+                .await?;
+                Ok(())
+            }
+            UsageFetchOutcome::Failed(err) => {
+                tracing::warn!(
+                    %account_id,
+                    error = %err,
+                    "pending account validation probe failed; leaving account pending_validation"
+                );
+                Ok(())
+            }
+        }
     }
 
     async fn initialize_schema(&self) -> Result<(), ChatgptAccountPoolError> {
@@ -1326,10 +1416,39 @@ fn is_account_eligible(account: &ChatgptAccountPoolAccount, now: i64) -> bool {
             .is_none_or(|cooldown_until| cooldown_until <= now)
 }
 
-fn select_best_account(accounts: &[ChatgptAccountPoolAccount], now: i64) -> Option<&str> {
+/// A not-yet-validated account that may be brought online during selection:
+/// enabled, not cooling down, and not already probed this pass.
+fn is_pending_validation_candidate(
+    account: &ChatgptAccountPoolAccount,
+    now: i64,
+    probed: &HashSet<String>,
+) -> bool {
+    account.enabled
+        && matches!(
+            account.auth_status,
+            ChatgptAccountPoolAuthStatus::PendingValidation
+        )
+        && account
+            .cooldown_until
+            .is_none_or(|cooldown_until| cooldown_until <= now)
+        && !probed.contains(&account.account_id)
+}
+
+/// Picks the best account to run the next turn on, scoring already-valid
+/// accounts and not-yet-validated accounts together. Pending accounts are
+/// scored as full capacity (see [`capacity_score`]), so the scorer prefers
+/// validating fresh capacity over reusing an idle valid account; the caller
+/// validates the pick on pickup when it is still `pending_validation`.
+fn select_best_candidate<'a>(
+    accounts: &'a [ChatgptAccountPoolAccount],
+    now: i64,
+    probed: &HashSet<String>,
+) -> Option<&'a str> {
     accounts
         .iter()
-        .filter(|account| is_account_eligible(account, now))
+        .filter(|account| {
+            is_account_eligible(account, now) || is_pending_validation_candidate(account, now, probed)
+        })
         .max_by(|left, right| compare_account_capacity(left, right, now))
         .map(|account| account.account_id.as_str())
 }
@@ -1348,6 +1467,17 @@ fn compare_account_capacity(
 }
 
 fn capacity_score(account: &ChatgptAccountPoolAccount, now: i64) -> (bool, i64) {
+    // A not-yet-validated account has no usage history yet. Treat it as fully
+    // available (both windows at 100% remaining, i.e. a known-capacity max) so
+    // the scorer prefers bringing it online over an idle valid account whose
+    // capacity is unknown ((false, 100)). It is validated on pickup, after
+    // which its real snapshot replaces this optimistic score.
+    if matches!(
+        account.auth_status,
+        ChatgptAccountPoolAuthStatus::PendingValidation
+    ) {
+        return (true, 100);
+    }
     if account.rate_limits.is_empty() {
         return (false, 100);
     }
@@ -1504,26 +1634,45 @@ async fn probe_usage_status(base_url: &str, auth: &CodexAuth) -> Option<reqwest:
         .map(|r| r.status())
 }
 
-async fn fetch_rate_limit_snapshots(
-    base_url: &str,
-    auth: &CodexAuth,
-) -> Result<Vec<RateLimitSnapshot>, ChatgptAccountPoolError> {
+/// Outcome of a `/usage` fetch that preserves the 401 distinction so callers
+/// can mark an account invalid (authoritative) vs. leave it untouched (transient).
+enum UsageFetchOutcome {
+    Snapshots(Vec<RateLimitSnapshot>),
+    Unauthorized,
+    Failed(ChatgptAccountPoolError),
+}
+
+async fn fetch_usage_snapshots_with_status(base_url: &str, auth: &CodexAuth) -> UsageFetchOutcome {
     let path = usage_endpoint_url(base_url);
-    let headers = usage_request_headers(auth)
-        .ok_or_else(|| std::io::Error::other("failed to build ChatGPT usage request headers"))?;
-    let client = build_reqwest_client_with_custom_ca(reqwest::Client::builder())
-        .map_err(std::io::Error::other)?;
-    let response = client
-        .get(&path)
-        .headers(headers)
-        .send()
-        .await
-        .map_err(std::io::Error::other)?;
-    if !response.status().is_success() {
-        return Err(ChatgptAccountPoolError::Io(std::io::Error::other(format!(
-            "rate-limit refresh failed with status {}",
-            response.status()
-        ))));
+    let Some(headers) = usage_request_headers(auth) else {
+        return UsageFetchOutcome::Failed(ChatgptAccountPoolError::Io(std::io::Error::other(
+            "failed to build ChatGPT usage request headers",
+        )));
+    };
+    let client = match build_reqwest_client_with_custom_ca(reqwest::Client::builder()) {
+        Ok(client) => client,
+        Err(err) => {
+            return UsageFetchOutcome::Failed(ChatgptAccountPoolError::Io(std::io::Error::other(
+                err,
+            )));
+        }
+    };
+    let response = match client.get(&path).headers(headers).send().await {
+        Ok(response) => response,
+        Err(err) => {
+            return UsageFetchOutcome::Failed(ChatgptAccountPoolError::Io(std::io::Error::other(
+                err,
+            )));
+        }
+    };
+    let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return UsageFetchOutcome::Unauthorized;
+    }
+    if !status.is_success() {
+        return UsageFetchOutcome::Failed(ChatgptAccountPoolError::Io(std::io::Error::other(
+            format!("rate-limit refresh failed with status {status}"),
+        )));
     }
     let content_type = response
         .headers()
@@ -1531,13 +1680,33 @@ async fn fetch_rate_limit_snapshots(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let body = response.text().await.map_err(std::io::Error::other)?;
-    let payload = serde_json::from_str::<RateLimitStatusPayload>(&body).map_err(|err| {
-        std::io::Error::other(format!(
-            "failed to decode rate-limit payload: {err}; content-type={content_type}; body={body}"
-        ))
-    })?;
-    Ok(rate_limit_snapshots_from_payload(payload))
+    let body = match response.text().await {
+        Ok(body) => body,
+        Err(err) => {
+            return UsageFetchOutcome::Failed(ChatgptAccountPoolError::Io(std::io::Error::other(
+                err,
+            )));
+        }
+    };
+    match serde_json::from_str::<RateLimitStatusPayload>(&body) {
+        Ok(payload) => UsageFetchOutcome::Snapshots(rate_limit_snapshots_from_payload(payload)),
+        Err(err) => UsageFetchOutcome::Failed(ChatgptAccountPoolError::Io(std::io::Error::other(
+            format!("failed to decode rate-limit payload: {err}; content-type={content_type}; body={body}"),
+        ))),
+    }
+}
+
+async fn fetch_rate_limit_snapshots(
+    base_url: &str,
+    auth: &CodexAuth,
+) -> Result<Vec<RateLimitSnapshot>, ChatgptAccountPoolError> {
+    match fetch_usage_snapshots_with_status(base_url, auth).await {
+        UsageFetchOutcome::Snapshots(snapshots) => Ok(snapshots),
+        UsageFetchOutcome::Unauthorized => Err(ChatgptAccountPoolError::Io(std::io::Error::other(
+            "rate-limit refresh failed with status 401 Unauthorized",
+        ))),
+        UsageFetchOutcome::Failed(err) => Err(err),
+    }
 }
 
 fn rate_limit_snapshots_from_payload(payload: RateLimitStatusPayload) -> Vec<RateLimitSnapshot> {
