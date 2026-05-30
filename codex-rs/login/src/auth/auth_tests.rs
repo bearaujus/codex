@@ -793,7 +793,7 @@ fn logout_removes_auth_file() -> Result<(), std::io::Error> {
 
 #[tokio::test]
 #[serial(codex_auth_env)]
-async fn startup_does_not_reactivate_logged_out_account_pool_auth() {
+async fn startup_reactivates_logged_out_account_pool_auth_when_eligible() {
     let codex_home = tempdir().unwrap();
     let _access_token_guard = remove_access_token_env_var();
 
@@ -854,13 +854,17 @@ async fn startup_does_not_reactivate_logged_out_account_pool_auth() {
         /*chatgpt_base_url*/ None,
     )
     .await;
-    assert!(
-        restarted.auth_cached().is_none(),
-        "startup should not reactivate logged-out pool auth"
+    let restarted_auth = restarted
+        .auth_cached()
+        .expect("startup should reactivate an eligible pool account after logout");
+    assert_eq!(
+        restarted_auth.get_account_id().as_deref(),
+        Some(WORKSPACE_ID_ALLOWED),
+        "startup should reselect the eligible pool account"
     );
     assert!(
-        !get_auth_file(codex_home.path()).exists(),
-        "startup should not rewrite auth.json from the pool"
+        get_auth_file(codex_home.path()).exists(),
+        "startup should rewrite auth.json from the pool"
     );
 }
 

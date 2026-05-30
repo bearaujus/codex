@@ -1506,7 +1506,16 @@ impl AuthManager {
             err
         })
         .ok();
-        let managed_auth = if should_consider_account_pool_auth(managed_auth.as_ref()) {
+        // Consult the account pool at startup when we already hold a managed
+        // ChatGPT auth, or when we hold no auth at all. The auth-free case
+        // matters because a previous run may have logged out after the pool
+        // reported no eligible accounts (or this CLI relies entirely on the
+        // pool); without it a newly idle pool account is never picked up until
+        // the user re-authenticates by hand. An explicit non-pool credential
+        // (e.g. an API key) is left untouched.
+        let consult_account_pool =
+            matches!(managed_auth.as_ref(), None | Some(CodexAuth::Chatgpt(_)));
+        let managed_auth = if consult_account_pool {
             load_startup_account_pool_auth(
                 &codex_home,
                 auth_credentials_store_mode,
