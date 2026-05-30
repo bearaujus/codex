@@ -1098,6 +1098,12 @@ impl ChatWidget {
                 self.token_info = None;
             }
         }
+        // The configurable status line derives several items (context
+        // remaining/used, context window size, used/input/output tokens) from
+        // `token_info`. Refresh the surfaces here so those values track token
+        // updates instead of only refreshing when some unrelated event happens
+        // to trigger a refresh.
+        self.refresh_status_surfaces();
     }
 
     fn apply_token_info(&mut self, info: TokenUsageInfo) {
@@ -1132,6 +1138,7 @@ impl ChatWidget {
                     self.token_info = None;
                 }
             }
+            self.refresh_status_surfaces();
         }
     }
 
