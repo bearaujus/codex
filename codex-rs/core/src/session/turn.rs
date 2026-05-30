@@ -269,8 +269,7 @@ pub(crate) async fn run_turn(
                     auto_compact_token_status(sess.as_ref(), turn_context.as_ref()).await;
                 let token_limit_reached = token_status.token_limit_reached;
 
-                let estimated_token_count =
-                    sess.get_estimated_token_count(turn_context.as_ref()).await;
+                let estimated_token_count = sess.get_estimated_token_count().await;
 
                 trace!(
                     turn_id = %turn_context.sub_id,
