@@ -822,6 +822,34 @@ impl ChatgptAccountPool {
             self.mark_account_missing_secret(account_id).await?;
             return Ok(());
         };
+        // Refresh-then-probe: an idle pending account may hold an expired (but
+        // refreshable) access token. Probing with it would 401 and wrongly mark
+        // the account invalid, so bring the token live first. Only a probe that
+        // fails 401 with a *fresh* token is treated as authoritative below.
+        let auth = match self.refresh_pending_account_auth(account_id, auth).await? {
+            token_refresh::PendingAccountAuth::Ready(auth) => auth,
+            token_refresh::PendingAccountAuth::Dead => {
+                self.update_auth_status(account_id, ChatgptAccountPoolAuthStatus::Invalid)
+                    .await?;
+                self.append_event(
+                    Some(account_id),
+                    "account_validation_failed",
+                    format!(
+                        "ChatGPT account {} failed validation on pickup (refresh token rejected); marked invalid",
+                        account_suffix(account_id)
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+            token_refresh::PendingAccountAuth::Inconclusive => {
+                tracing::warn!(
+                    %account_id,
+                    "pending account token refresh was inconclusive; leaving account pending_validation"
+                );
+                return Ok(());
+            }
+        };
         match fetch_usage_snapshots_with_status(&self.chatgpt_base_url, &auth).await {
             UsageFetchOutcome::Snapshots(snapshots) => {
                 // Persists the usage snapshot + history, refreshes cooldown, and
@@ -1447,7 +1475,8 @@ fn select_best_candidate<'a>(
     accounts
         .iter()
         .filter(|account| {
-            is_account_eligible(account, now) || is_pending_validation_candidate(account, now, probed)
+            is_account_eligible(account, now)
+                || is_pending_validation_candidate(account, now, probed)
         })
         .max_by(|left, right| compare_account_capacity(left, right, now))
         .map(|account| account.account_id.as_str())
@@ -1690,9 +1719,11 @@ async fn fetch_usage_snapshots_with_status(base_url: &str, auth: &CodexAuth) -> 
     };
     match serde_json::from_str::<RateLimitStatusPayload>(&body) {
         Ok(payload) => UsageFetchOutcome::Snapshots(rate_limit_snapshots_from_payload(payload)),
-        Err(err) => UsageFetchOutcome::Failed(ChatgptAccountPoolError::Io(std::io::Error::other(
-            format!("failed to decode rate-limit payload: {err}; content-type={content_type}; body={body}"),
-        ))),
+        Err(err) => {
+            UsageFetchOutcome::Failed(ChatgptAccountPoolError::Io(std::io::Error::other(format!(
+                "failed to decode rate-limit payload: {err}; content-type={content_type}; body={body}"
+            ))))
+        }
     }
 }
 

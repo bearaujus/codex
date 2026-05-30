@@ -10,8 +10,24 @@ use super::ChatgptAccountPoolError;
 use super::account_suffix;
 use super::now_ts;
 use crate::AuthDotJson;
+use crate::CodexAuth;
+use crate::RefreshTokenError;
 use crate::save_auth;
 use crate::token_data::parse_jwt_expiration;
+
+/// Outcome of preparing a pending account's auth for the validate-on-pickup
+/// probe (see [`ChatgptAccountPool::refresh_pending_account_auth`]).
+pub(crate) enum PendingAccountAuth {
+    /// A live `CodexAuth` whose access token is fresh and ready to probe.
+    Ready(CodexAuth),
+    /// The account's refresh token was rejected (expired / reused / revoked),
+    /// so the account is genuinely unusable and should be marked invalid.
+    Dead,
+    /// A live token could not be obtained right now (transient refresh failure,
+    /// missing secret, or another refresher holds the lock). The account should
+    /// be left `pending_validation` for a later attempt rather than condemned.
+    Inconclusive,
+}
 
 pub(crate) const ACCOUNT_TOKEN_REFRESH_EXPIRATION_SKEW_SECONDS: i64 = 60;
 pub(crate) const ACCOUNT_TOKEN_REFRESH_LOCK_TTL_SECONDS: i64 = 30;
@@ -80,6 +96,62 @@ impl ChatgptAccountPool {
         )
         .await?;
         Ok(())
+    }
+
+    /// Ensures a pending account holds a live access token before it is probed
+    /// during validate-on-pickup.
+    ///
+    /// An idle pending account can carry an expired (but refreshable) access
+    /// token; probing with it would yield a 401 and wrongly mark the account
+    /// invalid. When the token is stale this refreshes it under the shared
+    /// per-account refresh lock (so concurrent refreshers do not race and burn
+    /// the rotating refresh token) and persists the result back into the pool
+    /// secret, then returns a `CodexAuth` carrying the live token. A fresh token
+    /// is returned unchanged without touching the lock.
+    pub(crate) async fn refresh_pending_account_auth(
+        &self,
+        account_id: &str,
+        auth: CodexAuth,
+    ) -> Result<PendingAccountAuth, ChatgptAccountPoolError> {
+        if !auth.chatgpt_access_token_is_stale() {
+            return Ok(PendingAccountAuth::Ready(auth));
+        }
+        let owner = Self::token_refresh_lock_owner();
+        let acquired = self
+            .try_acquire_token_refresh_lock(account_id, &owner, Self::token_refresh_lock_ttl())
+            .await?;
+        if !acquired {
+            // Another refresher is already rotating this account's token. Reload
+            // the pool copy and use whatever it currently holds rather than
+            // racing a second refresh against the same rotating refresh token.
+            return Ok(match self.load_account_codex_auth(account_id).await? {
+                Some(reloaded) => PendingAccountAuth::Ready(reloaded),
+                None => PendingAccountAuth::Inconclusive,
+            });
+        }
+        let outcome = match auth.refresh_chatgpt_tokens().await {
+            Ok(refreshed) => {
+                self.persist_refreshed_account_auth(account_id, &refreshed)
+                    .await?;
+                match self.load_account_codex_auth(account_id).await? {
+                    Some(reloaded) => PendingAccountAuth::Ready(reloaded),
+                    None => PendingAccountAuth::Inconclusive,
+                }
+            }
+            // An authoritative refresh rejection (expired/reused/revoked refresh
+            // token) means the account cannot be used until it is re-authorized.
+            Err(RefreshTokenError::Permanent(_)) => PendingAccountAuth::Dead,
+            // A transient failure (network, 5xx) is inconclusive; leave pending.
+            Err(RefreshTokenError::Transient(_)) => PendingAccountAuth::Inconclusive,
+        };
+        if let Err(err) = self.release_token_refresh_lock(account_id, &owner).await {
+            tracing::warn!(
+                account_id,
+                owner,
+                "failed to release token refresh lock: {err}"
+            );
+        }
+        Ok(outcome)
     }
 
     pub async fn account_last_auth_refresh_at(

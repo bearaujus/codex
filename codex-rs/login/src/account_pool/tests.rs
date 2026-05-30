@@ -1285,6 +1285,233 @@ fn chatgpt_auth_with_live_token(email: &str, account_id: &str) -> AuthDotJson {
     auth
 }
 
+fn chatgpt_auth_with_stale_token(email: &str, account_id: &str) -> AuthDotJson {
+    let mut auth = chatgpt_auth(email, account_id, "pro");
+    auth.tokens
+        .as_mut()
+        .expect("tokens should exist")
+        .access_token = fake_access_token(account_id, Utc::now().timestamp() - 3600);
+    auth
+}
+
+/// Restores a process env var on drop so serial tests never leak the refresh
+/// URL override into other tests.
+struct EnvGuard {
+    key: &'static str,
+    original: Option<std::ffi::OsString>,
+}
+
+impl EnvGuard {
+    fn set(key: &'static str, value: String) -> Self {
+        let original = std::env::var_os(key);
+        // SAFETY: tests sharing this override run serially (see #[serial]).
+        unsafe { std::env::set_var(key, &value) };
+        Self { key, original }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: restore the prior value before any other test observes it.
+        unsafe {
+            match &self.original {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
+#[serial_test::serial(account_pool_refresh_url)]
+#[tokio::test]
+async fn resolve_turn_selection_refreshes_stale_pending_token_before_probe() {
+    let server = MockServer::start().await;
+    // A stale pending token is refreshed first; the rotated tokens come back here.
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id_token": fake_jwt("one@example.com", "workspace-1", "pro"),
+            "access_token": fake_access_token("workspace-1", Utc::now().timestamp() + 3600),
+            "refresh_token": "refresh-workspace-1-rotated",
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/backend-api/wham/usage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "plan_type": "pro" })))
+        .mount(&server)
+        .await;
+    let _env_guard = EnvGuard::set(
+        crate::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR,
+        format!("{}/oauth/token", server.uri()),
+    );
+    let base_url = format!("{}/backend-api", server.uri());
+
+    let codex_home = TempDir::new().expect("tempdir");
+    let pool = ChatgptAccountPool::open(
+        codex_home.path().to_path_buf(),
+        AuthCredentialsStoreMode::File,
+        Some(base_url),
+    )
+    .await
+    .expect("pool should open");
+    pool.register_account(&chatgpt_auth_with_stale_token(
+        "one@example.com",
+        "workspace-1",
+    ))
+    .await
+    .expect("account should register");
+    set_pending_validation(&pool, "workspace-1").await;
+
+    let selection = pool
+        .resolve_turn_selection(None, false)
+        .await
+        .expect("selection should succeed");
+    let ChatgptAccountPoolSelectionOutcome::Activated { account_id, .. } = selection else {
+        panic!("expected activation after refresh-then-probe, got {selection:?}");
+    };
+    assert_eq!(account_id, "workspace-1");
+
+    let accounts = pool.list_accounts().await.expect("accounts should list");
+    assert_eq!(
+        accounts
+            .iter()
+            .find(|account| account.account_id == "workspace-1")
+            .expect("account should remain")
+            .auth_status,
+        ChatgptAccountPoolAuthStatus::Valid,
+        "a stale token is refreshed and the probe then promotes the account to valid"
+    );
+    let persisted = pool
+        .load_account_secret("workspace-1")
+        .expect("secret should load")
+        .expect("secret should exist");
+    assert_eq!(
+        persisted.tokens.expect("tokens should exist").refresh_token,
+        "refresh-workspace-1-rotated",
+        "the rotated refresh token must be persisted so the next pickup does not reuse a spent one"
+    );
+}
+
+#[serial_test::serial(account_pool_refresh_url)]
+#[tokio::test]
+async fn resolve_turn_selection_leaves_pending_account_pending_when_refresh_fails_transiently() {
+    let server = MockServer::start().await;
+    // Transient (5xx) refresh failure: the probe must NOT run and the account
+    // must stay pending rather than being condemned.
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/backend-api/wham/usage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "plan_type": "pro" })))
+        .mount(&server)
+        .await;
+    let _env_guard = EnvGuard::set(
+        crate::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR,
+        format!("{}/oauth/token", server.uri()),
+    );
+    let base_url = format!("{}/backend-api", server.uri());
+
+    let codex_home = TempDir::new().expect("tempdir");
+    let pool = ChatgptAccountPool::open(
+        codex_home.path().to_path_buf(),
+        AuthCredentialsStoreMode::File,
+        Some(base_url),
+    )
+    .await
+    .expect("pool should open");
+    pool.register_account(&chatgpt_auth_with_stale_token(
+        "one@example.com",
+        "workspace-1",
+    ))
+    .await
+    .expect("account should register");
+    set_pending_validation(&pool, "workspace-1").await;
+
+    let selection = pool
+        .resolve_turn_selection(None, false)
+        .await
+        .expect("selection should succeed");
+    assert!(
+        matches!(
+            selection,
+            ChatgptAccountPoolSelectionOutcome::NoEligibleAccounts
+        ),
+        "a transient refresh failure leaves no usable account, got {selection:?}"
+    );
+
+    let accounts = pool.list_accounts().await.expect("accounts should list");
+    assert_eq!(
+        accounts
+            .iter()
+            .find(|account| account.account_id == "workspace-1")
+            .expect("account should remain")
+            .auth_status,
+        ChatgptAccountPoolAuthStatus::PendingValidation,
+        "a transient refresh failure must not condemn the account; it stays pending"
+    );
+}
+
+#[serial_test::serial(account_pool_refresh_url)]
+#[tokio::test]
+async fn resolve_turn_selection_marks_pending_account_invalid_when_refresh_token_rejected() {
+    let server = MockServer::start().await;
+    // Authoritative refresh rejection (401): the refresh token is dead, so the
+    // account is genuinely unusable and should be marked invalid.
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    let _env_guard = EnvGuard::set(
+        crate::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR,
+        format!("{}/oauth/token", server.uri()),
+    );
+    let base_url = format!("{}/backend-api", server.uri());
+
+    let codex_home = TempDir::new().expect("tempdir");
+    let pool = ChatgptAccountPool::open(
+        codex_home.path().to_path_buf(),
+        AuthCredentialsStoreMode::File,
+        Some(base_url),
+    )
+    .await
+    .expect("pool should open");
+    pool.register_account(&chatgpt_auth_with_stale_token(
+        "one@example.com",
+        "workspace-1",
+    ))
+    .await
+    .expect("account should register");
+    set_pending_validation(&pool, "workspace-1").await;
+
+    let selection = pool
+        .resolve_turn_selection(None, false)
+        .await
+        .expect("selection should succeed");
+    assert!(
+        matches!(
+            selection,
+            ChatgptAccountPoolSelectionOutcome::NoEligibleAccounts
+        ),
+        "a rejected refresh token leaves no usable account, got {selection:?}"
+    );
+
+    let accounts = pool.list_accounts().await.expect("accounts should list");
+    assert_eq!(
+        accounts
+            .iter()
+            .find(|account| account.account_id == "workspace-1")
+            .expect("account should remain")
+            .auth_status,
+        ChatgptAccountPoolAuthStatus::Invalid,
+        "an authoritative refresh-token rejection marks the account invalid"
+    );
+}
+
 #[tokio::test]
 async fn resolve_turn_selection_validates_pending_account_on_pickup() {
     let server = MockServer::start().await;
@@ -1303,9 +1530,12 @@ async fn resolve_turn_selection_validates_pending_account_on_pickup() {
     )
     .await
     .expect("pool should open");
-    pool.register_account(&chatgpt_auth_with_live_token("one@example.com", "workspace-1"))
-        .await
-        .expect("account should register");
+    pool.register_account(&chatgpt_auth_with_live_token(
+        "one@example.com",
+        "workspace-1",
+    ))
+    .await
+    .expect("account should register");
     set_pending_validation(&pool, "workspace-1").await;
 
     let selection = pool
@@ -1354,9 +1584,12 @@ async fn resolve_turn_selection_marks_pending_account_invalid_on_probe_401() {
     )
     .await
     .expect("pool should open");
-    pool.register_account(&chatgpt_auth_with_live_token("one@example.com", "workspace-1"))
-        .await
-        .expect("account should register");
+    pool.register_account(&chatgpt_auth_with_live_token(
+        "one@example.com",
+        "workspace-1",
+    ))
+    .await
+    .expect("account should register");
     set_pending_validation(&pool, "workspace-1").await;
 
     let selection = pool

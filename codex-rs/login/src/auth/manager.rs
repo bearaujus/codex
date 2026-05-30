@@ -364,6 +364,57 @@ impl CodexAuth {
         }
     }
 
+    /// Whether this is a ChatGPT credential whose access token is stale
+    /// (expired or within the refresh skew window) and should be refreshed
+    /// before use. Returns `false` for non-ChatGPT auth or a still-fresh token.
+    pub(crate) fn chatgpt_access_token_is_stale(&self) -> bool {
+        let Self::Chatgpt(chatgpt_auth) = self else {
+            return false;
+        };
+        match chatgpt_auth.current_auth_json() {
+            Some(auth_dot_json) => {
+                ChatgptAccountPool::account_auth_needs_token_refresh(&auth_dot_json, Utc::now())
+            }
+            None => false,
+        }
+    }
+
+    /// Refreshes this ChatGPT auth's OAuth tokens via the auth service and
+    /// returns the refreshed [`AuthDotJson`]. The caller is responsible for
+    /// persisting the result (e.g. back into the account-pool secret store).
+    ///
+    /// Used by the account pool to bring a stale pending-account token live
+    /// before probing `/usage`, so a merely-expired (but refreshable) token is
+    /// not mistaken for a revoked account. Uses the same HTTP client and
+    /// refresh primitives as the active-account refresh path.
+    pub(crate) async fn refresh_chatgpt_tokens(&self) -> Result<AuthDotJson, RefreshTokenError> {
+        let Self::Chatgpt(chatgpt_auth) = self else {
+            return Err(RefreshTokenError::Transient(std::io::Error::other(
+                "refresh_chatgpt_tokens called on non-ChatGPT auth",
+            )));
+        };
+        let auth_dot_json = chatgpt_auth.current_auth_json().ok_or_else(|| {
+            RefreshTokenError::Transient(std::io::Error::other("Token data is not available."))
+        })?;
+        let refresh_token = auth_dot_json
+            .tokens
+            .as_ref()
+            .ok_or_else(|| {
+                RefreshTokenError::Transient(std::io::Error::other("Token data is not available."))
+            })?
+            .refresh_token
+            .clone();
+        let refresh_response =
+            request_chatgpt_token_refresh(refresh_token, chatgpt_auth.client()).await?;
+        apply_refreshed_tokens(
+            auth_dot_json,
+            refresh_response.id_token,
+            refresh_response.access_token,
+            refresh_response.refresh_token,
+        )
+        .map_err(RefreshTokenError::Transient)
+    }
+
     /// Returns false if Codex backend auth omits the FedRAMP claim.
     pub fn is_fedramp_account(&self) -> bool {
         match self {
