@@ -1,12 +1,10 @@
 [profile.default]
-# Retry once so one transient failure does not fail full-CI outright.
-# Fanout keeps the full-CI shards moving without treating every >30s test as
-# stuck. Keep this aligned with the broader timeout budget we give sharded CI.
-slow-timeout = { period = "30s", terminate-after = 2 }
-retries = 1
-
-[profile.default.junit]
-path = "junit.xml"
+# Local-only fork: there is no CI, so this profile is tuned for the developer
+# loop. No retries (don't pay double for a flaky/slow test locally), and a more
+# generous timeout so genuinely long integration tests aren't killed + reported
+# as failures. terminate-after still backstops a truly hung test.
+slow-timeout = { period = "60s", terminate-after = 3 }
+retries = 0
 
 [profile.local]
 inherits = "default"

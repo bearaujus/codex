@@ -28,21 +28,11 @@ Remote mode registers the local exec-server with the environment registry,
 then reconnects to the service-provided rendezvous websocket as the environment.
 Remote communication uses the Noise relay contract; the registry and harness
 must support it.
-It uses the standard Codex ChatGPT sign-in state; run `codex login` first when
-remote registration needs authentication. Containerized callers that receive an
+It uses the standard Codex ChatGPT account-pool auth; configure ChatGPT auth outside
+the CLI first when remote registration needs authentication. Containerized callers that receive an
 Agent Identity JWT in `CODEX_ACCESS_TOKEN` can opt into that auth path with
 `--use-agent-identity-auth`; Codex then registers an Agent task and sends the
 derived AgentAssertion headers on the registry request.
-
-Alternatively, API users can instead use `CODEX_API_KEY`;
-Codex sends it as a bearer token on the registration request. For example:
-
-```sh
-CODEX_API_KEY="$OPENAI_API_KEY" \
-codex exec-server \
-  --remote ... \
-  --environment-id "$ENVIRONMENT_ID"
-```
 
 Wire framing:
 
