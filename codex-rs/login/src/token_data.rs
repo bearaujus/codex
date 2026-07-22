@@ -5,6 +5,8 @@ use codex_protocol::auth::PlanType;
 use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use sha2::Digest;
+use sha2::Sha256;
 use thiserror::Error;
 
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Default)]
@@ -34,6 +36,8 @@ pub struct IdTokenInfo {
     pub chatgpt_plan_type: Option<PlanType>,
     /// ChatGPT user identifier associated with the token, if present.
     pub chatgpt_user_id: Option<String>,
+    /// JWT subject associated with the token, if present.
+    pub subject: Option<String>,
     /// Organization/workspace identifier associated with the token, if present.
     pub chatgpt_account_id: Option<String>,
     /// Whether the selected ChatGPT workspace must route through the FedRAMP edge.
@@ -66,12 +70,43 @@ impl IdTokenInfo {
     pub fn is_fedramp_account(&self) -> bool {
         self.chatgpt_account_is_fedramp
     }
+
+    pub fn member_identity_key(&self) -> Option<String> {
+        self.chatgpt_user_id
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .map(|value| format!("chatgpt_user_id:{value}"))
+            .or_else(|| {
+                self.subject
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .map(|value| format!("sub:{value}"))
+            })
+    }
+}
+
+pub fn derive_pool_account_id(
+    workspace_account_id: &str,
+    member_identity_key: Option<&str>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(workspace_account_id.as_bytes());
+    hasher.update(b"\n");
+    if let Some(member_identity_key) = member_identity_key.filter(|value| !value.is_empty()) {
+        hasher.update(member_identity_key.as_bytes());
+    } else {
+        hasher.update(b"workspace");
+    }
+    let digest = format!("{:x}", hasher.finalize());
+    format!("pool_{}", &digest[..32])
 }
 
 #[derive(Deserialize)]
 struct IdClaims {
     #[serde(default)]
     email: Option<String>,
+    #[serde(default)]
+    sub: Option<String>,
     #[serde(rename = "https://api.openai.com/profile", default)]
     profile: Option<ProfileClaims>,
     #[serde(rename = "https://api.openai.com/auth", default)]
@@ -146,6 +181,7 @@ pub fn parse_chatgpt_jwt_claims(jwt: &str) -> Result<IdTokenInfo, IdTokenInfoErr
             raw_jwt: jwt.to_string(),
             chatgpt_plan_type: auth.chatgpt_plan_type,
             chatgpt_user_id: auth.chatgpt_user_id.or(auth.user_id),
+            subject: claims.sub,
             chatgpt_account_id: auth.chatgpt_account_id,
             chatgpt_account_is_fedramp: auth.chatgpt_account_is_fedramp,
         }),
@@ -154,6 +190,7 @@ pub fn parse_chatgpt_jwt_claims(jwt: &str) -> Result<IdTokenInfo, IdTokenInfoErr
             raw_jwt: jwt.to_string(),
             chatgpt_plan_type: None,
             chatgpt_user_id: None,
+            subject: claims.sub,
             chatgpt_account_id: None,
             chatgpt_account_is_fedramp: false,
         }),

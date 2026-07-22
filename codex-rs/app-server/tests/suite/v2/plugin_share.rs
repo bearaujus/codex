@@ -396,12 +396,15 @@ plugin_sharing = false
 
     assert_eq!(error.error.code, -32600);
     assert_eq!(error.error.message, "plugin sharing is disabled");
+    let requests = server
+        .received_requests()
+        .await
+        .expect("wiremock should record requests");
     assert!(
-        server
-            .received_requests()
-            .await
-            .expect("wiremock should record requests")
-            .is_empty()
+        requests.iter().all(|request| {
+            request.url.path().contains("/usage") || request.url.path().contains("/wham/")
+        }),
+        "disabled plugin sharing must not call the share API; got {requests:?}"
     );
     Ok(())
 }

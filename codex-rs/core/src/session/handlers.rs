@@ -22,6 +22,7 @@ use crate::tasks::CompactTask;
 use crate::tasks::UserShellCommandMode;
 use crate::tasks::UserShellCommandTask;
 use crate::tasks::execute_user_shell_command;
+use codex_login::ChatgptAccountPoolError;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
@@ -223,6 +224,43 @@ pub(super) async fn user_input_or_turn_inner(
             msg: thread_settings_applied_event(sess).await,
         })
         .await;
+    }
+    // Re-evaluate the shared ChatGPT account-pool selection at each user-turn boundary so
+    // service-side enable/disable/validate changes take effect before work starts. When no
+    // eligible account remains, the login layer logs out the stale active auth and we abort this
+    // turn with an error instead of running with credentials the pool no longer allows.
+    let account_before_selection = sess
+        .services
+        .auth_manager
+        .auth_cached()
+        .and_then(|auth| auth.get_pool_account_id());
+    if let Err(err) = sess
+        .services
+        .auth_manager
+        .prepare_chatgpt_account_pool_for_turn()
+        .await
+    {
+        let codex_error_info = match &err {
+            ChatgptAccountPoolError::NoEligibleAccounts => CodexErrorInfo::UsageLimitExceeded,
+            _ => CodexErrorInfo::Other,
+        };
+        sess.send_event_raw(Event {
+            id: sub_id.clone(),
+            msg: EventMsg::Error(ErrorEvent {
+                message: err.to_string(),
+                codex_error_info: Some(codex_error_info),
+            }),
+        })
+        .await;
+        return;
+    }
+    let account_after_selection = sess
+        .services
+        .auth_manager
+        .auth_cached()
+        .and_then(|auth| auth.get_pool_account_id());
+    if account_after_selection != account_before_selection {
+        sess.clear_rate_limits(current_context.as_ref()).await;
     }
     sess.maybe_emit_model_warnings_for_turn(current_context.as_ref())
         .await;

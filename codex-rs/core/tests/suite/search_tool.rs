@@ -304,51 +304,6 @@ async fn app_only_tools_are_not_visible_or_runnable_by_direct_model_calls() -> R
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn app_search_sources_are_hidden_for_api_key_auth() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = start_mock_server().await;
-    let apps_server = AppsTestServer::mount(&server).await?;
-    let mock = mount_sse_once(
-        &server,
-        sse(vec![
-            ev_response_created("resp-1"),
-            ev_assistant_message("msg-1", "done"),
-            ev_completed("resp-1"),
-        ]),
-    )
-    .await;
-
-    let mut builder = test_codex()
-        .with_auth(CodexAuth::from_api_key("Test API Key"))
-        .with_config(move |config| {
-            configure_search_capable_apps(config, apps_server.chatgpt_base_url.as_str())
-        });
-    let test = builder.build(&server).await?;
-
-    test.submit_turn_with_approval_and_permission_profile(
-        "list tools",
-        AskForApproval::Never,
-        PermissionProfile::Disabled,
-    )
-    .await?;
-
-    let body = mock.single_request().body_json();
-    let tools = tool_names(&body);
-    assert!(
-        !tools.iter().any(|name| name == SEARCH_CALENDAR_NAMESPACE),
-        "tools list should not include app tools for API key auth: {tools:?}"
-    );
-    let description = tool_search_description(&body).unwrap_or_default();
-    assert!(
-        !description.contains("Calendar"),
-        "tool_search description should not include app sources for API key auth: {description}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn search_tool_adds_discovery_instructions_to_tool_description() -> Result<()> {
     skip_if_no_network!(Ok(()));
 

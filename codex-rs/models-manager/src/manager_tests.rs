@@ -132,14 +132,14 @@ struct TestExternalApiKeyAuth;
 
 impl ExternalAuth for TestExternalApiKeyAuth {
     fn resolve(&self) -> codex_login::ExternalAuthFuture<'_, CodexAuth> {
-        Box::pin(async { Ok(CodexAuth::from_api_key("test-external-api-key")) })
+        Box::pin(async { Ok(CodexAuth::create_dummy_chatgpt_auth_for_testing()) })
     }
 
     fn refresh(
         &self,
         _context: ExternalAuthRefreshContext,
     ) -> codex_login::ExternalAuthFuture<'_, CodexAuth> {
-        Box::pin(async { Ok(CodexAuth::from_api_key("test-external-api-key")) })
+        Box::pin(async { Ok(CodexAuth::create_dummy_chatgpt_auth_for_testing()) })
     }
 }
 
@@ -241,8 +241,7 @@ async fn manager_without_cache_fetches_on_every_refresh() {
 
 async fn chatgpt_auth_tokens_for_tests(codex_home: &Path) -> CodexAuth {
     let auth_dot_json = codex_login::AuthDotJson {
-        auth_mode: Some(AuthMode::ChatgptAuthTokens),
-        openai_api_key: None,
+        auth_mode: Some(AuthMode::Chatgpt),
         tokens: Some(TokenData {
             id_token: codex_login::token_data::parse_chatgpt_jwt_claims(
                 "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.\
@@ -254,10 +253,9 @@ c2ln",
             refresh_token: "test".to_string(),
             account_id: Some("account_id".to_string()),
         }),
+        pool_account_id: None,
         last_refresh: Some(Utc::now()),
         agent_identity: None,
-        personal_access_token: None,
-        bedrock_api_key: None,
     };
     std::fs::create_dir_all(codex_home).expect("codex home should be created");
     std::fs::write(
@@ -679,9 +677,9 @@ async fn refresh_available_models_keeps_merging_for_api_auth() {
     let manager = openai_manager_for_tests_with_auth(
         codex_home.path().to_path_buf(),
         endpoint.clone(),
-        Some(AuthManager::from_auth_for_testing(CodexAuth::from_api_key(
-            "test-api-key",
-        ))),
+        Some(AuthManager::from_auth_for_testing(
+            CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+        )),
     );
     let mut expected = load_remote_models_from_file().expect("bundled models should parse");
     expected.extend(remote_models);

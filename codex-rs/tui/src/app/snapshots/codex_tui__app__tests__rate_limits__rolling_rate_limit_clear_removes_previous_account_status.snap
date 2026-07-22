@@ -1,0 +1,42 @@
+---
+source: tui/src/app/tests/rate_limits.rs
+expression: "format!(\"Before clear:\\n{before_clear}\\n\\nAfter clear:\\n{after_clear}\")"
+---
+Before clear:
+/status
+
+╭────────────────────────────────────────────────────────────────────╮
+│  >_ OpenAI Codex (v0.0.0)                                          │
+│                                                                    │
+│ Visit https://chatgpt.com/codex/settings/usage for up-to-date      │
+│ information on rate limits and credits                             │
+│                                                                    │
+│  Model:                gpt-5.6-sol (reasoning low, summaries auto) │
+│  Directory:            C:\tmp\project                              │
+│  Permissions:          Read Only (Ask for approval)                │
+│  Agents.md:            <none>                                      │
+│  Collaboration mode:   Default                                     │
+│                                                                    │
+│  Token usage:          0 total  (0 input + 0 output)               │
+│  5h limit:             [█░░░░░░░░░░░░░░░░░░░] 5% left              │
+│  Credits:              Available                                   │
+╰────────────────────────────────────────────────────────────────────╯
+
+After clear:
+/status
+
+╭────────────────────────────────────────────────────────────────────╮
+│  >_ OpenAI Codex (v0.0.0)                                          │
+│                                                                    │
+│ Visit https://chatgpt.com/codex/settings/usage for up-to-date      │
+│ information on rate limits and credits                             │
+│                                                                    │
+│  Model:                gpt-5.6-sol (reasoning low, summaries auto) │
+│  Directory:            C:\tmp\project                              │
+│  Permissions:          Read Only (Ask for approval)                │
+│  Agents.md:            <none>                                      │
+│  Collaboration mode:   Default                                     │
+│                                                                    │
+│  Token usage:          0 total  (0 input + 0 output)               │
+│  Limits:               data not available yet                      │
+╰────────────────────────────────────────────────────────────────────╯

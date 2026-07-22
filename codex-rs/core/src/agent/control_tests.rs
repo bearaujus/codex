@@ -140,7 +140,7 @@ impl AgentControlHarness {
     async fn new_with_config(home: TempDir, config: Config) -> Self {
         let state_db = init_state_db(&config).await;
         let manager = ThreadManager::with_models_provider_home_and_state_for_tests(
-            CodexAuth::from_api_key("dummy"),
+            CodexAuth::create_dummy_chatgpt_auth_for_testing(),
             config.model_provider.clone(),
             config.codex_home.to_path_buf(),
             std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
@@ -808,7 +808,7 @@ async fn resume_agent_from_rollout_does_not_reopen_v2_descendants() {
     assert_eq!(report.timed_out, Vec::<ThreadId>::new());
 
     let resumed_manager = ThreadManager::with_models_provider_home_and_state_for_tests(
-        CodexAuth::from_api_key("dummy"),
+        CodexAuth::create_dummy_chatgpt_auth_for_testing(),
         harness.config.model_provider.clone(),
         harness.config.codex_home.to_path_buf(),
         std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
@@ -1963,7 +1963,7 @@ async fn spawn_agent_respects_legacy_max_threads_alias() {
     )])
     .await;
     let manager = ThreadManager::with_models_provider_and_home_for_tests(
-        CodexAuth::from_api_key("dummy"),
+        CodexAuth::create_dummy_chatgpt_auth_for_testing(),
         config.model_provider.clone(),
         config.codex_home.to_path_buf(),
         std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
@@ -2015,7 +2015,7 @@ async fn spawn_agent_releases_slot_after_shutdown() {
     )])
     .await;
     let manager = ThreadManager::with_models_provider_and_home_for_tests(
-        CodexAuth::from_api_key("dummy"),
+        CodexAuth::create_dummy_chatgpt_auth_for_testing(),
         config.model_provider.clone(),
         config.codex_home.to_path_buf(),
         std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
@@ -2058,7 +2058,7 @@ async fn spawn_agent_limit_shared_across_clones() {
     )])
     .await;
     let manager = ThreadManager::with_models_provider_and_home_for_tests(
-        CodexAuth::from_api_key("dummy"),
+        CodexAuth::create_dummy_chatgpt_auth_for_testing(),
         config.model_provider.clone(),
         config.codex_home.to_path_buf(),
         std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
@@ -2103,7 +2103,7 @@ async fn resume_agent_respects_max_threads_limit() {
     )])
     .await;
     let manager = ThreadManager::with_models_provider_and_home_for_tests(
-        CodexAuth::from_api_key("dummy"),
+        CodexAuth::create_dummy_chatgpt_auth_for_testing(),
         config.model_provider.clone(),
         config.codex_home.to_path_buf(),
         std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
@@ -2159,7 +2159,7 @@ async fn resume_agent_releases_slot_after_resume_failure() {
     )])
     .await;
     let manager = ThreadManager::with_models_provider_and_home_for_tests(
-        CodexAuth::from_api_key("dummy"),
+        CodexAuth::create_dummy_chatgpt_auth_for_testing(),
         config.model_provider.clone(),
         config.codex_home.to_path_buf(),
         std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
@@ -2637,7 +2637,8 @@ async fn spawn_thread_subagent_uses_role_specific_nickname_candidates() {
 async fn resume_thread_subagent_restores_stored_metadata() {
     let (home, config) = test_config().await;
     let thread_store = Arc::new(InMemoryThreadStore::default());
-    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy"));
+    let auth_manager =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
     let manager = ThreadManager::new(
         &config,
         auth_manager.clone(),
@@ -3031,7 +3032,7 @@ async fn list_agent_subtree_thread_ids_includes_anonymous_and_closed_descendants
 async fn list_agent_subtree_thread_ids_finds_live_descendants_of_unloaded_root() {
     let (_home, config) = test_config().await;
     let manager = ThreadManager::with_models_provider_home_and_state_for_tests(
-        CodexAuth::from_api_key("dummy"),
+        CodexAuth::create_dummy_chatgpt_auth_for_testing(),
         config.model_provider.clone(),
         config.codex_home.to_path_buf(),
         std::sync::Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),

@@ -494,7 +494,6 @@ impl ServiceTier {
 #[strum(serialize_all = "lowercase")]
 pub enum ForcedLoginMethod {
     Chatgpt,
-    Api,
 }
 
 const DEFAULT_PROVIDER_AUTH_TIMEOUT_MS: u64 = 5_000;

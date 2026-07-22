@@ -1132,13 +1132,13 @@ async fn prepare_realtime_start(
         .transport
         .clone()
         .unwrap_or(ConversationStartTransport::Websocket);
-    let mut api_provider = provider.to_api_provider(Some(AuthMode::ApiKey))?;
+    let mut api_provider = provider.to_api_provider(Some(AuthMode::Chatgpt))?;
     if let Some(realtime_ws_base_url) = &config.experimental_realtime_ws_base_url {
         api_provider.base_url = realtime_ws_base_url.clone();
     }
     let realtime_call_api_provider =
         if let Some(realtime_call_base_url) = &config.experimental_realtime_webrtc_call_base_url {
-            let mut api_provider = provider.to_api_provider(Some(AuthMode::ApiKey))?;
+            let mut api_provider = provider.to_api_provider(Some(AuthMode::Chatgpt))?;
             api_provider.base_url = realtime_call_base_url.clone();
             Some(api_provider)
         } else {
@@ -1164,10 +1164,11 @@ async fn prepare_realtime_start(
     let originator = sess.originator().await;
     let extra_headers = match transport {
         ConversationStartTransport::Websocket => {
-            let realtime_api_key = realtime_api_key(auth.as_ref(), &provider)?;
+            let realtime_auth = realtime_api_auth(auth.as_ref(), &provider)?;
             realtime_request_headers(
                 requested_realtime_session_id.as_deref(),
-                Some(realtime_api_key.as_str()),
+                Some(realtime_auth.bearer.as_str()),
+                realtime_auth.chatgpt_account_id.as_deref(),
                 event_parser,
                 originator.as_str(),
             )?
@@ -1176,6 +1177,7 @@ async fn prepare_realtime_start(
             realtime_request_headers(
                 requested_realtime_session_id.as_deref(),
                 /*api_key*/ None,
+                /*chatgpt_account_id*/ None,
                 event_parser,
                 originator.as_str(),
             )?
@@ -1556,35 +1558,57 @@ fn wrap_realtime_delegation_input(
     RealtimeDelegation::new(input, transcript_delta, source).render()
 }
 
-fn realtime_api_key(auth: Option<&CodexAuth>, provider: &ModelProviderInfo) -> CodexResult<String> {
+struct RealtimeApiAuth {
+    bearer: String,
+    chatgpt_account_id: Option<String>,
+}
+
+fn realtime_api_auth(
+    auth: Option<&CodexAuth>,
+    provider: &ModelProviderInfo,
+) -> CodexResult<RealtimeApiAuth> {
     if let Some(api_key) = provider.api_key()? {
-        return Ok(api_key);
+        return Ok(RealtimeApiAuth {
+            bearer: api_key,
+            chatgpt_account_id: None,
+        });
     }
 
     if let Some(token) = provider.experimental_bearer_token.clone() {
-        return Ok(token);
+        return Ok(RealtimeApiAuth {
+            bearer: token,
+            chatgpt_account_id: None,
+        });
     }
 
-    if let Some(api_key) = auth.and_then(CodexAuth::api_key) {
-        return Ok(api_key.to_string());
+    if let Some(auth) = auth
+        && let Ok(token) = auth.get_token()
+    {
+        return Ok(RealtimeApiAuth {
+            bearer: token,
+            chatgpt_account_id: auth.get_account_id(),
+        });
     }
 
-    // TODO(aibrahim): Remove this temporary fallback once realtime auth no longer
-    // requires API key auth for ChatGPT/SIWC sessions.
+    // Optional env fallback for local/dev OpenAI providers without pool auth.
     if provider.is_openai()
         && let Some(api_key) = read_openai_api_key_from_env()
     {
-        return Ok(api_key);
+        return Ok(RealtimeApiAuth {
+            bearer: api_key,
+            chatgpt_account_id: None,
+        });
     }
 
     Err(CodexErr::InvalidRequest(
-        "realtime conversation requires API key auth".to_string(),
+        "realtime conversation requires ChatGPT or provider API authentication".to_string(),
     ))
 }
 
 fn realtime_request_headers(
     realtime_session_id: Option<&str>,
     api_key: Option<&str>,
+    chatgpt_account_id: Option<&str>,
     event_parser: RealtimeEventParser,
     originator: &str,
 ) -> CodexResult<Option<HeaderMap>> {
@@ -1611,6 +1635,12 @@ fn realtime_request_headers(
             CodexErr::InvalidRequest(format!("invalid realtime api key header: {err}"))
         })?;
         headers.insert(AUTHORIZATION, auth_value);
+    }
+    if let Some(account_id) = chatgpt_account_id {
+        let account_id = HeaderValue::from_str(account_id).map_err(|err| {
+            CodexErr::InvalidRequest(format!("invalid ChatGPT account id header: {err}"))
+        })?;
+        headers.insert("ChatGPT-Account-ID", account_id);
     }
 
     add_originator_header(&mut headers, originator);

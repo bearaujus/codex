@@ -3,12 +3,12 @@ use app_test_support::ChatGptAuthFixture;
 use app_test_support::TestAppServer;
 use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
+use app_test_support::write_chatgpt_auth_to_pool;
 use codex_app_server_protocol::AddCreditsNudgeCreditType;
 use codex_app_server_protocol::AddCreditsNudgeEmailStatus;
 use codex_app_server_protocol::GetAccountRateLimitsResponse;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCResponse;
-use codex_app_server_protocol::LoginAccountResponse;
 use codex_app_server_protocol::RateLimitReachedType;
 use codex_app_server_protocol::RateLimitResetCredit;
 use codex_app_server_protocol::RateLimitResetCreditStatus;
@@ -21,7 +21,14 @@ use codex_app_server_protocol::SendAddCreditsNudgeEmailParams;
 use codex_app_server_protocol::SendAddCreditsNudgeEmailResponse;
 use codex_app_server_protocol::SpendControlLimitSnapshot;
 use codex_config::types::AuthCredentialsStoreMode;
+use codex_login::AuthKeyringBackendKind;
+use codex_login::AuthManager;
+use codex_login::token_data::derive_pool_account_id;
 use codex_protocol::account::PlanType as AccountPlanType;
+use codex_protocol::protocol::RateLimitReachedType as CoreRateLimitReachedType;
+use codex_protocol::protocol::RateLimitSnapshot as CoreRateLimitSnapshot;
+use codex_protocol::protocol::RateLimitWindow as CoreRateLimitWindow;
+use codex_protocol::protocol::SpendControlLimitSnapshot as CoreSpendControlLimitSnapshot;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::path::Path;
@@ -69,46 +76,16 @@ async fn get_account_rate_limits_requires_auth() -> Result<()> {
 }
 
 #[tokio::test]
-async fn get_account_rate_limits_requires_chatgpt_auth() -> Result<()> {
-    let codex_home = TempDir::new()?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    login_with_api_key(&mut mcp, "sk-test-key").await?;
-
-    let request_id = mcp.send_get_account_rate_limits_request().await?;
-
-    let error: JSONRPCError = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-
-    assert_eq!(error.id, RequestId::Integer(request_id));
-    assert_eq!(error.error.code, INVALID_REQUEST_ERROR_CODE);
-    assert_eq!(
-        error.error.message,
-        "chatgpt authentication required to read rate limits"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn get_account_rate_limits_returns_snapshot() -> Result<()> {
     let codex_home = TempDir::new()?;
-    write_chatgpt_auth(
+    write_chatgpt_auth_to_pool(
         codex_home.path(),
         ChatGptAuthFixture::new("chatgpt-token")
             .account_id("account-123")
             .plan_type("pro"),
         AuthCredentialsStoreMode::File,
-    )?;
+    )
+    .await?;
 
     let server = MockServer::start().await;
     let server_url = server.uri();
@@ -130,6 +107,49 @@ async fn get_account_rate_limits_returns_snapshot() -> Result<()> {
         chrono::DateTime::parse_from_rfc3339("2026-06-18T00:00:00Z")
             .expect("parse second reset credit grant timestamp")
             .timestamp();
+    let cached_snapshots = vec![
+        CoreRateLimitSnapshot {
+            limit_id: Some("codex".to_string()),
+            limit_name: None,
+            primary: Some(CoreRateLimitWindow {
+                used_percent: 42.0,
+                window_minutes: Some(60),
+                resets_at: Some(primary_reset_timestamp),
+            }),
+            secondary: Some(CoreRateLimitWindow {
+                used_percent: 5.0,
+                window_minutes: Some(1440),
+                resets_at: Some(secondary_reset_timestamp),
+            }),
+            credits: None,
+            individual_limit: Some(CoreSpendControlLimitSnapshot {
+                limit: "25000".to_string(),
+                used: "8000".to_string(),
+                remaining_percent: 68,
+                resets_at: secondary_reset_timestamp,
+            }),
+            spend_control_reached: Some(false),
+            plan_type: Some(AccountPlanType::Pro),
+            rate_limit_reached_type: Some(
+                CoreRateLimitReachedType::WorkspaceMemberUsageLimitReached,
+            ),
+        },
+        CoreRateLimitSnapshot {
+            limit_id: Some("codex_other".to_string()),
+            limit_name: Some("codex_other".to_string()),
+            primary: Some(CoreRateLimitWindow {
+                used_percent: 88.0,
+                window_minutes: Some(30),
+                resets_at: Some(1735693200),
+            }),
+            secondary: None,
+            credits: None,
+            individual_limit: None,
+            spend_control_reached: None,
+            plan_type: Some(AccountPlanType::Pro),
+            rate_limit_reached_type: None,
+        },
+    ];
     let response_body = json!({
         "plan_type": "pro",
         "rate_limit": {
@@ -188,7 +208,8 @@ async fn get_account_rate_limits_returns_snapshot() -> Result<()> {
         .and(header("authorization", "Bearer chatgpt-token"))
         .and(header("chatgpt-account-id", "account-123"))
         .respond_with(ResponseTemplate::new(200).set_body_json(response_body))
-        .expect(1)
+        // Pool-managed startup may probe /usage before account/rateLimits/read.
+        .expect(1..)
         .mount(&server)
         .await;
     Mock::given(method("GET"))
@@ -221,6 +242,23 @@ async fn get_account_rate_limits_returns_snapshot() -> Result<()> {
         .mount(&server)
         .await;
 
+    let seed_manager = AuthManager::new(
+        codex_home.path().to_path_buf(),
+        AuthCredentialsStoreMode::File,
+        /*forced_chatgpt_workspace_id*/ None,
+        Some(server_url),
+        AuthKeyringBackendKind::default(),
+        /*auth_route_config*/ None,
+    )
+    .await;
+    seed_manager
+        .record_account_pool_rate_limits_fetch_for(
+            &derive_pool_account_id("account-123", /*member_identity_key*/ None),
+            &cached_snapshots,
+        )
+        .await;
+    drop(seed_manager);
+
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
@@ -228,6 +266,13 @@ async fn get_account_rate_limits_returns_snapshot() -> Result<()> {
         .build()
         .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+    let usage_requests_before_read = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|request| request.url.path() == "/api/codex/usage")
+        .count();
 
     let request_id = mcp.send_get_account_rate_limits_request().await?;
 
@@ -236,6 +281,14 @@ async fn get_account_rate_limits_returns_snapshot() -> Result<()> {
         mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
     )
     .await??;
+    let usage_requests_after_read = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|request| request.url.path() == "/api/codex/usage")
+        .count();
+    assert_eq!(usage_requests_after_read, usage_requests_before_read);
 
     let received: GetAccountRateLimitsResponse = to_response(response)?;
 
@@ -347,15 +400,16 @@ async fn get_account_rate_limits_returns_snapshot() -> Result<()> {
 }
 
 #[tokio::test]
-async fn get_account_rate_limits_preserves_count_when_reset_credit_details_fail() -> Result<()> {
+async fn get_account_rate_limits_requires_cached_snapshot() -> Result<()> {
     let codex_home = TempDir::new()?;
-    write_chatgpt_auth(
+    write_chatgpt_auth_to_pool(
         codex_home.path(),
         ChatGptAuthFixture::new("chatgpt-token")
             .account_id("account-123")
             .plan_type("pro"),
         AuthCredentialsStoreMode::File,
-    )?;
+    )
+    .await?;
 
     let server = MockServer::start().await;
     write_chatgpt_base_url(codex_home.path(), &server.uri())?;
@@ -373,16 +427,9 @@ async fn get_account_rate_limits_preserves_count_when_reset_credit_details_fail(
                     "reset_after_seconds": 120,
                     "reset_at": 1735689720
                 }
-            },
-            "rate_limit_reset_credits": { "available_count": 3 }
+            }
         })))
-        .expect(1)
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/api/codex/rate-limit-reset-credits"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
-        .expect(1)
+        .expect(1..)
         .mount(&server)
         .await;
 
@@ -395,20 +442,25 @@ async fn get_account_rate_limits_preserves_count_when_reset_credit_details_fail(
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp.send_get_account_rate_limits_request().await?;
-    let response: JSONRPCResponse = timeout(
+    let error: JSONRPCError = timeout(
         DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
     )
     .await??;
-    let received: GetAccountRateLimitsResponse = to_response(response)?;
-
+    assert_eq!(error.id, RequestId::Integer(request_id));
+    assert_eq!(error.error.code, INTERNAL_ERROR_CODE);
     assert_eq!(
-        received.rate_limit_reset_credits,
-        Some(RateLimitResetCreditsSummary {
-            available_count: 3,
-            credits: None,
-        })
+        error.error.message,
+        "cached codex rate limits unavailable: no snapshots returned"
     );
+    let reset_credit_requests = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|request| request.url.path() == "/api/codex/rate-limit-reset-credits")
+        .count();
+    assert_eq!(reset_credit_requests, 0);
 
     Ok(())
 }
@@ -442,41 +494,6 @@ async fn send_add_credits_nudge_email_requires_auth() -> Result<()> {
     assert_eq!(
         error.error.message,
         "codex account authentication required to notify workspace owner"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn send_add_credits_nudge_email_requires_chatgpt_auth() -> Result<()> {
-    let codex_home = TempDir::new()?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .build()
-        .await?;
-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-
-    login_with_api_key(&mut mcp, "sk-test-key").await?;
-
-    let request_id = mcp
-        .send_add_credits_nudge_email_request(SendAddCreditsNudgeEmailParams {
-            credit_type: AddCreditsNudgeCreditType::UsageLimit,
-        })
-        .await?;
-
-    let error: JSONRPCError = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-
-    assert_eq!(error.id, RequestId::Integer(request_id));
-    assert_eq!(error.error.code, INVALID_REQUEST_ERROR_CODE);
-    assert_eq!(
-        error.error.message,
-        "chatgpt authentication required to notify workspace owner"
     );
 
     Ok(())
@@ -636,19 +653,6 @@ async fn send_add_credits_nudge_email_surfaces_backend_failure() -> Result<()> {
         error.error.message
     );
     assert_eq!(error.error.data, None);
-
-    Ok(())
-}
-
-async fn login_with_api_key(mcp: &mut TestAppServer, api_key: &str) -> Result<()> {
-    let request_id = mcp.send_login_account_api_key_request(api_key).await?;
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let login: LoginAccountResponse = to_response(response)?;
-    assert_eq!(login, LoginAccountResponse::ApiKey {});
 
     Ok(())
 }

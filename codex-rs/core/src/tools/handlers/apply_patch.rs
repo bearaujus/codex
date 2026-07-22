@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::fmt::Display;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -40,6 +42,7 @@ use codex_apply_patch::ApplyPatchFileChange;
 use codex_apply_patch::Hunk;
 use codex_apply_patch::StreamingPatchParser;
 use codex_exec_server::ExecutorFileSystem;
+use codex_exec_server::FileSystemSandboxContext;
 use codex_features::Feature;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::FileSystemPermissions;
@@ -52,9 +55,24 @@ use codex_sandboxing::policy_transforms::normalize_additional_permissions;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_output_truncation::TruncationPolicy;
+use codex_utils_output_truncation::truncate_text;
 use codex_utils_path_uri::PathUri;
+use codex_utils_string::take_bytes_at_char_boundary;
 
 const APPLY_PATCH_ARGUMENT_DIFF_BUFFER_INTERVAL: Duration = Duration::from_millis(500);
+const APPLY_PATCH_DIAGNOSTIC_MAX_TOKENS: usize = 800;
+const AMBIGUOUS_PATH_DIAGNOSTIC_MAX_PATHS: usize = 8;
+const AMBIGUOUS_PATH_DIAGNOSTIC_MAX_BYTES_PER_PATH: usize = 256;
+
+fn apply_patch_verification_error(message: impl Display) -> FunctionCallError {
+    let message = format!("apply_patch verification failed: {message}");
+    FunctionCallError::RespondToModel(truncate_text(
+        &message,
+        TruncationPolicy::Tokens(APPLY_PATCH_DIAGNOSTIC_MAX_TOKENS),
+    ))
+}
+
 /// Handles freeform `apply_patch` requests and routes verified patches to the
 /// selected environment filesystem.
 #[derive(Default)]
@@ -107,6 +125,9 @@ impl ApplyPatchArgumentDiffConsumer {
             return None;
         }
         let changes = convert_apply_patch_hunks_to_protocol(&hunks);
+        if changes.is_empty() {
+            return None;
+        }
         let event = PatchApplyUpdatedEvent { call_id, changes };
         let now = Instant::now();
         match self.last_sent_at {
@@ -142,7 +163,7 @@ impl ApplyPatchArgumentDiffConsumer {
 fn convert_apply_patch_hunks_to_protocol(hunks: &[Hunk]) -> HashMap<PathBuf, FileChange> {
     hunks
         .iter()
-        .map(|hunk| {
+        .filter_map(|hunk| {
             let path = hunk_source_path(hunk).to_path_buf();
             let change = match hunk {
                 Hunk::AddFile { contents, .. } => FileChange::Add {
@@ -151,6 +172,10 @@ fn convert_apply_patch_hunks_to_protocol(hunks: &[Hunk]) -> HashMap<PathBuf, Fil
                 Hunk::DeleteFile { .. } => FileChange::Delete {
                     content: String::new(),
                 },
+                // Replace-file previews need live filesystem contents to render a
+                // truthful diff. Skip the optimistic streaming preview and let the
+                // verified tool event publish the real diff once available.
+                Hunk::ReplaceFile { .. } => return None,
                 Hunk::UpdateFile {
                     chunks, move_path, ..
                 } => FileChange::Update {
@@ -158,16 +183,17 @@ fn convert_apply_patch_hunks_to_protocol(hunks: &[Hunk]) -> HashMap<PathBuf, Fil
                     move_path: move_path.clone(),
                 },
             };
-            (path, change)
+            Some((path, change))
         })
         .collect()
 }
 
 fn hunk_source_path(hunk: &Hunk) -> &Path {
     match hunk {
-        Hunk::AddFile { path, .. } | Hunk::DeleteFile { path } | Hunk::UpdateFile { path, .. } => {
-            path
-        }
+        Hunk::AddFile { path, .. }
+        | Hunk::DeleteFile { path }
+        | Hunk::ReplaceFile { path, .. }
+        | Hunk::UpdateFile { path, .. } => path,
     }
 }
 
@@ -201,6 +227,141 @@ fn format_update_chunks_for_progress(chunks: &[codex_apply_patch::UpdateFileChun
         }
     }
     unified_diff
+}
+
+async fn ensure_exact_match_updates_use_fresh_context(
+    tracker: &SharedTurnDiffTracker,
+    hunks: &[Hunk],
+    cwd: &PathUri,
+    fs: &dyn ExecutorFileSystem,
+    sandbox: Option<&FileSystemSandboxContext>,
+) -> Result<(), FunctionCallError> {
+    // Identify update hunks whose target path was already edited via an
+    // exact-match update earlier this same turn. Only those risk being anchored
+    // to a stale, pre-edit view of the file.
+    let candidates: Vec<(PathUri, AbsolutePathBuf, &Hunk)> = {
+        let tracker = tracker.lock().await;
+        hunks
+            .iter()
+            .filter_map(|hunk| match hunk {
+                Hunk::UpdateFile { .. } => {
+                    let path_uri = hunk.resolve_path(cwd).ok()?;
+                    let absolute_path = path_uri.to_abs_path().ok()?;
+                    tracker
+                        .requires_refresh_for_exact_match_update(absolute_path.as_path())
+                        .then_some((path_uri, absolute_path, hunk))
+                }
+                Hunk::AddFile { .. } | Hunk::DeleteFile { .. } | Hunk::ReplaceFile { .. } => None,
+            })
+            .collect()
+    };
+
+    if candidates.is_empty() {
+        return Ok(());
+    }
+
+    // A second exact-match update is only hazardous when its anchor is ambiguous
+    // in the live file: `seek_sequence` takes the first match, so duplicated
+    // anchor lines can land the edit on the wrong (already shifted) occurrence.
+    // A unique anchor identifies exactly one location and is safe to apply
+    // without a re-read, even though codex cannot observe the model's reads.
+    let mut repeated_paths = HashSet::new();
+    for (path_uri, absolute_path, hunk) in candidates {
+        if update_hunk_anchor_is_ambiguous(hunk, &path_uri, fs, sandbox).await {
+            repeated_paths.insert(absolute_path.into_path_buf());
+        }
+    }
+
+    if repeated_paths.is_empty() {
+        return Ok(());
+    }
+
+    let mut repeated_paths = repeated_paths.into_iter().collect::<Vec<_>>();
+    repeated_paths.sort();
+    let omitted_path_count = repeated_paths
+        .len()
+        .saturating_sub(AMBIGUOUS_PATH_DIAGNOSTIC_MAX_PATHS);
+    let mut repeated_paths = repeated_paths
+        .into_iter()
+        .take(AMBIGUOUS_PATH_DIAGNOSTIC_MAX_PATHS)
+        .map(|path| {
+            let path = path.display().to_string();
+            let path_prefix =
+                take_bytes_at_char_boundary(&path, AMBIGUOUS_PATH_DIAGNOSTIC_MAX_BYTES_PER_PATH);
+            let truncated = if path_prefix.len() < path.len() {
+                "… [path truncated]"
+            } else {
+                ""
+            };
+            format!("- {path_prefix}{truncated}")
+        })
+        .collect::<Vec<_>>();
+    if omitted_path_count > 0 {
+        repeated_paths.push(format!(
+            "- … [{omitted_path_count} additional ambiguous paths omitted]"
+        ));
+    }
+    let repeated_paths = repeated_paths.join("\n");
+
+    Err(apply_patch_verification_error(format!(
+        "this exact-match update is ambiguous after an earlier edit to the same file in this turn (its context matches more than one location):\n{repeated_paths}\nRe-read the live file and include enough surrounding context to uniquely anchor the change, or use '*** Replace File:' for a whole-file rewrite."
+    )))
+}
+
+/// Returns true when any chunk of an `*** Update File:` hunk anchors to a block
+/// of source lines that occurs more than once in the live file. Such anchors are
+/// ambiguous: the applier resolves them to the first occurrence, which may not be
+/// the one the model intended once an earlier edit in the turn shifted the file.
+async fn update_hunk_anchor_is_ambiguous(
+    hunk: &Hunk,
+    path: &PathUri,
+    fs: &dyn ExecutorFileSystem,
+    sandbox: Option<&FileSystemSandboxContext>,
+) -> bool {
+    let Hunk::UpdateFile { chunks, .. } = hunk else {
+        return false;
+    };
+
+    // Only chunks with concrete source lines (`old_lines`) carry a positional
+    // anchor that can match in more than one place. Pure insertions anchored at
+    // BOF/EOF or a lone change-context line are left to verification.
+    let anchors: Vec<&[String]> = chunks
+        .iter()
+        .map(|chunk| chunk.old_lines.as_slice())
+        .filter(|old_lines| !old_lines.is_empty())
+        .collect();
+    if anchors.is_empty() {
+        return false;
+    }
+
+    let text = match fs.read_file_text(path, sandbox).await {
+        Ok(text) => text,
+        // If the live file cannot be re-read (or decoded) to disambiguate, fail
+        // closed and require a refresh rather than risk a misplaced edit.
+        Err(_) => return true,
+    };
+    let lines: Vec<&str> = text.lines().collect();
+
+    anchors
+        .into_iter()
+        .any(|anchor| count_exact_block_occurrences(&lines, anchor) > 1)
+}
+
+/// Counts how many times `anchor` appears as a contiguous block of lines in
+/// `lines`, comparing line contents exactly.
+fn count_exact_block_occurrences(lines: &[&str], anchor: &[String]) -> usize {
+    if anchor.is_empty() || anchor.len() > lines.len() {
+        return 0;
+    }
+    lines
+        .windows(anchor.len())
+        .filter(|window| {
+            window
+                .iter()
+                .zip(anchor)
+                .all(|(line, anchor_line)| *line == anchor_line.as_str())
+        })
+        .count()
 }
 
 fn file_paths_for_action(action: &ApplyPatchAction) -> Vec<PathUri> {
@@ -364,11 +525,10 @@ impl ApplyPatchHandler {
         let args = match codex_apply_patch::parse_patch(&patch_input) {
             Ok(args) => args,
             Err(parse_error) => {
-                return Err(FunctionCallError::RespondToModel(format!(
-                    "apply_patch verification failed: {parse_error}"
-                )));
+                return Err(apply_patch_verification_error(parse_error));
             }
         };
+        let parsed_hunks = args.hunks.clone();
         let selected_environment_id =
             require_environment_id(args.environment_id.as_deref(), self.multi_environment)?;
 
@@ -394,6 +554,14 @@ impl ApplyPatchHandler {
         .await
         {
             codex_apply_patch::MaybeApplyPatchVerified::Body(changes) => {
+                ensure_exact_match_updates_use_fresh_context(
+                    &tracker,
+                    &parsed_hunks,
+                    turn_environment.cwd(),
+                    fs.as_ref(),
+                    Some(&sandbox),
+                )
+                .await?;
                 let (file_paths, effective_additional_permissions, file_system_sandbox_policy) =
                     effective_patch_permissions(
                         session.as_ref(),
@@ -472,9 +640,7 @@ impl ApplyPatchHandler {
                 }
             }
             codex_apply_patch::MaybeApplyPatchVerified::CorrectnessError(parse_error) => {
-                Err(FunctionCallError::RespondToModel(format!(
-                    "apply_patch verification failed: {parse_error}"
-                )))
+                Err(apply_patch_verification_error(parse_error))
             }
             codex_apply_patch::MaybeApplyPatchVerified::ShellParseError(error) => {
                 tracing::trace!("Failed to parse apply_patch input, {error:?}");
@@ -558,6 +724,19 @@ pub(crate) async fn intercept_apply_patch(
         .await
     {
         codex_apply_patch::MaybeApplyPatchVerified::Body(changes) => {
+            if let Some(tracker) = tracker {
+                let parsed_hunks = codex_apply_patch::parse_patch(&changes.patch)
+                    .map_err(apply_patch_verification_error)?
+                    .hunks;
+                ensure_exact_match_updates_use_fresh_context(
+                    tracker,
+                    &parsed_hunks,
+                    cwd,
+                    fs,
+                    Some(&sandbox),
+                )
+                .await?;
+            }
             let (approval_keys, effective_additional_permissions, file_system_sandbox_policy) =
                 effective_patch_permissions(
                     session.as_ref(),
@@ -636,9 +815,7 @@ pub(crate) async fn intercept_apply_patch(
             }
         }
         codex_apply_patch::MaybeApplyPatchVerified::CorrectnessError(parse_error) => {
-            Err(FunctionCallError::RespondToModel(format!(
-                "apply_patch verification failed: {parse_error}"
-            )))
+            Err(apply_patch_verification_error(parse_error))
         }
         codex_apply_patch::MaybeApplyPatchVerified::ShellParseError(error) => {
             tracing::trace!("Failed to parse apply_patch input, {error:?}");

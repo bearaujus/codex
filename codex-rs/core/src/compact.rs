@@ -17,7 +17,7 @@ use crate::session::PreviousTurnSettings;
 use crate::session::session::Session;
 use crate::session::turn::get_last_assistant_message_from_turn;
 use crate::session::turn_context::TurnContext;
-use crate::util::backoff;
+use crate::util::stream_reconnect_delay;
 use codex_analytics::CodexCompactionEvent;
 use codex_analytics::CompactionImplementation;
 use codex_analytics::CompactionPhase;
@@ -301,14 +301,16 @@ async fn run_compact_task_inner_impl(
             Err(e) => {
                 if retries < max_retries {
                     retries += 1;
-                    let delay = backoff(retries);
+                    let delay = stream_reconnect_delay(retries);
                     sess.notify_stream_error(
                         turn_context.as_ref(),
                         format!("Reconnecting... {retries}/{max_retries}"),
                         e,
                     )
                     .await;
-                    tokio::time::sleep(delay).await;
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
                     continue;
                 } else {
                     sess.track_turn_codex_error(turn_context.as_ref(), &e);

@@ -16,6 +16,7 @@ use codex_exec_server::FileSystemSandboxContext;
 use codex_exec_server::RemoveOptions;
 use codex_utils_path_uri::PathUri;
 use codex_utils_path_uri::PathUriParseError;
+use codex_utils_string::take_bytes_at_char_boundary;
 pub use parser::Hunk;
 pub use parser::ParseError;
 use parser::ParseError::*;
@@ -346,6 +347,10 @@ pub async fn apply_hunks(
     }
 }
 
+const STALE_PATCH_REFRESH_HINT: &str = "This usually means the file changed since the patch was drafted or was edited earlier in the turn. Re-read the live file and retry with current context.";
+const STALE_PATCH_LIVE_CONTEXT_MAX_LINES: usize = 8;
+const STALE_PATCH_LIVE_CONTEXT_MAX_LINE_BYTES: usize = 256;
+
 /// Applies each parsed patch hunk to the filesystem.
 /// Returns an error if any of the changes could not be applied.
 /// Tracks file paths affected by applying a patch, preserving the path spelling
@@ -369,23 +374,92 @@ async fn apply_hunks_to_files(
         anyhow::bail!("No files were modified.");
     }
 
-    let mut added: Vec<PathBuf> = Vec::new();
-    let mut modified: Vec<PathBuf> = Vec::new();
-    let mut deleted: Vec<PathBuf> = Vec::new();
-    // A failed write can still have modified the target before surfacing an
-    // error (for example by truncating before ENOSPC), so the accumulated
-    // delta is no longer exact when a write fails.
-    macro_rules! try_write {
-        ($result:expr) => {
-            match $result {
-                Ok(value) => value,
-                Err(error) => {
-                    delta.exact = false;
-                    return Err(anyhow::Error::from(error));
-                }
+    let plan = stage_hunks_to_files(hunks, cwd, fs, sandbox).await?;
+    delta.exact = plan.exact;
+    commit_staged_patch_plan(plan, fs, sandbox, delta).await
+}
+
+#[derive(Clone, Copy, Debug)]
+enum AffectedKind {
+    Add,
+    Modify,
+    Delete,
+}
+
+#[derive(Clone, Debug)]
+enum PriorFileState {
+    Missing,
+    Existing {
+        bytes: Vec<u8>,
+        text: Option<String>,
+    },
+    UnreadableExisting,
+}
+
+impl PriorFileState {
+    fn from_text(contents: String) -> Self {
+        let bytes = contents.clone().into_bytes();
+        Self::Existing {
+            bytes,
+            text: Some(contents),
+        }
+    }
+
+    fn from_bytes(bytes: Vec<u8>, exact: &mut bool) -> Self {
+        let text = match String::from_utf8(bytes.clone()) {
+            Ok(contents) => Some(contents),
+            Err(_) => {
+                *exact = false;
+                None
             }
         };
+        Self::Existing { bytes, text }
     }
+
+    fn cloned_known_text(&self) -> Option<String> {
+        match self {
+            Self::Missing | Self::UnreadableExisting => None,
+            Self::Existing { text, .. } => text.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum CommitOp {
+    Write {
+        path: PathUri,
+        new_contents: String,
+        old_state: PriorFileState,
+    },
+    Delete {
+        path: PathUri,
+        old_state: PriorFileState,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct PlannedChangeGroup {
+    commit_ops: Vec<CommitOp>,
+    affected_kind: AffectedKind,
+    affected_path: PathBuf,
+    delta_change: Option<AppliedPatchChange>,
+}
+
+#[derive(Debug)]
+struct StagedPatchPlan {
+    groups: Vec<PlannedChangeGroup>,
+    exact: bool,
+}
+
+async fn stage_hunks_to_files(
+    hunks: &[Hunk],
+    cwd: &PathUri,
+    fs: &dyn ExecutorFileSystem,
+    sandbox: Option<&FileSystemSandboxContext>,
+) -> anyhow::Result<StagedPatchPlan> {
+    let mut groups = Vec::new();
+    let mut exact = true;
+    let mut staged_contents = HashMap::<PathBuf, Option<String>>::new();
 
     // TODO(anp): Carry PathUri through committed patch deltas and the turn diff tracker.
     for hunk in hunks {
@@ -393,105 +467,120 @@ async fn apply_hunks_to_files(
         let path_uri = hunk.resolve_path(cwd)?;
         match hunk {
             Hunk::AddFile { contents, .. } => {
-                let overwritten_content =
-                    read_optional_file_text_for_delta(&path_uri, fs, sandbox, &mut delta.exact)
-                        .await;
-                try_write!(
-                    write_file_with_missing_parent_retry(
-                        fs,
-                        &path_uri,
-                        contents.clone().into_bytes(),
-                        sandbox,
-                    )
-                    .await
-                );
-                delta.changes.push(AppliedPatchChange {
-                    path: path_uri.to_path_buf(),
-                    change: AppliedPatchFileChange::Add {
-                        content: contents.clone(),
-                        overwritten_content,
-                    },
+                let overwritten_state = read_optional_file_state_for_plan(
+                    &path_uri,
+                    &staged_contents,
+                    fs,
+                    sandbox,
+                    &mut exact,
+                )
+                .await;
+                let overwritten_content = overwritten_state.cloned_known_text();
+                staged_contents.insert(path_uri.to_path_buf(), Some(contents.clone()));
+                groups.push(PlannedChangeGroup {
+                    commit_ops: vec![CommitOp::Write {
+                        path: path_uri.clone(),
+                        new_contents: contents.clone(),
+                        old_state: overwritten_state,
+                    }],
+                    affected_kind: AffectedKind::Add,
+                    affected_path,
+                    delta_change: Some(AppliedPatchChange {
+                        path: path_uri.to_path_buf(),
+                        change: AppliedPatchFileChange::Add {
+                            content: contents.clone(),
+                            overwritten_content,
+                        },
+                    }),
                 });
-                added.push(affected_path);
             }
             Hunk::DeleteFile { .. } => {
-                note_existing_path_delta_support(&path_uri, fs, sandbox, &mut delta.exact).await;
-                let deleted_content = fs.read_file_text(&path_uri, sandbox).await.ok();
-                if deleted_content.is_none() {
-                    delta.exact = false;
-                }
-                ensure_not_directory(&path_uri, fs, sandbox)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "Failed to delete file {}",
-                            path_uri.inferred_native_path_string()
-                        )
-                    })?;
-                if let Err(error) = fs
-                    .remove(
-                        &path_uri,
-                        RemoveOptions {
-                            recursive: false,
-                            force: false,
-                        },
-                        sandbox,
-                    )
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "Failed to delete file {}",
-                            path_uri.inferred_native_path_string()
-                        )
-                    })
-                {
-                    delta.exact &= remove_failure_was_side_effect_free(
-                        &path_uri,
-                        deleted_content.as_deref(),
-                        fs,
-                        sandbox,
-                    )
-                    .await;
-                    return Err(error);
-                }
-                if let Some(content) = deleted_content {
-                    delta.changes.push(AppliedPatchChange {
+                let deleted_state = read_deleted_file_state_for_plan(
+                    &path_uri,
+                    &staged_contents,
+                    fs,
+                    sandbox,
+                    &mut exact,
+                )
+                .await?;
+                let deleted_content = deleted_state.cloned_known_text();
+                staged_contents.insert(path_uri.to_path_buf(), None);
+                groups.push(PlannedChangeGroup {
+                    commit_ops: vec![CommitOp::Delete {
+                        path: path_uri.clone(),
+                        old_state: deleted_state,
+                    }],
+                    affected_kind: AffectedKind::Delete,
+                    affected_path,
+                    delta_change: deleted_content.map(|content| AppliedPatchChange {
                         path: path_uri.to_path_buf(),
                         change: AppliedPatchFileChange::Delete { content },
-                    });
-                }
-                deleted.push(affected_path);
+                    }),
+                });
+            }
+            Hunk::ReplaceFile { contents, .. } => {
+                let original_contents = read_required_file_text_for_plan(
+                    &path_uri,
+                    &staged_contents,
+                    fs,
+                    sandbox,
+                    &mut exact,
+                    "Failed to read file to replace",
+                )
+                .await?;
+                let new_contents =
+                    normalize_full_file_replacement_contents(contents, &original_contents);
+                staged_contents.insert(path_uri.to_path_buf(), Some(new_contents.clone()));
+                groups.push(PlannedChangeGroup {
+                    commit_ops: vec![CommitOp::Write {
+                        path: path_uri.clone(),
+                        new_contents: new_contents.clone(),
+                        old_state: PriorFileState::from_text(original_contents.clone()),
+                    }],
+                    affected_kind: AffectedKind::Modify,
+                    affected_path,
+                    delta_change: Some(AppliedPatchChange {
+                        path: path_uri.to_path_buf(),
+                        change: AppliedPatchFileChange::Update {
+                            move_path: None,
+                            old_content: original_contents,
+                            overwritten_move_content: None,
+                            new_content: new_contents,
+                        },
+                    }),
+                });
             }
             Hunk::UpdateFile {
                 move_path, chunks, ..
             } => {
-                note_existing_path_delta_support(&path_uri, fs, sandbox, &mut delta.exact).await;
-                let AppliedPatch {
-                    original_contents,
-                    new_contents,
-                } = derive_new_contents_from_chunks(&path_uri, chunks, fs, sandbox).await?;
-                if let Some(dest) = move_path {
-                    let dest_uri = cwd.join(&dest.to_string_lossy())?;
-                    let overwritten_move_content =
-                        read_optional_file_text_for_delta(&dest_uri, fs, sandbox, &mut delta.exact)
-                            .await;
-                    try_write!(
-                        write_file_with_missing_parent_retry(
-                            fs,
-                            &dest_uri,
-                            new_contents.clone().into_bytes(),
-                            sandbox,
-                        )
-                        .await
-                    );
-                    let dest_write_change_index = delta.changes.len();
-                    delta.changes.push(AppliedPatchChange {
-                        path: dest_uri.to_path_buf(),
-                        change: AppliedPatchFileChange::Add {
-                            content: new_contents.clone(),
-                            overwritten_content: overwritten_move_content.clone(),
-                        },
-                    });
+                let original_contents = read_required_file_text_for_plan(
+                    &path_uri,
+                    &staged_contents,
+                    fs,
+                    sandbox,
+                    &mut exact,
+                    "Failed to read file to update",
+                )
+                .await?;
+                let new_contents = derive_new_contents_from_original_contents(
+                    &original_contents,
+                    &path_uri.inferred_native_path_string(),
+                    chunks,
+                )?;
+                let dest_uri = match move_path {
+                    Some(dest) => Some(cwd.join(&dest.to_string_lossy())?),
+                    None => None,
+                };
+                if let Some(dest_uri) = dest_uri.filter(|dest_uri| dest_uri != &path_uri) {
+                    let overwritten_move_state = read_optional_file_state_for_plan(
+                        &dest_uri,
+                        &staged_contents,
+                        fs,
+                        sandbox,
+                        &mut exact,
+                    )
+                    .await;
+                    let overwritten_move_content = overwritten_move_state.cloned_known_text();
                     ensure_not_directory(&path_uri, fs, sandbox)
                         .await
                         .with_context(|| {
@@ -500,70 +589,191 @@ async fn apply_hunks_to_files(
                                 path_uri.inferred_native_path_string()
                             )
                         })?;
-                    if let Err(error) = fs
-                        .remove(
-                            &path_uri,
-                            RemoveOptions {
-                                recursive: false,
-                                force: false,
+                    staged_contents.insert(path_uri.to_path_buf(), None);
+                    staged_contents.insert(dest_uri.to_path_buf(), Some(new_contents.clone()));
+                    groups.push(PlannedChangeGroup {
+                        commit_ops: vec![
+                            CommitOp::Write {
+                                path: dest_uri.clone(),
+                                new_contents: new_contents.clone(),
+                                old_state: overwritten_move_state,
                             },
-                            sandbox,
-                        )
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "Failed to remove original {}",
-                                path_uri.inferred_native_path_string()
-                            )
-                        })
-                    {
-                        delta.exact &= remove_failure_was_side_effect_free(
-                            &path_uri,
-                            Some(&original_contents),
-                            fs,
-                            sandbox,
-                        )
-                        .await;
-                        return Err(error);
-                    }
-                    delta.changes[dest_write_change_index] = AppliedPatchChange {
-                        path: path_uri.to_path_buf(),
-                        change: AppliedPatchFileChange::Update {
-                            move_path: Some(dest_uri.to_path_buf()),
-                            old_content: original_contents,
-                            overwritten_move_content,
-                            new_content: new_contents,
-                        },
-                    };
-                    modified.push(affected_path);
-                } else {
-                    try_write!(
-                        fs.write_file(&path_uri, new_contents.clone().into_bytes(), sandbox)
-                            .await
-                            .with_context(|| format!(
-                                "Failed to write file {}",
-                                path_uri.inferred_native_path_string()
-                            ))
-                    );
-                    delta.changes.push(AppliedPatchChange {
-                        path: path_uri.to_path_buf(),
-                        change: AppliedPatchFileChange::Update {
-                            move_path: None,
-                            old_content: original_contents,
-                            overwritten_move_content: None,
-                            new_content: new_contents,
-                        },
+                            CommitOp::Delete {
+                                path: path_uri.clone(),
+                                old_state: PriorFileState::from_text(original_contents.clone()),
+                            },
+                        ],
+                        affected_kind: AffectedKind::Modify,
+                        affected_path,
+                        delta_change: Some(AppliedPatchChange {
+                            path: path_uri.to_path_buf(),
+                            change: AppliedPatchFileChange::Update {
+                                move_path: Some(dest_uri.to_path_buf()),
+                                old_content: original_contents,
+                                overwritten_move_content,
+                                new_content: new_contents,
+                            },
+                        }),
                     });
-                    modified.push(affected_path);
+                } else {
+                    staged_contents.insert(path_uri.to_path_buf(), Some(new_contents.clone()));
+                    groups.push(PlannedChangeGroup {
+                        commit_ops: vec![CommitOp::Write {
+                            path: path_uri.clone(),
+                            new_contents: new_contents.clone(),
+                            old_state: PriorFileState::from_text(original_contents.clone()),
+                        }],
+                        affected_kind: AffectedKind::Modify,
+                        affected_path,
+                        delta_change: Some(AppliedPatchChange {
+                            path: path_uri.to_path_buf(),
+                            change: AppliedPatchFileChange::Update {
+                                move_path: None,
+                                old_content: original_contents,
+                                overwritten_move_content: None,
+                                new_content: new_contents,
+                            },
+                        }),
+                    });
                 }
             }
         }
     }
+
+    Ok(StagedPatchPlan { groups, exact })
+}
+
+async fn commit_staged_patch_plan(
+    plan: StagedPatchPlan,
+    fs: &dyn ExecutorFileSystem,
+    sandbox: Option<&FileSystemSandboxContext>,
+    delta: &mut AppliedPatchDelta,
+) -> anyhow::Result<AffectedPaths> {
+    let mut added = Vec::new();
+    let mut modified = Vec::new();
+    let mut deleted = Vec::new();
+    let mut executed_ops = Vec::<CommitOp>::new();
+
+    for group in plan.groups {
+        let committed_before_group = executed_ops.len();
+        for op in &group.commit_ops {
+            if let Err(error) = execute_commit_op(op, fs, sandbox).await {
+                let failed_op_rollback_success = rollback_failed_commit_op(op, fs, sandbox).await;
+                let executed_ops_rollback_success =
+                    rollback_commit_ops(&executed_ops, fs, sandbox).await;
+                if executed_ops_rollback_success {
+                    delta.changes.clear();
+                }
+                delta.exact = failed_op_rollback_success && executed_ops_rollback_success;
+                executed_ops.truncate(committed_before_group);
+                return Err(error);
+            }
+            executed_ops.push(op.clone());
+        }
+
+        if let Some(change) = group.delta_change {
+            delta.changes.push(change);
+        }
+        match group.affected_kind {
+            AffectedKind::Add => added.push(group.affected_path),
+            AffectedKind::Modify => modified.push(group.affected_path),
+            AffectedKind::Delete => deleted.push(group.affected_path),
+        }
+    }
+
     Ok(AffectedPaths {
         added,
         modified,
         deleted,
     })
+}
+
+async fn execute_commit_op(
+    op: &CommitOp,
+    fs: &dyn ExecutorFileSystem,
+    sandbox: Option<&FileSystemSandboxContext>,
+) -> anyhow::Result<()> {
+    match op {
+        CommitOp::Write {
+            path, new_contents, ..
+        } => {
+            write_file_with_missing_parent_retry(
+                fs,
+                path,
+                new_contents.clone().into_bytes(),
+                sandbox,
+            )
+            .await
+        }
+        CommitOp::Delete { path, .. } => fs
+            .remove(
+                path,
+                RemoveOptions {
+                    recursive: false,
+                    force: false,
+                },
+                sandbox,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to delete file {}",
+                    path.inferred_native_path_string()
+                )
+            }),
+    }
+}
+
+async fn rollback_commit_ops(
+    executed_ops: &[CommitOp],
+    fs: &dyn ExecutorFileSystem,
+    sandbox: Option<&FileSystemSandboxContext>,
+) -> bool {
+    let mut success = true;
+    for op in executed_ops.iter().rev() {
+        if rollback_commit_op(op, fs, sandbox).await.is_err() {
+            success = false;
+        }
+    }
+    success
+}
+
+async fn rollback_failed_commit_op(
+    op: &CommitOp,
+    fs: &dyn ExecutorFileSystem,
+    sandbox: Option<&FileSystemSandboxContext>,
+) -> bool {
+    rollback_commit_op(op, fs, sandbox).await.is_ok()
+}
+
+async fn rollback_commit_op(
+    op: &CommitOp,
+    fs: &dyn ExecutorFileSystem,
+    sandbox: Option<&FileSystemSandboxContext>,
+) -> anyhow::Result<()> {
+    match op {
+        CommitOp::Write {
+            path, old_state, ..
+        } => match old_state {
+            PriorFileState::Existing { bytes, .. } => {
+                write_file_with_missing_parent_retry(fs, path, bytes.clone(), sandbox).await
+            }
+            PriorFileState::Missing => remove_file_if_present(path, fs, sandbox).await,
+            PriorFileState::UnreadableExisting => anyhow::bail!(
+                "cannot roll back overwrite of {}",
+                path.inferred_native_path_string()
+            ),
+        },
+        CommitOp::Delete { path, old_state } => match old_state {
+            PriorFileState::Existing { bytes, .. } => {
+                write_file_with_missing_parent_retry(fs, path, bytes.clone(), sandbox).await
+            }
+            PriorFileState::Missing | PriorFileState::UnreadableExisting => anyhow::bail!(
+                "cannot roll back delete of {}",
+                path.inferred_native_path_string()
+            ),
+        },
+    }
 }
 
 async fn ensure_not_directory(
@@ -581,36 +791,93 @@ async fn ensure_not_directory(
     Ok(())
 }
 
-async fn remove_failure_was_side_effect_free(
+async fn read_optional_file_state_for_plan(
     path: &PathUri,
-    expected_content: Option<&str>,
-    fs: &dyn ExecutorFileSystem,
-    sandbox: Option<&FileSystemSandboxContext>,
-) -> bool {
-    match expected_content {
-        Some(expected_content) => fs
-            .read_file_text(path, sandbox)
-            .await
-            .is_ok_and(|content| content == expected_content),
-        None => false,
-    }
-}
-
-async fn read_optional_file_text_for_delta(
-    path: &PathUri,
+    staged_contents: &HashMap<PathBuf, Option<String>>,
     fs: &dyn ExecutorFileSystem,
     sandbox: Option<&FileSystemSandboxContext>,
     exact: &mut bool,
-) -> Option<String> {
+) -> PriorFileState {
+    if let Some(contents) = staged_contents.get(&path.to_path_buf()) {
+        return match contents {
+            Some(contents) => PriorFileState::from_text(contents.clone()),
+            None => PriorFileState::Missing,
+        };
+    }
+
     note_existing_path_delta_support(path, fs, sandbox, exact).await;
-    match fs.read_file_text(path, sandbox).await {
-        Ok(content) => Some(content),
-        Err(source) if source.kind() == io::ErrorKind::NotFound => None,
+    match fs.read_file(path, sandbox).await {
+        Ok(bytes) => PriorFileState::from_bytes(bytes, exact),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => PriorFileState::Missing,
         Err(_) => {
             *exact = false;
-            None
+            PriorFileState::UnreadableExisting
         }
     }
+}
+
+async fn read_deleted_file_state_for_plan(
+    path: &PathUri,
+    staged_contents: &HashMap<PathBuf, Option<String>>,
+    fs: &dyn ExecutorFileSystem,
+    sandbox: Option<&FileSystemSandboxContext>,
+    exact: &mut bool,
+) -> anyhow::Result<PriorFileState> {
+    if let Some(contents) = staged_contents.get(&path.to_path_buf()) {
+        return match contents {
+            Some(contents) => Ok(PriorFileState::from_text(contents.clone())),
+            None => anyhow::bail!(
+                "Failed to delete file {}",
+                path.inferred_native_path_string()
+            ),
+        };
+    }
+
+    note_existing_path_delta_support(path, fs, sandbox, exact).await;
+    let deleted_state = match fs.read_file(path, sandbox).await {
+        Ok(bytes) => PriorFileState::from_bytes(bytes, exact),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => PriorFileState::Missing,
+        Err(_) => {
+            *exact = false;
+            PriorFileState::UnreadableExisting
+        }
+    };
+    ensure_not_directory(path, fs, sandbox)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to delete file {}",
+                path.inferred_native_path_string()
+            )
+        })?;
+    Ok(deleted_state)
+}
+
+async fn read_required_file_text_for_plan(
+    path: &PathUri,
+    staged_contents: &HashMap<PathBuf, Option<String>>,
+    fs: &dyn ExecutorFileSystem,
+    sandbox: Option<&FileSystemSandboxContext>,
+    exact: &mut bool,
+    context: &str,
+) -> std::result::Result<String, ApplyPatchError> {
+    if let Some(contents) = staged_contents.get(&path.to_path_buf()) {
+        return match contents {
+            Some(contents) => Ok(contents.clone()),
+            None => Err(ApplyPatchError::IoError(IoError {
+                context: format!("{context} {}", path.inferred_native_path_string()),
+                source: io::Error::from(io::ErrorKind::NotFound),
+            })),
+        };
+    }
+
+    note_existing_path_delta_support(path, fs, sandbox, exact).await;
+    fs.read_file_text(path, sandbox).await.map_err(|source| {
+        ApplyPatchError::IoError(IoError {
+            context: format!("{context} {}", path.inferred_native_path_string()),
+            source,
+        })
+    })
 }
 
 async fn note_existing_path_delta_support(
@@ -624,6 +891,33 @@ async fn note_existing_path_delta_support(
         Ok(_) => *exact = false,
         Err(source) if source.kind() == io::ErrorKind::NotFound => {}
         Err(_) => *exact = false,
+    }
+}
+
+async fn remove_file_if_present(
+    path: &PathUri,
+    fs: &dyn ExecutorFileSystem,
+    sandbox: Option<&FileSystemSandboxContext>,
+) -> anyhow::Result<()> {
+    match fs
+        .remove(
+            path,
+            RemoveOptions {
+                recursive: false,
+                force: false,
+            },
+            sandbox,
+        )
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(source).with_context(|| {
+            format!(
+                "Failed to delete file {}",
+                path.inferred_native_path_string()
+            )
+        }),
     }
 }
 
@@ -670,6 +964,108 @@ struct AppliedPatch {
     new_contents: String,
 }
 
+/// Detect the dominant line ending of `contents` so a rewritten file keeps the
+/// ending it had on disk. Returns `"\r\n"` only when CRLF is the strict majority
+/// of newlines; otherwise `"\n"` (the safe default for LF files and files with
+/// no newline at all).
+fn detect_line_ending(contents: &str) -> &'static str {
+    let crlf = contents.matches("\r\n").count();
+    let lone_lf = contents.matches('\n').count().saturating_sub(crlf);
+    if crlf > lone_lf { "\r\n" } else { "\n" }
+}
+
+fn normalize_full_file_replacement_contents(
+    replacement_contents: &str,
+    original_contents: &str,
+) -> String {
+    if replacement_contents.is_empty() {
+        return String::new();
+    }
+
+    let line_ending = detect_line_ending(original_contents);
+    let mut replacement_lines = replacement_contents.split('\n').collect::<Vec<_>>();
+    if replacement_lines.last().is_some_and(|line| line.is_empty()) {
+        replacement_lines.pop();
+    }
+
+    if replacement_lines.is_empty() {
+        String::new()
+    } else {
+        format!("{}{line_ending}", replacement_lines.join(line_ending))
+    }
+}
+
+fn build_unified_diff(original_contents: &str, new_contents: &str, context: usize) -> String {
+    TextDiff::from_lines(original_contents, new_contents)
+        .unified_diff()
+        .context_radius(context)
+        .to_string()
+}
+
+async fn derive_replaced_file_contents(
+    path: &PathUri,
+    replacement_contents: &str,
+    fs: &dyn ExecutorFileSystem,
+    sandbox: Option<&FileSystemSandboxContext>,
+) -> std::result::Result<AppliedPatch, ApplyPatchError> {
+    let original_contents = fs.read_file_text(path, sandbox).await.map_err(|err| {
+        ApplyPatchError::IoError(IoError {
+            context: format!(
+                "Failed to read file to replace {}",
+                path.inferred_native_path_string()
+            ),
+            source: err,
+        })
+    })?;
+    let new_contents =
+        normalize_full_file_replacement_contents(replacement_contents, &original_contents);
+    Ok(AppliedPatch {
+        original_contents,
+        new_contents,
+    })
+}
+
+fn derive_new_contents_from_original_contents(
+    original_contents: &str,
+    path: &str,
+    chunks: &[UpdateFileChunk],
+) -> std::result::Result<String, ApplyPatchError> {
+    let line_ending = detect_line_ending(original_contents);
+    let mut original_lines: Vec<String> = original_contents
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line).to_string())
+        .collect();
+
+    if original_lines.last().is_some_and(String::is_empty) {
+        original_lines.pop();
+    }
+
+    let replacements = compute_replacements(&original_lines, path, chunks)?;
+    let mut new_lines = apply_replacements(original_lines, &replacements);
+    if !new_lines.last().is_some_and(String::is_empty) {
+        new_lines.push(String::new());
+    }
+    Ok(new_lines.join(line_ending))
+}
+
+pub(crate) async fn full_file_update_from_replacement(
+    path: &PathUri,
+    replacement_contents: &str,
+    context: usize,
+    fs: &dyn ExecutorFileSystem,
+    sandbox: Option<&FileSystemSandboxContext>,
+) -> std::result::Result<ApplyPatchFileUpdate, ApplyPatchError> {
+    let AppliedPatch {
+        original_contents,
+        new_contents,
+    } = derive_replaced_file_contents(path, replacement_contents, fs, sandbox).await?;
+    Ok(ApplyPatchFileUpdate {
+        unified_diff: build_unified_diff(&original_contents, &new_contents, context),
+        original_content: original_contents,
+        content: new_contents,
+    })
+}
+
 /// Return *only* the new file contents (joined into a single `String`) after
 /// applying the chunks to the file at `path`.
 async fn derive_new_contents_from_chunks(
@@ -688,22 +1084,16 @@ async fn derive_new_contents_from_chunks(
         })
     })?;
 
-    let mut original_lines: Vec<String> = original_contents.split('\n').map(String::from).collect();
-
-    // Drop the trailing empty element that results from the final newline so
-    // that line counts match the behaviour of standard `diff`.
-    if original_lines.last().is_some_and(String::is_empty) {
-        original_lines.pop();
-    }
-
+    // Patches authored by the model are always normalised to LF: the parser
+    // splits them with `str::lines()`, which strips a trailing `\r`. Strip the
+    // file's line endings the same way before matching, then re-apply the
+    // file's dominant ending on write. Without this, a CRLF file only matched
+    // via the trailing-whitespace fallback in `seek_sequence`, and the
+    // rewritten region was written back as LF, leaving the file with mixed
+    // endings that broke subsequent patches.
     let path_text = path.inferred_native_path_string();
-    let replacements = compute_replacements(&original_lines, &path_text, chunks)?;
-    let new_lines = apply_replacements(original_lines, &replacements);
-    let mut new_lines = new_lines;
-    if !new_lines.last().is_some_and(String::is_empty) {
-        new_lines.push(String::new());
-    }
-    let new_contents = new_lines.join("\n");
+    let new_contents =
+        derive_new_contents_from_original_contents(&original_contents, &path_text, chunks)?;
     Ok(AppliedPatch {
         original_contents,
         new_contents,
@@ -733,9 +1123,9 @@ fn compute_replacements(
             ) {
                 line_index = idx + 1;
             } else {
-                return Err(ApplyPatchError::ComputeReplacements(format!(
-                    "Failed to find context '{ctx_line}' in {path}"
-                )));
+                return Err(ApplyPatchError::ComputeReplacements(
+                    missing_context_diagnostic(original_lines, line_index, ctx_line, path),
+                ));
             }
         }
 
@@ -788,11 +1178,14 @@ fn compute_replacements(
             replacements.push((start_idx, pattern.len(), new_slice.to_vec()));
             line_index = start_idx + pattern.len();
         } else {
-            return Err(ApplyPatchError::ComputeReplacements(format!(
-                "Failed to find expected lines in {}:\n{}",
-                path,
-                chunk.old_lines.join("\n"),
-            )));
+            return Err(ApplyPatchError::ComputeReplacements(
+                missing_expected_lines_diagnostic(
+                    original_lines,
+                    line_index,
+                    &chunk.old_lines,
+                    path,
+                ),
+            ));
         }
     }
 
@@ -857,13 +1250,171 @@ pub async fn unified_diff_from_chunks_with_context(
         original_contents,
         new_contents,
     } = derive_new_contents_from_chunks(path, chunks, fs, sandbox).await?;
-    let text_diff = TextDiff::from_lines(&original_contents, &new_contents);
-    let unified_diff = text_diff.unified_diff().context_radius(context).to_string();
     Ok(ApplyPatchFileUpdate {
-        unified_diff,
+        unified_diff: build_unified_diff(&original_contents, &new_contents, context),
         original_content: original_contents,
         content: new_contents,
     })
+}
+
+fn missing_context_diagnostic(
+    original_lines: &[String],
+    search_start: usize,
+    expected_line: &str,
+    path: &str,
+) -> String {
+    let mut message = format!("Failed to find context '{expected_line}' in {path}");
+    let expected_line = expected_line.to_string();
+    append_refresh_hint_and_live_context(
+        &mut message,
+        original_lines,
+        search_start,
+        std::slice::from_ref(&expected_line),
+    );
+    message
+}
+
+fn missing_expected_lines_diagnostic(
+    original_lines: &[String],
+    search_start: usize,
+    expected_lines: &[String],
+    path: &str,
+) -> String {
+    let mut message = format!(
+        "Failed to find expected lines in {path}:\n{}",
+        expected_lines.join("\n")
+    );
+    append_refresh_hint_and_live_context(
+        &mut message,
+        original_lines,
+        search_start,
+        expected_lines,
+    );
+    message
+}
+
+fn append_refresh_hint_and_live_context(
+    message: &mut String,
+    original_lines: &[String],
+    search_start: usize,
+    expected_lines: &[String],
+) {
+    message.push('\n');
+    message.push_str(STALE_PATCH_REFRESH_HINT);
+
+    if original_lines.is_empty() {
+        return;
+    }
+
+    let snippet = if let Some(best_start) =
+        find_best_matching_window_start(original_lines, search_start, expected_lines)
+    {
+        let window_len = expected_lines.len().max(1).min(original_lines.len());
+        let snippet_start = best_start.saturating_sub(1);
+        let snippet_end = (best_start + window_len + 1).min(original_lines.len());
+        format!(
+            "\nClosest live block starts at line {}:\n{}",
+            best_start + 1,
+            render_numbered_lines(original_lines, snippet_start, snippet_end)
+        )
+    } else {
+        let snippet_start = search_start.min(original_lines.len().saturating_sub(1));
+        let snippet_end = (snippet_start + 3).min(original_lines.len());
+        format!(
+            "\nNearby live lines from line {}:\n{}",
+            snippet_start + 1,
+            render_numbered_lines(original_lines, snippet_start, snippet_end)
+        )
+    };
+    message.push_str(&snippet);
+}
+
+fn find_best_matching_window_start(
+    original_lines: &[String],
+    search_start: usize,
+    expected_lines: &[String],
+) -> Option<usize> {
+    if original_lines.is_empty() {
+        return None;
+    }
+
+    let window_len = expected_lines.len().max(1).min(original_lines.len());
+    let last_start = original_lines.len().saturating_sub(window_len);
+    let search_start = search_start.min(last_start);
+    let mut best: Option<(usize, usize)> = None;
+    for start in search_start..=last_start {
+        let score = block_match_score(
+            &expected_lines[..expected_lines.len().min(window_len)],
+            &original_lines[start..start + window_len],
+        );
+        match best {
+            Some((best_score, _)) if score <= best_score => {}
+            _ => best = Some((score, start)),
+        }
+    }
+
+    best.and_then(|(score, start)| (score > 0).then_some(start))
+}
+
+fn block_match_score(expected_lines: &[String], actual_lines: &[String]) -> usize {
+    expected_lines
+        .iter()
+        .zip(actual_lines.iter())
+        .map(|(expected_line, actual_line)| {
+            approximate_line_match_score(expected_line, actual_line)
+        })
+        .sum()
+}
+
+fn approximate_line_match_score(expected_line: &str, actual_line: &str) -> usize {
+    let expected = seek_sequence::normalize_for_fuzzy_match(expected_line);
+    let actual = seek_sequence::normalize_for_fuzzy_match(actual_line);
+    let shared_prefix = expected
+        .chars()
+        .zip(actual.chars())
+        .take_while(|(lhs, rhs)| lhs == rhs)
+        .count();
+    let shared_suffix = expected
+        .chars()
+        .rev()
+        .zip(actual.chars().rev())
+        .take_while(|(lhs, rhs)| lhs == rhs)
+        .count();
+    let shared_tokens = expected
+        .split_whitespace()
+        .filter(|token| !token.is_empty() && actual.contains(token))
+        .count()
+        * 8;
+    shared_prefix + shared_suffix + shared_tokens
+}
+
+fn render_numbered_lines(original_lines: &[String], start: usize, end: usize) -> String {
+    let mut rendered = String::new();
+    let capped_end = end.min(start.saturating_add(STALE_PATCH_LIVE_CONTEXT_MAX_LINES));
+    for (idx, line) in original_lines
+        .iter()
+        .enumerate()
+        .take(capped_end)
+        .skip(start)
+    {
+        if !rendered.is_empty() {
+            rendered.push('\n');
+        }
+        let line_prefix =
+            take_bytes_at_char_boundary(line, STALE_PATCH_LIVE_CONTEXT_MAX_LINE_BYTES);
+        rendered.push_str(&format!("{}| {line_prefix}", idx + 1));
+        if line_prefix.len() < line.len() {
+            rendered.push_str("… [line truncated]");
+        }
+    }
+    let omitted_lines = end.saturating_sub(capped_end);
+    if omitted_lines > 0 {
+        if !rendered.is_empty() {
+            rendered.push('\n');
+        }
+        rendered.push_str(&format!("… [{omitted_lines} live lines omitted]"));
+    }
+    rendered
 }
 
 /// Print the summary of changes in git-style format.
@@ -1114,9 +1665,48 @@ mod tests {
         assert_eq!(contents, "line2\n");
     }
 
+    #[tokio::test]
+    async fn test_update_file_hunk_move_to_same_path_keeps_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("same.txt");
+        fs::write(&path, "before\n").unwrap();
+        let patch =
+            wrap_patch("*** Update File: same.txt\n*** Move to: same.txt\n@@\n-before\n+after");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let delta = apply_patch(
+            &patch,
+            &PathUri::from_host_native_path(dir.path()).expect("absolute test path"),
+            &mut stdout,
+            &mut stderr,
+            LOCAL_FS.as_ref(),
+            /*sandbox*/ None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "after\n");
+        assert_eq!(
+            delta,
+            AppliedPatchDelta::new(
+                vec![AppliedPatchChange {
+                    path,
+                    change: AppliedPatchFileChange::Update {
+                        move_path: None,
+                        old_content: "before\n".to_string(),
+                        overwritten_move_content: None,
+                        new_content: "after\n".to_string(),
+                    },
+                }],
+                /*exact*/ true,
+            )
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_failed_move_returns_committed_destination_delta() {
+    async fn test_failed_move_rolls_back_destination() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempdir().unwrap();
@@ -1150,23 +1740,11 @@ mod tests {
         assert!(
             String::from_utf8(stderr)
                 .unwrap()
-                .contains(&format!("Failed to remove original {}", src.display()))
+                .contains(&format!("Failed to delete file {}", src.display()))
         );
-        assert_eq!(
-            failure.delta(),
-            &AppliedPatchDelta::new(
-                vec![AppliedPatchChange {
-                    path: dest.clone(),
-                    change: AppliedPatchFileChange::Add {
-                        content: "line2\n".to_string(),
-                        overwritten_content: None,
-                    },
-                }],
-                /*exact*/ true,
-            )
-        );
+        assert_eq!(failure.delta(), &AppliedPatchDelta::empty());
         assert_eq!(fs::read_to_string(src).unwrap(), "line\n");
-        assert_eq!(fs::read_to_string(dest).unwrap(), "line2\n");
+        assert!(!dest.exists());
     }
 
     /// Verify that a single `Update File` hunk with multiple change chunks can update different
@@ -1364,6 +1942,74 @@ mod tests {
         assert_eq!(stdout_str, expected_out);
 
         // No stderr expected.
+        assert_eq!(String::from_utf8(stderr).unwrap(), "");
+    }
+
+    #[test]
+    fn test_detect_line_ending() {
+        assert_eq!(detect_line_ending("foo\r\nbar\r\n"), "\r\n");
+        assert_eq!(detect_line_ending("foo\nbar\n"), "\n");
+        // Ties and LF-majority fall back to LF.
+        assert_eq!(detect_line_ending("foo\r\nbar\n"), "\n");
+        // No newline at all.
+        assert_eq!(detect_line_ending("foo"), "\n");
+        assert_eq!(detect_line_ending(""), "\n");
+    }
+
+    /// A CRLF file should match cleanly and be written back with CRLF endings,
+    /// touching only the replaced line rather than normalising the whole file
+    /// to LF.
+    #[tokio::test]
+    async fn test_update_preserves_crlf_line_endings() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("crlf.txt");
+        fs::write(&path, "foo\r\nbar\r\nbaz\r\n").unwrap();
+        let patch = wrap_patch(&format!(
+            "*** Update File: {}\n@@\n foo\n-bar\n+BAR",
+            path.display()
+        ));
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        apply_patch(
+            &patch,
+            &PathUri::from_host_native_path(dir.path()).expect("absolute test path"),
+            &mut stdout,
+            &mut stderr,
+            LOCAL_FS.as_ref(),
+            /*sandbox*/ None,
+        )
+        .await
+        .unwrap();
+        let contents = fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, "foo\r\nBAR\r\nbaz\r\n");
+        assert_eq!(String::from_utf8(stderr).unwrap(), "");
+    }
+
+    /// Inserting at end-of-file on a CRLF file should keep CRLF endings,
+    /// including for the newly appended line.
+    #[tokio::test]
+    async fn test_eof_insertion_preserves_crlf_line_endings() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("crlf_eof.txt");
+        fs::write(&path, "foo\r\nbar\r\nbaz\r\n").unwrap();
+        let patch = wrap_patch(&format!(
+            "*** Update File: {}\n@@\n+quux\n*** End of File",
+            path.display()
+        ));
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        apply_patch(
+            &patch,
+            &PathUri::from_host_native_path(dir.path()).expect("absolute test path"),
+            &mut stdout,
+            &mut stderr,
+            LOCAL_FS.as_ref(),
+            /*sandbox*/ None,
+        )
+        .await
+        .unwrap();
+        let contents = fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, "foo\r\nbar\r\nbaz\r\nquux\r\n");
         assert_eq!(String::from_utf8(stderr).unwrap(), "");
     }
 
@@ -1659,11 +2305,115 @@ g
 
         fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o755)).unwrap();
 
-        assert!(!failure.delta().is_exact());
+        assert!(failure.delta().is_exact());
+        assert!(failure.delta().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_apply_patch_rolls_back_earlier_writes_when_later_write_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let updated_path = dir.path().join("updated.txt");
+        fs::write(&updated_path, "before\n").unwrap();
+        let locked_dir = dir.path().join("locked");
+        fs::create_dir(&locked_dir).unwrap();
+        fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let patch = wrap_patch(
+            "*** Update File: updated.txt\n@@\n-before\n+after\n*** Add File: locked/new.txt\n+blocked",
+        );
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let result = apply_patch(
+            &patch,
+            &PathUri::from_host_native_path(dir.path()).expect("absolute test path"),
+            &mut stdout,
+            &mut stderr,
+            LOCAL_FS.as_ref(),
+            /*sandbox*/ None,
+        )
+        .await;
+        let failure = result.expect_err("write should fail");
+
+        fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(fs::read_to_string(&updated_path).unwrap(), "before\n");
+        assert!(!dir.path().join("locked/new.txt").exists());
+        assert!(failure.delta().is_exact());
+        assert!(failure.delta().is_empty());
     }
 
     #[tokio::test]
-    async fn test_unreadable_destinations_return_inexact_delta() {
+    async fn test_apply_patch_rolls_back_earlier_writes_when_failed_target_is_unreadable() {
+        let dir = tempdir().unwrap();
+        let updated_path = dir.path().join("updated.txt");
+        fs::write(&updated_path, "before\n").unwrap();
+        fs::create_dir(dir.path().join("existing-dir")).unwrap();
+        let patch = wrap_patch(
+            "*** Update File: updated.txt\n@@\n-before\n+after\n*** Add File: existing-dir\n+blocked",
+        );
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let failure = apply_patch(
+            &patch,
+            &PathUri::from_host_native_path(dir.path()).expect("absolute test path"),
+            &mut stdout,
+            &mut stderr,
+            LOCAL_FS.as_ref(),
+            /*sandbox*/ None,
+        )
+        .await
+        .expect_err("writing over a directory should fail");
+
+        assert_eq!(fs::read_to_string(updated_path).unwrap(), "before\n");
+        assert!(dir.path().join("existing-dir").is_dir());
+        assert!(failure.delta().is_empty());
+        assert!(!failure.delta().is_exact());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_apply_patch_rolls_back_binary_overwrite_when_later_write_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let binary_path = dir.path().join("binary.dat");
+        let original_bytes = vec![0xff, 0xfe, 0xfd];
+        fs::write(&binary_path, &original_bytes).unwrap();
+        let locked_dir = dir.path().join("locked");
+        fs::create_dir(&locked_dir).unwrap();
+        fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let patch =
+            wrap_patch("*** Add File: binary.dat\n+text\n*** Add File: locked/new.txt\n+blocked");
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let result = apply_patch(
+            &patch,
+            &PathUri::from_host_native_path(dir.path()).expect("absolute test path"),
+            &mut stdout,
+            &mut stderr,
+            LOCAL_FS.as_ref(),
+            /*sandbox*/ None,
+        )
+        .await;
+        let failure = result.expect_err("write should fail");
+
+        fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(fs::read(&binary_path).unwrap(), original_bytes);
+        assert!(!dir.path().join("locked/new.txt").exists());
+        assert!(failure.delta().is_exact());
+        assert!(failure.delta().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_non_utf8_destinations_return_inexact_delta() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("binary.dat");
         fs::write(dir.path().join("source.txt"), "before\n").unwrap();
@@ -1689,6 +2439,21 @@ g
 
             assert!(!delta.is_exact());
         }
+    }
+
+    #[test]
+    fn stale_patch_live_context_is_bounded() {
+        let long_line = "x".repeat(STALE_PATCH_LIVE_CONTEXT_MAX_LINE_BYTES * 2);
+        let lines = vec![long_line; STALE_PATCH_LIVE_CONTEXT_MAX_LINES + 4];
+
+        let rendered = render_numbered_lines(&lines, 0, lines.len());
+
+        assert!(rendered.contains("… [line truncated]"));
+        assert!(rendered.contains("… [4 live lines omitted]"));
+        assert_eq!(
+            rendered.lines().count(),
+            STALE_PATCH_LIVE_CONTEXT_MAX_LINES + 1
+        );
     }
 
     #[cfg(unix)]

@@ -54,7 +54,6 @@ use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::ListMcpServerStatusParams;
-use codex_app_server_protocol::LoginAccountParams;
 use codex_app_server_protocol::MarketplaceAddParams;
 use codex_app_server_protocol::MarketplaceRemoveParams;
 use codex_app_server_protocol::MarketplaceUpgradeParams;
@@ -443,22 +442,6 @@ impl TestAppServer {
     ) -> anyhow::Result<i64> {
         let params = Some(serde_json::to_value(params)?);
         self.send_request("account/read", params).await
-    }
-
-    /// Send an `account/login/start` JSON-RPC request with ChatGPT auth tokens.
-    pub async fn send_chatgpt_auth_tokens_login_request(
-        &mut self,
-        access_token: String,
-        chatgpt_account_id: String,
-        chatgpt_plan_type: Option<String>,
-    ) -> anyhow::Result<i64> {
-        let params = LoginAccountParams::ChatgptAuthTokens {
-            access_token,
-            chatgpt_account_id,
-            chatgpt_plan_type,
-        };
-        self.send_login_account_request(serde_json::to_value(params)?)
-            .await
     }
 
     /// Send a `feedback/upload` JSON-RPC request.
@@ -1356,32 +1339,6 @@ impl TestAppServer {
         self.send_request("account/login/start", Some(params)).await
     }
 
-    /// Send an `account/login/start` JSON-RPC request for API key login.
-    pub async fn send_login_account_api_key_request(
-        &mut self,
-        api_key: &str,
-    ) -> anyhow::Result<i64> {
-        let params = serde_json::json!({
-            "type": "apiKey",
-            "apiKey": api_key,
-        });
-        self.send_login_account_request(params).await
-    }
-
-    /// Send an `account/login/start` JSON-RPC request for managed Amazon Bedrock login.
-    pub async fn send_login_account_amazon_bedrock_request(
-        &mut self,
-        api_key: &str,
-        region: &str,
-    ) -> anyhow::Result<i64> {
-        let params = serde_json::json!({
-            "type": "amazonBedrock",
-            "apiKey": api_key,
-            "region": region,
-        });
-        self.send_request("account/login/start", Some(params)).await
-    }
-
     /// Send an `account/login/start` JSON-RPC request for ChatGPT login.
     pub async fn send_login_account_chatgpt_request(&mut self) -> anyhow::Result<i64> {
         let params = serde_json::json!({
@@ -1999,4 +1956,22 @@ impl Drop for TestAppServer {
             }
         }
     }
+}
+
+/// Writes ChatGPT auth.json for tests that need authenticated app-server state.
+///
+/// Call this before starting [TestAppServer] so AuthManager loads the credentials
+/// at process startup.
+pub fn seed_chatgpt_auth(codex_home: &Path) -> anyhow::Result<()> {
+    use crate::ChatGptAuthFixture;
+    use crate::write_chatgpt_auth;
+    use codex_login::AuthCredentialsStoreMode;
+
+    write_chatgpt_auth(
+        codex_home,
+        ChatGptAuthFixture::new("test-access-token")
+            .account_id("test-account")
+            .plan_type("pro"),
+        AuthCredentialsStoreMode::File,
+    )
 }

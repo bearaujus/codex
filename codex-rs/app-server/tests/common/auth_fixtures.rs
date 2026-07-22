@@ -9,8 +9,10 @@ use chrono::Utc;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_login::AuthDotJson;
 use codex_login::AuthKeyringBackendKind;
+use codex_login::ChatgptAccountPool;
 use codex_login::save_auth;
 use codex_login::token_data::TokenData;
+use codex_login::token_data::derive_pool_account_id;
 use codex_login::token_data::parse_chatgpt_jwt_claims;
 use codex_protocol::auth::AuthMode;
 use serde_json::json;
@@ -150,6 +152,9 @@ pub fn write_chatgpt_auth(
 ) -> Result<()> {
     let id_token_raw = encode_id_token(&fixture.claims)?;
     let id_token = parse_chatgpt_jwt_claims(&id_token_raw).context("parse id token")?;
+    let pool_account_id = fixture.account_id.as_ref().map(|account_id| {
+        derive_pool_account_id(account_id, /*member_identity_key*/ None)
+    });
     let tokens = TokenData {
         id_token,
         access_token: fixture.access_token,
@@ -159,14 +164,14 @@ pub fn write_chatgpt_auth(
 
     let last_refresh = fixture.last_refresh.unwrap_or_else(|| Some(Utc::now()));
 
+    // Pool-shaped auth: when a workspace account id is present, also stamp the
+    // derived pool row id so fixtures exercise the account-pool path directly.
     let auth = AuthDotJson {
         auth_mode: Some(AuthMode::Chatgpt),
-        openai_api_key: None,
         tokens: Some(tokens),
+        pool_account_id,
         last_refresh,
         agent_identity: None,
-        personal_access_token: None,
-        bedrock_api_key: None,
     };
 
     save_auth(
@@ -176,4 +181,70 @@ pub fn write_chatgpt_auth(
         AuthKeyringBackendKind::default(),
     )
     .context("write auth.json")
+}
+
+/// Writes ChatGPT auth to disk and syncs the account-pool secret.
+///
+/// Prefer this over [`write_chatgpt_auth`] when a test rewrites credentials after
+/// `AuthManager` has already opened the pool (disk-only writes are ignored).
+pub async fn write_chatgpt_auth_to_pool(
+    codex_home: &Path,
+    fixture: ChatGptAuthFixture,
+    cli_auth_credentials_store_mode: AuthCredentialsStoreMode,
+) -> Result<()> {
+    write_chatgpt_auth(codex_home, fixture, cli_auth_credentials_store_mode)?;
+    let auth = load_written_chatgpt_auth(codex_home, cli_auth_credentials_store_mode)?;
+    let Some(pool_account_id) = auth.pool_account_id.clone() else {
+        return Ok(());
+    };
+    let _ = ChatgptAccountPool::open(
+        codex_home.to_path_buf(),
+        AuthCredentialsStoreMode::File,
+        /*chatgpt_base_url*/ None,
+    )
+    .await
+    .context("ensure chatgpt account pool row exists")?;
+    let pool = ChatgptAccountPool::open(
+        codex_home.to_path_buf(),
+        AuthCredentialsStoreMode::File,
+        /*chatgpt_base_url*/ None,
+    )
+    .await
+    .context("open chatgpt account pool")?;
+    pool.persist_refreshed_account_auth(&pool_account_id, &auth)
+        .await
+        .context("persist auth into account pool")?;
+    Ok(())
+}
+
+fn load_written_chatgpt_auth(
+    codex_home: &Path,
+    cli_auth_credentials_store_mode: AuthCredentialsStoreMode,
+) -> Result<AuthDotJson> {
+    codex_login::load_auth_dot_json(
+        codex_home,
+        cli_auth_credentials_store_mode,
+        AuthKeyringBackendKind::default(),
+    )
+    .context("load auth.json")?
+    .context("auth.json should exist after write_chatgpt_auth")
+}
+
+/// Marks the ChatGPT account-pool row for `workspace_account_id` as permanently
+/// failed. App-server tests use this instead of mocking `/oauth/token` because
+/// pool-managed ChatGPT auth never calls the OAuth refresh endpoint.
+pub async fn mark_pool_auth_failed(codex_home: &Path, workspace_account_id: &str) -> Result<()> {
+    let pool = ChatgptAccountPool::open(
+        codex_home.to_path_buf(),
+        AuthCredentialsStoreMode::File,
+        /*chatgpt_base_url*/ None,
+    )
+    .await
+    .context("open chatgpt account pool")?;
+    let pool_account_id =
+        derive_pool_account_id(workspace_account_id, /*member_identity_key*/ None);
+    pool.mark_account_auth_failed(&pool_account_id, "refresh_token_reused")
+        .await
+        .context("mark pool auth failed")?;
+    Ok(())
 }

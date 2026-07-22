@@ -273,6 +273,10 @@ async fn guardian_test_session_and_turn_with_base_url(
     session.thread_id = fixed_guardian_parent_session_id();
     let mut config = (*turn.config).clone();
     config.model_provider.base_url = Some(format!("{base_url}/v1"));
+    config
+        .features
+        .disable(Feature::EnableRequestCompression)
+        .expect("test config should allow request-compression override");
     let config = Arc::new(config);
     let models_manager = test_support::models_manager_with_provider(
         config.codex_home.to_path_buf(),

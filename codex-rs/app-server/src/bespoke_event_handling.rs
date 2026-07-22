@@ -1551,6 +1551,7 @@ async fn handle_token_count_event(
     outgoing: &ThreadScopedOutgoingMessageSender,
 ) {
     let TokenCountEvent { info, rate_limits } = token_count_event;
+    let had_token_usage = info.is_some();
     if let Some(token_usage) = info.map(ThreadTokenUsage::from) {
         let notification = ThreadTokenUsageUpdatedNotification {
             thread_id: conversation_id.to_string(),
@@ -1561,11 +1562,11 @@ async fn handle_token_count_event(
             .send_server_notification(ServerNotification::ThreadTokenUsageUpdated(notification))
             .await;
     }
-    if let Some(rate_limits) = rate_limits {
+    if rate_limits.is_some() || had_token_usage {
         outgoing
             .send_server_notification(ServerNotification::AccountRateLimitsUpdated(
                 AccountRateLimitsUpdatedNotification {
-                    rate_limits: rate_limits.into(),
+                    rate_limits: rate_limits.map(Into::into),
                 },
             ))
             .await;
@@ -3771,10 +3772,11 @@ mod tests {
         let second = recv_broadcast_notification(&mut rx).await?;
         match second {
             ServerNotification::AccountRateLimitsUpdated(payload) => {
-                assert_eq!(payload.rate_limits.limit_id.as_deref(), Some("codex"));
-                assert_eq!(payload.rate_limits.limit_name, None);
-                assert!(payload.rate_limits.primary.is_some());
-                assert!(payload.rate_limits.credits.is_some());
+                let rate_limits = payload.rate_limits.expect("rate limits should be present");
+                assert_eq!(rate_limits.limit_id.as_deref(), Some("codex"));
+                assert_eq!(rate_limits.limit_name, None);
+                assert!(rate_limits.primary.is_some());
+                assert!(rate_limits.credits.is_some());
             }
             other => bail!("unexpected notification: {other:?}"),
         }
@@ -3811,6 +3813,43 @@ mod tests {
             rx.try_recv().is_err(),
             "no notifications should be emitted when token usage info is absent"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_handle_token_count_event_emits_rate_limit_clear() -> Result<()> {
+        let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            ThreadId::new(),
+        );
+
+        handle_token_count_event(
+            ThreadId::new(),
+            "turn-clear".to_string(),
+            TokenCountEvent {
+                info: Some(TokenUsageInfo {
+                    total_token_usage: TokenUsage::default(),
+                    last_token_usage: TokenUsage::default(),
+                    model_context_window: None,
+                }),
+                rate_limits: None,
+            },
+            &outgoing,
+        )
+        .await;
+
+        let _token_usage = recv_broadcast_notification(&mut rx).await?;
+        let rate_limits = recv_broadcast_notification(&mut rx).await?;
+        let ServerNotification::AccountRateLimitsUpdated(payload) = rate_limits else {
+            bail!("expected rate-limit clear notification")
+        };
+        assert_eq!(payload.rate_limits, None);
         Ok(())
     }
 

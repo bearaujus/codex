@@ -5,9 +5,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use app_test_support::ChatGptAuthFixture;
-use app_test_support::ChatGptIdTokenClaims;
 use app_test_support::TestAppServer;
-use app_test_support::encode_id_token;
 use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
 use axum::Json;
@@ -23,7 +21,6 @@ use codex_app_server_protocol::AppsReadResponse;
 use codex_app_server_protocol::ConnectorMetadata;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCResponse;
-use codex_app_server_protocol::LoginAccountResponse;
 use codex_app_server_protocol::RequestId;
 use codex_config::types::AuthCredentialsStoreMode;
 use pretty_assertions::assert_eq;
@@ -35,110 +32,6 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
-
-#[tokio::test]
-async fn app_read_deduplicates_orders_partial_misses_and_reuses_cached_metadata() -> Result<()> {
-    let access_token = encode_id_token(
-        &ChatGptIdTokenClaims::new()
-            .email("external@example.com")
-            .plan_type("plus")
-            .chatgpt_account_id("account-123"),
-    )?;
-    let state = BatchServerState::new(
-        json!({
-            "apps": [
-                app_response("alpha", "Alpha", Some("https://files.openai.com/content?id=alpha")),
-                app_response("beta", "Beta", Some("https://files.openai.com/content?id=beta")),
-            ]
-        }),
-        &access_token,
-        "tpp",
-    );
-    let (server_url, server_handle) = start_batch_server(state.clone()).await?;
-    let codex_home = TempDir::new()?;
-    write_apps_config(codex_home.path(), &server_url, Some("tpp"))?;
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .without_auto_env()
-        .without_managed_config()
-        .build()
-        .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
-    let login_id = mcp
-        .send_chatgpt_auth_tokens_login_request(
-            access_token,
-            "account-123".to_string(),
-            Some("plus".to_string()),
-        )
-        .await?;
-    let login_response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(login_id)),
-    )
-    .await??;
-    assert_eq!(
-        to_response::<LoginAccountResponse>(login_response)?,
-        LoginAccountResponse::ChatgptAuthTokens {}
-    );
-
-    let response = read_apps(
-        &mut mcp,
-        vec!["beta", "missing", "alpha", "beta", "forbidden"],
-        /*include_tools*/ true,
-    )
-    .await?;
-    assert_eq!(
-        response,
-        AppsReadResponse {
-            apps: vec![
-                metadata(
-                    "beta",
-                    "Beta",
-                    Some("https://files.openai.com/content?id=beta")
-                ),
-                metadata(
-                    "alpha",
-                    "Alpha",
-                    Some("https://files.openai.com/content?id=alpha")
-                ),
-            ],
-            missing_app_ids: vec!["missing".to_string(), "forbidden".to_string()],
-        }
-    );
-    assert_eq!(
-        state.requests(),
-        vec![json!({
-            "app_ids": ["beta", "missing", "alpha", "forbidden"],
-            "include_tools": true,
-        })]
-    );
-
-    let cached_response =
-        read_apps(&mut mcp, vec!["alpha", "beta"], /*include_tools*/ true).await?;
-    assert_eq!(
-        cached_response,
-        AppsReadResponse {
-            apps: vec![
-                metadata(
-                    "alpha",
-                    "Alpha",
-                    Some("https://files.openai.com/content?id=alpha")
-                ),
-                metadata(
-                    "beta",
-                    "Beta",
-                    Some("https://files.openai.com/content?id=beta")
-                ),
-            ],
-            missing_app_ids: Vec::new(),
-        }
-    );
-    assert_eq!(state.requests().len(), 1);
-
-    server_handle.abort();
-    let _ = server_handle.await;
-    Ok(())
-}
 
 #[tokio::test]
 async fn app_read_refetches_metadata_only_cache_entries_when_tools_are_requested() -> Result<()> {

@@ -18,15 +18,11 @@ impl AccountRequestProcessor {
         {
             Ok(Ok(details)) => details,
             Ok(Err(err)) => {
-                tracing::warn!(
-                    "failed to fetch rate limit reset credit details; falling back to the usage response: {err}"
-                );
+                tracing::warn!("failed to fetch rate limit reset credit details: {err}");
                 return None;
             }
             Err(_) => {
-                tracing::warn!(
-                    "rate limit reset credit detail request timed out; falling back to the usage response"
-                );
+                tracing::warn!("rate limit reset credit detail request timed out");
                 return None;
             }
         };
@@ -34,9 +30,7 @@ impl AccountRequestProcessor {
         match rate_limit_reset_credits_from_backend(details) {
             Ok(summary) => Some(summary),
             Err(err) => {
-                tracing::warn!(
-                    "failed to parse rate limit reset credit details; falling back to the usage response: {err}"
-                );
+                tracing::warn!("failed to parse rate limit reset credit details: {err}");
                 None
             }
         }
@@ -53,7 +47,7 @@ impl AccountRequestProcessor {
             return Err(invalid_request("creditId must not be empty"));
         }
 
-        let client = self.rate_limit_reset_backend_client().await?;
+        let (client, pool_account_id) = self.rate_limit_reset_backend_client().await?;
         let request_timeout = RATE_LIMIT_RESET_REQUEST_TIMEOUT;
         #[cfg(debug_assertions)]
         let request_timeout = std::env::var(RATE_LIMIT_RESET_REQUEST_TIMEOUT_ENV_VAR)
@@ -78,6 +72,11 @@ impl AccountRequestProcessor {
         .await
         .map_err(|_| internal_error("rate limit reset consume timed out"))?
         .map_err(|err| internal_error(format!("failed to consume rate limit reset: {err}")))?;
+        let reset_applied = matches!(
+            response.code,
+            BackendConsumeRateLimitResetCreditCode::Reset
+                | BackendConsumeRateLimitResetCreditCode::AlreadyRedeemed
+        );
         let outcome = match response.code {
             BackendConsumeRateLimitResetCreditCode::Reset => {
                 ConsumeAccountRateLimitResetCreditOutcome::Reset
@@ -92,13 +91,24 @@ impl AccountRequestProcessor {
                 ConsumeAccountRateLimitResetCreditOutcome::AlreadyRedeemed
             }
         };
+        if reset_applied
+            && let Some(account_id) = pool_account_id.as_deref()
+            && let Err(err) = self
+                .auth_manager
+                .clear_account_pool_rate_limit_cooldown_for(account_id)
+                .await
+        {
+            tracing::warn!(account_id, error = %err, "failed to clear account cooldown after usage limit reset");
+        }
         Ok(Some(
             ConsumeAccountRateLimitResetCreditResponse { outcome }.into(),
         ))
     }
 
-    async fn rate_limit_reset_backend_client(&self) -> Result<BackendClient, JSONRPCErrorError> {
-        let Some(auth) = self.auth_manager.auth().await else {
+    async fn rate_limit_reset_backend_client(
+        &self,
+    ) -> Result<(BackendClient, Option<String>), JSONRPCErrorError> {
+        let Some(auth) = self.auth_manager.chatgpt_account_management_auth().await else {
             return Err(invalid_request(
                 "codex account authentication required for rate limit reset credits",
             ));
@@ -109,7 +119,9 @@ impl AccountRequestProcessor {
             ));
         }
 
+        let pool_account_id = auth.get_pool_account_id();
         BackendClient::from_auth(self.config.chatgpt_base_url.clone(), &auth)
+            .map(|client| (client, pool_account_id))
             .map_err(|err| internal_error(format!("failed to construct backend client: {err}")))
     }
 }

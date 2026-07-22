@@ -101,7 +101,7 @@ fn parse_agent_id(id: &str) -> ThreadId {
 
 fn thread_manager() -> ThreadManager {
     ThreadManager::with_models_provider_for_tests(
-        CodexAuth::from_api_key("dummy"),
+        CodexAuth::create_dummy_chatgpt_auth_for_testing(),
         built_in_model_providers(/* openai_base_url */ /*openai_base_url*/ None)["openai"].clone(),
     )
 }
@@ -2761,7 +2761,7 @@ async fn resume_agent_restores_closed_agent_and_accepts_send_input() {
                 phase: None,
                 internal_chat_message_metadata_passthrough: None,
             })]),
-            AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy")),
+            AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing()),
             /*parent_trace*/ None,
             /*supports_openai_form_elicitation*/ false,
         )
@@ -3081,21 +3081,7 @@ async fn multi_agent_v2_wait_agent_uses_configured_default_timeout() {
     let session = Arc::new(session);
     let turn = Arc::new(turn);
 
-    let early = timeout(
-        Duration::from_millis(/*millis*/ 20),
-        WaitAgentHandlerV2::default().handle(invocation(
-            session.clone(),
-            turn.clone(),
-            "wait_agent",
-            function_payload(json!({})),
-        )),
-    )
-    .await;
-    assert!(
-        early.is_err(),
-        "wait_agent should not return before the configured default timeout"
-    );
-
+    let start = std::time::Instant::now();
     let output = timeout(
         Duration::from_secs(/*secs*/ 1),
         WaitAgentHandlerV2::default().handle(invocation(
@@ -3108,6 +3094,10 @@ async fn multi_agent_v2_wait_agent_uses_configured_default_timeout() {
     .await
     .expect("configured default should be shorter than the test timeout")
     .expect("wait_agent should succeed");
+    assert!(
+        start.elapsed() >= Duration::from_millis(/*millis*/ 20),
+        "wait_agent should not return before the configured default timeout"
+    );
     let (content, success) = expect_text_output(output);
     let result: crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult =
         serde_json::from_str(&content).expect("wait_agent result should be json");
@@ -3326,15 +3316,26 @@ async fn wait_agent_clamps_short_timeouts_to_minimum() {
         })),
     );
 
-    let early = timeout(
-        Duration::from_millis(50),
-        WaitAgentHandler::default().handle(invocation),
-    )
-    .await;
+    let start = std::time::Instant::now();
+    let output = WaitAgentHandler::default()
+        .handle(invocation)
+        .await
+        .expect("wait_agent should succeed");
     assert!(
-        early.is_err(),
+        start.elapsed() >= Duration::from_millis(50),
         "wait_agent should not return before the minimum timeout clamp"
     );
+    let (content, success) = expect_text_output(output);
+    let result: crate::tools::handlers::multi_agents::wait::WaitAgentResult =
+        serde_json::from_str(&content).expect("wait_agent result should be json");
+    assert_eq!(
+        result,
+        crate::tools::handlers::multi_agents::wait::WaitAgentResult {
+            status: HashMap::new(),
+            timed_out: true,
+        }
+    );
+    assert_eq!(success, None);
 
     let _ = thread
         .thread
@@ -3870,7 +3871,7 @@ async fn multi_agent_v2_interrupt_agent_accepts_unloaded_task_name_target() {
         .await
         .expect("sqlite state db should initialize");
     let manager = ThreadManager::with_models_provider_home_and_state_for_tests(
-        CodexAuth::from_api_key("dummy"),
+        CodexAuth::create_dummy_chatgpt_auth_for_testing(),
         config.model_provider.clone(),
         config.codex_home.to_path_buf(),
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
@@ -4196,7 +4197,8 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
         .enable(Feature::Sqlite)
         .expect("test config should allow sqlite");
     let state_db = init_state_db(&config).await;
-    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy"));
+    let auth_manager =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
     let manager = ThreadManager::new(
         &config,
         auth_manager.clone(),

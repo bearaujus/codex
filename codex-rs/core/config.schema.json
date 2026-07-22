@@ -1096,8 +1096,7 @@
     },
     "ForcedLoginMethod": {
       "enum": [
-        "chatgpt",
-        "api"
+        "chatgpt"
       ],
       "type": "string"
     },
@@ -3338,6 +3337,11 @@
         "status_line_use_colors": {
           "default": true,
           "description": "Color status line items with colors derived from the active syntax theme. Defaults to `true`.",
+          "type": "boolean"
+        },
+        "stream_reasoning_live": {
+          "default": false,
+          "description": "Stream agent reasoning chunks live in the TUI instead of buffering them until completion. Defaults to `false`.",
           "type": "boolean"
         },
         "terminal_resize_reflow_max_rows": {

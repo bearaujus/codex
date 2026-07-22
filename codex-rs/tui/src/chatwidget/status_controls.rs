@@ -4,6 +4,9 @@
 //! widget entrypoints that apply status state, open setup views, and update the
 //! history-facing `/status` surface.
 
+use chrono::DateTime;
+use chrono::Utc;
+
 use super::*;
 
 impl ChatWidget {
@@ -263,6 +266,7 @@ impl ChatWidget {
             return;
         }
 
+        self.finish_rate_limit_full_refresh();
         for snapshot in snapshots {
             self.on_rate_limit_snapshot(Some(snapshot));
         }
@@ -393,7 +397,10 @@ impl ChatWidget {
     ) -> Option<String> {
         let window = window?;
         let remaining = (100.0f64 - window.used_percent).clamp(0.0f64, 100.0f64);
-        Some(format!("{label} {remaining:.0}% left"))
+        match window.resets_at_utc.map(format_limit_countdown) {
+            Some(countdown) => Some(format!("{label} {remaining:.0}% left ↻ {countdown}")),
+            None => Some(format!("{label} {remaining:.0}% left")),
+        }
     }
 
     pub(super) fn status_line_reasoning_effort_label(
@@ -403,5 +410,48 @@ impl ChatWidget {
             None | Some(ReasoningEffortConfig::None) => "default".to_string(),
             Some(effort) => effort.as_str().to_string(),
         }
+    }
+}
+
+/// Formats a duration until `resets_at` as a compact countdown string, e.g. `5d 21h`, `4h59m`, or `42m`.
+/// Returns `"soon"` when the timestamp is already in the past or less than a minute away.
+pub(super) fn format_limit_countdown(resets_at: DateTime<Utc>) -> String {
+    let secs = (resets_at - Utc::now()).num_seconds();
+    if secs < 60 {
+        return "soon".to_string();
+    }
+    let total_minutes = secs / 60;
+    let hours = total_minutes / 60;
+    let minutes = total_minutes % 60;
+    let days = hours / 24;
+    let remaining_hours = hours % 24;
+    if days > 0 {
+        format!("{days}d {remaining_hours}h")
+    } else if hours > 0 {
+        format!("{hours}h{minutes:02}m")
+    } else {
+        format!("{minutes}m")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn format_limit_countdown_reports_sub_minute_resets_as_soon() {
+        assert_eq!(
+            format_limit_countdown(Utc::now() + chrono::Duration::seconds(30)),
+            "soon"
+        );
+    }
+
+    #[test]
+    fn format_limit_countdown_reports_minute_scale_resets_compactly() {
+        assert_eq!(
+            format_limit_countdown(Utc::now() + chrono::Duration::seconds(3_930)),
+            "1h05m"
+        );
     }
 }

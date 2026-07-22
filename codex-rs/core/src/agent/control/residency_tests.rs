@@ -27,7 +27,7 @@ async fn residency_slot_reservation_unloads_oldest_idle_v2_agent() {
     config.codex_home = temp_home.path().to_path_buf().try_into().unwrap();
     config.cwd = temp_home.path().to_path_buf().try_into().unwrap();
     let manager = ThreadManager::with_models_provider_and_home_for_tests(
-        CodexAuth::from_api_key("dummy"),
+        CodexAuth::create_dummy_chatgpt_auth_for_testing(),
         config.model_provider.clone(),
         config.codex_home.to_path_buf(),
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
@@ -73,7 +73,7 @@ async fn interrupted_v2_agent_is_lost_after_residency_eviction() {
     config.codex_home = temp_home.path().to_path_buf().try_into().unwrap();
     config.cwd = temp_home.path().to_path_buf().try_into().unwrap();
     let manager = ThreadManager::with_models_provider_and_home_for_tests(
-        CodexAuth::from_api_key("dummy"),
+        CodexAuth::create_dummy_chatgpt_auth_for_testing(),
         config.model_provider.clone(),
         config.codex_home.to_path_buf(),
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),

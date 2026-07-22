@@ -1446,11 +1446,21 @@ async fn completed_token_activity_refresh_waits_for_active_stream() {
     );
 
     chat.finalize_turn();
-    assert!(!chat.usage_history_insertion_blocked());
+    assert!(chat.usage_history_insertion_blocked());
+    let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
     assert!(
-        std::iter::from_fn(|| rx.try_recv().ok())
+        events
+            .iter()
+            .any(|event| matches!(event, AppEvent::ConsolidateAgentMessage { .. }))
+    );
+    assert!(
+        events
+            .iter()
             .any(|event| matches!(event, AppEvent::CommitPendingUsageOutputAfterStreamShutdown))
     );
+
+    chat.note_stream_consolidation_completed();
+    assert!(!chat.usage_history_insertion_blocked());
     assert!(chat.take_completed_token_activity_output().is_some());
 }
 
@@ -1690,15 +1700,6 @@ async fn slash_quit_requests_exit() {
     chat.dispatch_command(SlashCommand::Quit);
 
     assert_matches!(rx.try_recv(), Ok(AppEvent::Exit(ExitMode::ShutdownFirst)));
-}
-
-#[tokio::test]
-async fn slash_logout_requests_app_server_logout() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-
-    chat.dispatch_command(SlashCommand::Logout);
-
-    assert_matches!(rx.try_recv(), Ok(AppEvent::Logout));
 }
 
 #[tokio::test]

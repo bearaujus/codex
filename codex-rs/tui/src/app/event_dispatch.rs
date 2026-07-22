@@ -366,6 +366,24 @@ impl App {
                 self.chat_widget.note_stream_consolidation_completed();
                 self.insert_pending_usage_output_after_stream_shutdown(tui);
             }
+            AppEvent::ConsolidateReasoning(source) => {
+                let end = self.transcript_cells.len();
+                let start =
+                    trailing_run_start::<history_cell::ReasoningStreamCell>(&self.transcript_cells);
+                if start < end {
+                    let consolidated: Arc<dyn HistoryCell> = Arc::new(
+                        history_cell::ReasoningMarkdownCell::new(source, &self.config.cwd),
+                    );
+                    self.transcript_cells
+                        .splice(start..end, std::iter::once(consolidated.clone()));
+                    if let Some(Overlay::Transcript(t)) = &mut self.overlay {
+                        t.consolidate_cells(start..end, consolidated.clone());
+                        tui.frame_requester().schedule_frame();
+                    }
+                }
+                self.chat_widget.note_stream_consolidation_completed();
+                self.insert_pending_usage_output_after_stream_shutdown(tui);
+            }
             AppEvent::StartCommitAnimation => {
                 if self
                     .commit_anim_running
@@ -394,19 +412,6 @@ impl App {
                 }
                 return Ok(self.handle_exit_mode(app_server, mode).await);
             }
-            AppEvent::Logout => match app_server.logout_account().await {
-                Ok(()) => {
-                    self.show_shutdown_feedback(tui)?;
-                    return Ok(self
-                        .handle_exit_mode(app_server, ExitMode::ShutdownFirst)
-                        .await);
-                }
-                Err(err) => {
-                    tracing::error!("failed to logout: {err}");
-                    self.chat_widget
-                        .add_error_message(format!("Logout failed: {err}"));
-                }
-            },
             AppEvent::FatalExitRequest(message) => {
                 return Ok(AppRunControl::Exit(ExitReason::Fatal(message)));
             }
@@ -868,13 +873,12 @@ impl App {
             }
             AppEvent::RateLimitsLoaded {
                 origin,
-                hard_stop_generation,
+                update_generation,
                 result,
             } => match result {
                 Ok(response) => {
                     let rate_limit_reset_credits = response.rate_limit_reset_credits.clone();
-                    let snapshots = if hard_stop_generation == self.rate_limit_hard_stop_generation
-                    {
+                    let snapshots = if update_generation == self.rate_limit_update_generation {
                         app_server_rate_limit_snapshots(response)
                     } else {
                         Vec::new()

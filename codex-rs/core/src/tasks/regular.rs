@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
+use crate::session::AccountPoolActivityHeartbeat;
 use crate::session::TurnInput;
 use crate::session::turn::run_turn;
 use crate::session::turn_context::TurnContext;
@@ -70,8 +71,13 @@ impl SessionTask for RegularTask {
         };
         let mut next_input = input;
         let mut prewarmed_client_session = prewarmed_client_session;
+        let account_pool_activity_heartbeat = AccountPoolActivityHeartbeat::start(
+            Arc::clone(&sess.services.auth_manager),
+            &cancellation_token,
+        )
+        .await;
         loop {
-            let last_agent_message = run_turn(
+            let turn_result = run_turn(
                 Arc::clone(&sess),
                 Arc::clone(&ctx),
                 Arc::clone(&turn_extension_data),
@@ -81,10 +87,46 @@ impl SessionTask for RegularTask {
             )
             .instrument(run_turn_span.clone())
             .await?;
-            if !sess.input_queue.has_pending_input(&sess.active_turn).await {
+            if sess.input_queue.has_pending_input(&sess.active_turn).await {
+                next_input = Vec::new();
+                continue;
+            }
+
+            let last_agent_message = turn_result.last_agent_message;
+            if !turn_result.completed_successfully {
+                account_pool_activity_heartbeat.shutdown().await;
                 return Ok(last_agent_message);
             }
-            next_input = Vec::new();
+            let Some(serving_account_id) = turn_result.serving_account_id else {
+                account_pool_activity_heartbeat.shutdown().await;
+                return Ok(last_agent_message);
+            };
+
+            sess.services
+                .auth_manager
+                .record_pool_account_activity_for(&serving_account_id)
+                .await;
+
+            // A logical protocol turn can call `run_turn` more than once while
+            // draining steering input. Read the service-owned cache only after
+            // the outer task is truly complete, and bind the detached result to
+            // the account that served its final sampling request.
+            let probe_sess = Arc::clone(&sess);
+            let probe_turn_context = Arc::clone(&ctx);
+            tokio::spawn(async move {
+                let probe = probe_sess
+                    .services
+                    .auth_manager
+                    .load_cached_rate_limits_post_turn(&serving_account_id)
+                    .await;
+                for snapshot in probe.snapshots {
+                    probe_sess
+                        .update_rate_limits(&probe_turn_context, snapshot)
+                        .await;
+                }
+                account_pool_activity_heartbeat.shutdown().await;
+            });
+            return Ok(last_agent_message);
         }
     }
 }

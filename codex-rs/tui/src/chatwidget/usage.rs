@@ -85,6 +85,7 @@ impl ChatWidget {
             return;
         }
         self.pending_usage_menu_rate_limit_request_id = None;
+        self.finish_rate_limit_full_refresh();
         for snapshot in snapshots {
             self.on_rate_limit_snapshot(Some(snapshot));
         }
@@ -131,6 +132,7 @@ impl ChatWidget {
             return false;
         }
         self.pending_rate_limit_reset_request_id = None;
+        self.finish_rate_limit_full_refresh();
         for snapshot in snapshots {
             self.on_rate_limit_snapshot(Some(snapshot));
         }
@@ -444,6 +446,7 @@ impl ChatWidget {
             return false;
         }
         self.pending_rate_limit_reset_request_id = None;
+        self.finish_rate_limit_full_refresh();
         for snapshot in snapshots {
             self.on_rate_limit_snapshot(Some(snapshot));
         }
@@ -504,6 +507,7 @@ impl ChatWidget {
             return false;
         }
         self.pending_rate_limit_reset_hint_request_id = None;
+        self.finish_rate_limit_full_refresh();
         for snapshot in snapshots {
             self.on_rate_limit_snapshot(Some(snapshot));
         }

@@ -358,7 +358,6 @@ async fn start_in_process_client(
         environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
         config_warnings: Vec::new(),
         session_source: SessionSource::Cli,
-        enable_codex_api_key_env: false,
         initialize: InitializeParams {
             client_info: ClientInfo {
                 name: "codex-app-server-tests".to_string(),
@@ -429,6 +428,10 @@ fn assert_no_local_persistence_artifacts(codex_home: &Path) -> Result<()> {
     // That is not thread persistence; keep the assertion focused on rollout,
     // session, sqlite, and other unexpected thread-store artifacts.
     entries.remove("shell_snapshots");
+    // Opening AuthManager initializes the ChatGPT account-pool DB directory even
+    // when no ChatGPT credentials are present. That is auth infrastructure, not
+    // thread persistence.
+    entries.remove("account-pool");
     assert_eq!(
         entries,
         BTreeSet::from([

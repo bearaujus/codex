@@ -1,15 +1,8 @@
 use codex_config::ConfigLayerStack;
-use codex_config::types::AuthCredentialsStoreMode;
 use codex_core::ModelClient;
-use codex_core::NewThread;
 use codex_core::Prompt;
 use codex_core::ResponseEvent;
-use codex_core::ThreadManager;
-use codex_core::resolve_installation_id;
-use codex_core::thread_store_from_config;
-use codex_extension_api::empty_extension_registry;
 use codex_features::Feature;
-use codex_login::AuthKeyringBackendKind;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::auth::AgentIdentityAuthPolicy;
@@ -639,58 +632,6 @@ async fn response_item_ids_are_sent_for_all_remote_v2_compaction_requests() -> a
     Ok(())
 }
 
-/// Writes an `auth.json` into the provided `codex_home` with the specified parameters.
-/// Returns the fake JWT string written to `tokens.id_token`.
-#[expect(clippy::unwrap_used)]
-fn write_auth_json(
-    codex_home: &TempDir,
-    openai_api_key: Option<&str>,
-    chatgpt_plan_type: &str,
-    access_token: &str,
-    account_id: Option<&str>,
-) -> String {
-    use base64::Engine as _;
-
-    let header = json!({ "alg": "none", "typ": "JWT" });
-    let payload = json!({
-        "email": "user@example.com",
-        "https://api.openai.com/auth": {
-            "chatgpt_plan_type": chatgpt_plan_type,
-            "chatgpt_account_id": account_id.unwrap_or("acc-123")
-        }
-    });
-
-    let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
-    let header_b64 = b64(&serde_json::to_vec(&header).unwrap());
-    let payload_b64 = b64(&serde_json::to_vec(&payload).unwrap());
-    let signature_b64 = b64(b"sig");
-    let fake_jwt = format!("{header_b64}.{payload_b64}.{signature_b64}");
-
-    let mut tokens = json!({
-        "id_token": fake_jwt,
-        "access_token": access_token,
-        "refresh_token": "refresh-test",
-    });
-    if let Some(acc) = account_id {
-        tokens["account_id"] = json!(acc);
-    }
-
-    let auth_json = json!({
-        "OPENAI_API_KEY": openai_api_key,
-        "tokens": tokens,
-        // RFC3339 datetime; value doesn't matter for these tests
-        "last_refresh": chrono::Utc::now(),
-    });
-
-    std::fs::write(
-        codex_home.path().join("auth.json"),
-        serde_json::to_string_pretty(&auth_json).unwrap(),
-    )
-    .unwrap();
-
-    fake_jwt
-}
-
 struct ProviderAuthCommandFixture {
     tempdir: TempDir,
     command: String,
@@ -1293,7 +1234,7 @@ async fn includes_session_id_thread_id_and_model_headers_in_request() {
     )
     .await;
 
-    let mut builder = test_codex().with_auth(CodexAuth::from_api_key("Test API Key"));
+    let mut builder = test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing());
     let test = builder
         .build(&server)
         .await
@@ -1336,7 +1277,7 @@ async fn includes_session_id_thread_id_and_model_headers_in_request() {
     assert_eq!(request_session_id, session_id_string.as_str());
     assert_eq!(request_thread_id, thread_id_string.as_str());
     assert_eq!(request_originator, originator().value);
-    assert_eq!(request_authorization, "Bearer Test API Key");
+    assert_eq!(request_authorization, "Bearer Access Token");
     assert_eq!(
         request_body["prompt_cache_key"].as_str(),
         Some(session_id_string.as_str())
@@ -1491,9 +1432,9 @@ async fn send_request_with_provider(provider: ModelProviderInfo) {
         SessionSource::Exec,
     );
     let client = ModelClient::new(
-        Some(AuthManager::from_auth_for_testing(CodexAuth::from_api_key(
-            "unused-api-key",
-        ))),
+        Some(AuthManager::from_auth_for_testing(
+            CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+        )),
         AgentIdentityAuthPolicy::JwtOnly,
         thread_id,
         provider,
@@ -1557,7 +1498,7 @@ async fn includes_base_instructions_override_in_request() {
     .await;
 
     let mut builder = test_codex()
-        .with_auth(CodexAuth::from_api_key("Test API Key"))
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_config(|config| {
             config.base_instructions = Some("test instructions".to_string());
         });
@@ -1678,102 +1619,6 @@ async fn chatgpt_auth_sends_correct_request() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn prefers_apikey_when_config_prefers_apikey_even_with_chatgpt_tokens() {
-    skip_if_no_network!();
-
-    // Mock server
-    let server = MockServer::start().await;
-
-    let first = ResponseTemplate::new(200)
-        .insert_header("content-type", "text/event-stream")
-        .set_body_raw(
-            sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
-            "text/event-stream",
-        );
-
-    // Expect API key header, no ChatGPT account header required.
-    Mock::given(method("POST"))
-        .and(path("/v1/responses"))
-        .and(header_regex("Authorization", r"Bearer sk-test-key"))
-        .respond_with(first)
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let model_provider = ModelProviderInfo {
-        base_url: Some(format!("{}/v1", server.uri())),
-        supports_websockets: false,
-        ..built_in_model_providers(/* openai_base_url */ /*openai_base_url*/ None)["openai"].clone()
-    };
-
-    // Init session
-    let codex_home = TempDir::new().unwrap();
-    // Write auth.json that contains both API key and ChatGPT tokens for a plan that should prefer ChatGPT,
-    // but config will force API key preference.
-    let _jwt = write_auth_json(
-        &codex_home,
-        Some("sk-test-key"),
-        "pro",
-        "Access-123",
-        Some("acc-123"),
-    );
-
-    let mut config = load_default_config_for_test(&codex_home).await;
-    config.model_provider = model_provider;
-
-    let auth = CodexAuth::from_auth_storage(
-        codex_home.path(),
-        AuthCredentialsStoreMode::File,
-        /*chatgpt_base_url*/ None,
-        AuthKeyringBackendKind::default(),
-        /*auth_route_config*/ None,
-    )
-    .await
-    .expect("Failed to load CodexAuth")
-    .expect("No CodexAuth found in codex_home");
-    let auth_manager = codex_core::test_support::auth_manager_from_auth(auth);
-    let installation_id = resolve_installation_id(&config.codex_home)
-        .await
-        .expect("resolve installation id");
-    let thread_manager = ThreadManager::new(
-        &config,
-        auth_manager.clone(),
-        codex_core::build_models_manager(&config, auth_manager),
-        codex_core::CodexAppsToolsCache::default(),
-        SessionSource::Exec,
-        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
-        empty_extension_registry(),
-        Arc::new(codex_core::test_support::EmptyUserInstructionsProvider),
-        /*analytics_events_client*/ None,
-        thread_store_from_config(&config, /*state_db*/ None),
-        /*agent_graph_store*/ None,
-        installation_id,
-        /*attestation_provider*/ None,
-        /*external_time_provider*/ None,
-    );
-    let NewThread { thread: codex, .. } = thread_manager
-        .start_thread(config.clone())
-        .await
-        .expect("create new conversation");
-
-    codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
-        .await
-        .unwrap();
-
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn includes_user_instructions_message_in_request() {
     skip_if_no_network!();
     let server = MockServer::start().await;
@@ -1785,7 +1630,7 @@ async fn includes_user_instructions_message_in_request() {
     .await;
 
     let mut builder = test_codex()
-        .with_auth(CodexAuth::from_api_key("Test API Key"))
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_pre_build_hook(|home| {
             std::fs::write(home.join("AGENTS.md"), "be nice").expect("write global instructions");
         });
@@ -1918,64 +1763,6 @@ async fn includes_apps_guidance_as_developer_message_for_chatgpt_auth() {
     assert!(
         !message_input_text_contains(&request, "user", apps_snippet),
         "did not expect apps guidance in user messages, got {:?}",
-        request.body_json()["input"]
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn omits_apps_guidance_for_api_key_auth_even_when_feature_enabled() {
-    skip_if_no_network!();
-    let server = MockServer::start().await;
-    let apps_server = AppsTestServer::mount(&server)
-        .await
-        .expect("mount apps MCP mock");
-    let apps_base_url = apps_server.chatgpt_base_url.clone();
-
-    let resp_mock = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
-    )
-    .await;
-
-    let mut builder = test_codex()
-        .with_auth(CodexAuth::from_api_key("Test API Key"))
-        .with_config(move |config| {
-            config
-                .features
-                .enable(Feature::Apps)
-                .expect("test config should allow feature update");
-            config.chatgpt_base_url = apps_base_url;
-        });
-    let codex = builder
-        .build(&server)
-        .await
-        .expect("create new conversation")
-        .codex;
-
-    codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "hello".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
-        .await
-        .unwrap();
-
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-
-    let request = resp_mock.single_request();
-    let apps_snippet =
-        "Apps (Connectors) can be explicitly triggered in user messages in the format";
-
-    assert!(
-        !message_input_text_contains(&request, "developer", apps_snippet)
-            && !message_input_text_contains(&request, "user", apps_snippet),
-        "did not expect apps guidance for API key auth, got {:?}",
         request.body_json()["input"]
     );
 }
@@ -2217,7 +2004,7 @@ async fn skills_append_to_developer_message() {
     let codex_home_path = codex_home.path().to_path_buf();
     let mut builder = test_codex()
         .with_home(codex_home.clone())
-        .with_auth(CodexAuth::from_api_key("Test API Key"))
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_config(move |config| {
             config.cwd = codex_home_path.abs();
         });
@@ -2294,7 +2081,7 @@ async fn skills_use_aliases_in_developer_message_under_budget_pressure() {
     let codex_home_path = codex_home.path().to_path_buf();
     let mut builder = test_codex()
         .with_home(codex_home.clone())
-        .with_auth(CodexAuth::from_api_key("Test API Key"))
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_config(move |config| {
             config.cwd = codex_home_path.abs();
             let user_config_path = codex_home_path.join("config.toml").abs();
@@ -3083,7 +2870,7 @@ async fn includes_developer_instructions_message_in_request() {
     )
     .await;
     let mut builder = test_codex()
-        .with_auth(CodexAuth::from_api_key("Test API Key"))
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_pre_build_hook(|home| {
             std::fs::write(home.join("AGENTS.md"), "be nice").expect("write global instructions");
         })
@@ -3208,8 +2995,9 @@ async fn azure_responses_request_includes_store_and_prefixed_item_ids() {
     let model_info =
         codex_core::test_support::construct_model_info_offline(model.as_str(), &config);
     let thread_id = ThreadId::new();
-    let auth_manager =
-        codex_core::test_support::auth_manager_from_auth(CodexAuth::from_api_key("Test API Key"));
+    let auth_manager = codex_core::test_support::auth_manager_from_auth(
+        CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+    );
     let session_telemetry = SessionTelemetry::new(
         thread_id,
         model.as_str(),
@@ -3412,7 +3200,7 @@ async fn token_count_includes_rate_limits_snapshot() {
     provider.supports_websockets = false;
 
     let mut builder = test_codex()
-        .with_auth(CodexAuth::from_api_key("test"))
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_config(move |config| {
             config.model_provider = provider;
         });
@@ -4004,7 +3792,7 @@ async fn history_dedupes_streamed_and_final_messages_across_turns() {
 
     let request_log = mount_sse_sequence(&server, vec![sse1.clone(), sse1.clone(), sse1]).await;
 
-    let mut builder = test_codex().with_auth(CodexAuth::from_api_key("Test API Key"));
+    let mut builder = test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing());
     let codex = builder
         .build(&server)
         .await

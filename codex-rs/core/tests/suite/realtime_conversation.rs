@@ -3,6 +3,7 @@ use anyhow::Result;
 use chrono::Utc;
 use codex_config::config_toml::RealtimeWsVersion;
 use codex_core::test_support::auth_manager_from_auth;
+use codex_login::AuthHeaders;
 use codex_login::CodexAuth;
 use codex_login::OPENAI_API_KEY_ENV_VAR;
 use codex_protocol::ThreadId;
@@ -377,7 +378,7 @@ async fn conversation_start_audio_text_close_round_trip() -> Result<()> {
     );
     assert_eq!(
         server.handshakes()[1].header("authorization").as_deref(),
-        Some("Bearer dummy")
+        Some("Bearer Access Token")
     );
     assert_eq!(
         server.handshakes()[1].uri(),
@@ -598,7 +599,7 @@ async fn conversation_webrtc_start_posts_generated_session() -> Result<()> {
             .headers
             .get("authorization")
             .and_then(|value| value.to_str().ok()),
-        Some("Bearer dummy")
+        Some("Bearer Access Token")
     );
     assert_eq!(
         request
@@ -662,7 +663,7 @@ async fn conversation_webrtc_start_posts_generated_session() -> Result<()> {
     );
     assert_eq!(
         handshake.header("authorization").as_deref(),
-        Some("Bearer dummy")
+        Some("Bearer Access Token")
     );
 
     test.codex.submit(Op::RealtimeConversationClose).await?;
@@ -775,7 +776,7 @@ async fn conversation_webrtc_start_uses_avas_query() -> Result<()> {
     );
     assert_eq!(
         handshake.header("authorization").as_deref(),
-        Some("Bearer dummy")
+        Some("Bearer Access Token")
     );
 
     test.codex.submit(Op::RealtimeConversationClose).await?;
@@ -1012,7 +1013,7 @@ async fn conversation_webrtc_start_uses_configured_call_base_url_for_avas() -> R
     );
     assert_eq!(
         handshake.header("authorization").as_deref(),
-        Some("Bearer dummy")
+        Some("Bearer Access Token")
     );
 
     test.codex.submit(Op::RealtimeConversationClose).await?;
@@ -1215,10 +1216,10 @@ async fn conversation_webrtc_sideband_connect_failure_closes_with_error() -> Res
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn conversation_start_uses_openai_env_key_fallback_with_chatgpt_auth() -> Result<()> {
+async fn conversation_start_prefers_chatgpt_auth_over_openai_env_key() -> Result<()> {
     if std::env::var_os(REALTIME_CONVERSATION_TEST_SUBPROCESS_ENV_VAR).is_none() {
         return run_realtime_conversation_test_in_subprocess(
-            "suite::realtime_conversation::conversation_start_uses_openai_env_key_fallback_with_chatgpt_auth",
+            "suite::realtime_conversation::conversation_start_prefers_chatgpt_auth_over_openai_env_key",
             Some("env-realtime-key"),
         );
     }
@@ -1286,7 +1287,7 @@ async fn conversation_start_uses_openai_env_key_fallback_with_chatgpt_auth() -> 
 
     assert_eq!(
         server.handshakes()[1].header("authorization").as_deref(),
-        Some("Bearer env-realtime-key")
+        Some("Bearer Access Token")
     );
 
     test.codex.submit(Op::RealtimeConversationClose).await?;
@@ -1452,7 +1453,8 @@ async fn conversation_start_preflight_failure_emits_realtime_error_only() -> Res
     skip_if_no_network!(Ok(()));
 
     let server = start_websocket_server(vec![]).await;
-    let mut builder = test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    let mut builder =
+        test_codex().with_auth(CodexAuth::Headers(AuthHeaders::new(Default::default())));
     let test = builder.build_with_websocket_server(&server).await?;
 
     test.codex
@@ -1482,7 +1484,10 @@ async fn conversation_start_preflight_failure_emits_realtime_error_only() -> Res
         _ => None,
     })
     .await;
-    assert_eq!(err, "realtime conversation requires API key auth");
+    assert_eq!(
+        err,
+        "realtime conversation requires ChatGPT or provider API authentication"
+    );
 
     let closed = timeout(Duration::from_millis(200), async {
         wait_for_event_match(&test.codex, |msg| match msg {
@@ -2481,7 +2486,7 @@ async fn conversation_startup_context_current_thread_selects_many_turns_by_budge
         .resume_thread_with_history(
             test.config.clone(),
             InitialHistory::Forked(history),
-            auth_manager_from_auth(CodexAuth::from_api_key("dummy")),
+            auth_manager_from_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing()),
             /*parent_trace*/ None,
             /*supports_openai_form_elicitation*/ false,
         )

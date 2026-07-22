@@ -35,7 +35,6 @@ use codex_app_server_protocol::GetAccountParams;
 use codex_app_server_protocol::GetAccountRateLimitsResponse;
 use codex_app_server_protocol::GetAccountResponse;
 use codex_app_server_protocol::JSONRPCErrorError;
-use codex_app_server_protocol::LogoutAccountResponse;
 use codex_app_server_protocol::MemoryResetResponse;
 use codex_app_server_protocol::Model as ApiModel;
 use codex_app_server_protocol::ModelListParams;
@@ -359,14 +358,6 @@ impl AppServerSession {
             feedback_audience,
             has_chatgpt_account,
         ) = match account.account {
-            Some(Account::ApiKey {}) => (
-                None,
-                Some(TelemetryAuthMode::ApiKey),
-                Some(StatusAccountDisplay::ApiKey),
-                None,
-                FeedbackAudience::External,
-                false,
-            ),
             Some(Account::Chatgpt { email, plan_type }) => {
                 let feedback_audience = if email
                     .as_deref()
@@ -387,9 +378,6 @@ impl AppServerSession {
                     feedback_audience,
                     true,
                 )
-            }
-            Some(Account::AmazonBedrock { .. }) => {
-                (None, None, None, None, FeedbackAudience::External, false)
             }
             None => (None, None, None, None, FeedbackAudience::External, false),
         };
@@ -1084,19 +1072,6 @@ impl AppServerSession {
             .wrap_err("thread/goal/clear failed in TUI")
     }
 
-    pub(crate) async fn logout_account(&mut self) -> Result<()> {
-        let request_id = self.next_request_id();
-        let _: LogoutAccountResponse = self
-            .client
-            .request_typed(ClientRequest::LogoutAccount {
-                request_id,
-                params: None,
-            })
-            .await
-            .wrap_err("account/logout failed in TUI")?;
-        Ok(())
-    }
-
     pub(crate) async fn thread_unsubscribe(&mut self, thread_id: ThreadId) -> Result<()> {
         let request_id = self.next_request_id();
         let _: ThreadUnsubscribeResponse = self
@@ -1289,18 +1264,16 @@ pub(crate) async fn start_thread_with_request_handle(
 pub(crate) fn status_account_display_from_auth_mode(
     auth_mode: Option<AuthMode>,
     plan_type: Option<codex_protocol::account::PlanType>,
+    account_email: Option<String>,
 ) -> Option<StatusAccountDisplay> {
     match auth_mode {
-        Some(AuthMode::ApiKey) => Some(StatusAccountDisplay::ApiKey),
-        Some(AuthMode::Chatgpt)
-        | Some(AuthMode::ChatgptAuthTokens)
-        | Some(AuthMode::AgentIdentity)
-        | Some(AuthMode::PersonalAccessToken) => Some(StatusAccountDisplay::ChatGpt {
-            email: None,
-            plan: plan_type.map(plan_type_display_name),
-        }),
-        Some(AuthMode::Headers) | Some(AuthMode::BedrockApiKey) => None,
-        None => None,
+        Some(AuthMode::Chatgpt) | Some(AuthMode::AgentIdentity) => {
+            Some(StatusAccountDisplay::ChatGpt {
+                email: account_email,
+                plan: plan_type.map(plan_type_display_name),
+            })
+        }
+        Some(AuthMode::Headers) | None => None,
     }
 }
 
@@ -2906,6 +2879,7 @@ mod tests {
         let business = status_account_display_from_auth_mode(
             Some(AuthMode::Chatgpt),
             Some(codex_protocol::account::PlanType::EnterpriseCbpUsageBased),
+            /*account_email*/ None,
         );
         assert!(matches!(
             business,
@@ -2918,6 +2892,7 @@ mod tests {
         let team = status_account_display_from_auth_mode(
             Some(AuthMode::Chatgpt),
             Some(codex_protocol::account::PlanType::SelfServeBusinessUsageBased),
+            /*account_email*/ None,
         );
         assert!(matches!(
             team,

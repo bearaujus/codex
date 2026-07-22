@@ -564,7 +564,6 @@ where
         config_warnings,
         session_source: serde_json::from_value(serde_json::json!("cli"))
             .unwrap_or_else(|err| panic!("cli session source should deserialize: {err}")),
-        enable_codex_api_key_env: false,
         client_name: "codex-tui".to_string(),
         client_version: env!("CARGO_PKG_VERSION").to_string(),
         experimental_api: true,
@@ -1030,7 +1029,6 @@ pub async fn run_main(
     )?;
     let cloud_config_bundle = cloud_config_bundle_loader_for_storage(
         codex_home.to_path_buf(),
-        /*enable_codex_api_key_env*/ false,
         bootstrap_config_toml
             .cli_auth_credentials_store
             .unwrap_or_default(),
@@ -1410,6 +1408,16 @@ async fn run_ratatui_app(
     } else {
         LoginStatus::NotAuthenticated
     };
+    if requires_external_cli_auth(login_status, &initial_config) {
+        shutdown_app_server_if_present(app_server.take()).await;
+        terminal_restore_guard.restore_silently();
+        session_log::log_session_end();
+        #[allow(clippy::print_stderr)]
+        {
+            eprintln!("{}", external_cli_auth_message());
+        }
+        std::process::exit(1);
+    }
     let should_show_onboarding =
         should_show_onboarding(login_status, &initial_config, should_show_trust_screen_flag);
 
@@ -1456,7 +1464,6 @@ async fn run_ratatui_app(
         if show_login_screen && !uses_remote_workspace {
             cloud_config_bundle = cloud_config_bundle_loader_for_storage(
                 initial_config.codex_home.to_path_buf(),
-                /*enable_codex_api_key_env*/ false,
                 initial_config.cli_auth_credentials_store_mode,
                 initial_config.auth_keyring_backend_kind(),
                 initial_config.chatgpt_base_url.clone(),
@@ -1892,9 +1899,7 @@ async fn get_login_status(
 
     let account = app_server.read_account().await?;
     Ok(match account.account {
-        Some(AppServerAccount::ApiKey {}) => LoginStatus::AuthMode(AuthMode::ApiKey),
         Some(AppServerAccount::Chatgpt { .. }) => LoginStatus::AuthMode(AuthMode::Chatgpt),
-        Some(AppServerAccount::AmazonBedrock { .. }) => LoginStatus::NotAuthenticated,
         None => LoginStatus::NotAuthenticated,
     })
 }
@@ -2001,14 +2006,17 @@ fn should_show_onboarding(
     should_show_login_screen(login_status, config)
 }
 
-fn should_show_login_screen(login_status: LoginStatus, config: &Config) -> bool {
-    // Only show the login screen for providers that actually require OpenAI auth
-    // (OpenAI or equivalents). For OSS/other providers, skip login entirely.
-    if !config.model_provider.requires_openai_auth {
-        return false;
-    }
+fn requires_external_cli_auth(login_status: LoginStatus, config: &Config) -> bool {
+    config.model_provider.requires_openai_auth && login_status == LoginStatus::NotAuthenticated
+}
 
-    login_status == LoginStatus::NotAuthenticated
+fn external_cli_auth_message() -> &'static str {
+    "No Codex credentials are configured. This CLI build cannot sign in or sign out. Configure ChatGPT through app-server OAuth or device-code login, or ask your administrator to provision managed auth, then restart Codex."
+}
+
+fn should_show_login_screen(_login_status: LoginStatus, _config: &Config) -> bool {
+    // Interactive auth mutation is intentionally disabled in this CLI build.
+    false
 }
 
 #[cfg(test)]

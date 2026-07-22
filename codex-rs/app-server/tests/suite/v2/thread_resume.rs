@@ -60,7 +60,6 @@ use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_core::ARCHIVED_SESSIONS_SUBDIR;
-use codex_login::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
@@ -3977,14 +3976,6 @@ async fn thread_resume_surfaces_cloud_config_bundle_load_errors() -> Result<()> 
         )
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/oauth/token"))
-        .respond_with(ResponseTemplate::new(401).set_body_json(json!({
-            "error": { "code": "refresh_token_invalidated" }
-        })))
-        .mount(&server)
-        .await;
-
     let codex_home = TempDir::new()?;
     let model_server = create_mock_responses_server_repeating_assistant("Done").await;
     let chatgpt_base_url = format!("{}/backend-api", server.uri());
@@ -4012,16 +4003,9 @@ async fn thread_resume_surfaces_cloud_config_bundle_load_errors() -> Result<()> 
         Some("mock_provider"),
         /*git_info*/ None,
     )?;
-    let refresh_token_url = format!("{}/oauth/token", server.uri());
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .with_env_overrides(&[
-            ("OPENAI_API_KEY", None),
-            (
-                REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR,
-                Some(refresh_token_url.as_str()),
-            ),
-        ])
+        .with_env_overrides(&[("OPENAI_API_KEY", None)])
         .build()
         .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
@@ -4043,14 +4027,15 @@ async fn thread_resume_surfaces_cloud_config_bundle_load_errors() -> Result<()> 
         "unexpected error message: {}",
         err.error.message
     );
+    // Pool-managed ChatGPT auth does not call OAuth from the CLI, so a cloud
+    // config 401 surfaces as RequestFailed rather than Auth/relogin.
     assert_eq!(
         err.error.data,
         Some(json!({
             "reason": "cloudConfigBundle",
-            "errorCode": "Auth",
-            "action": "relogin",
+            "errorCode": "RequestFailed",
             "statusCode": 401,
-            "detail": "Your access token could not be refreshed because your refresh token was revoked. Please log out and sign in again.",
+            "detail": "Failed to load cloud config bundle (workspace-managed policies).",
         }))
     );
 

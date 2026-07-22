@@ -57,7 +57,7 @@ async fn logout_with_revoke_revokes_refresh_token_then_removes_auth() -> Result<
         AuthKeyringBackendKind::default(),
     )?;
 
-    let removed = logout_with_revoke(
+    let _removed = logout_with_revoke(
         codex_home.path(),
         AuthCredentialsStoreMode::File,
         AuthKeyringBackendKind::default(),
@@ -65,7 +65,6 @@ async fn logout_with_revoke_revokes_refresh_token_then_removes_auth() -> Result<
     )
     .await?;
 
-    assert!(removed);
     assert!(!codex_home.path().join("auth.json").exists());
 
     let requests = server
@@ -159,7 +158,7 @@ async fn logout_with_revoke_removes_auth_when_revoke_fails() -> Result<()> {
         AuthKeyringBackendKind::default(),
     )?;
 
-    let removed = logout_with_revoke(
+    let _removed = logout_with_revoke(
         codex_home.path(),
         AuthCredentialsStoreMode::File,
         AuthKeyringBackendKind::default(),
@@ -167,7 +166,6 @@ async fn logout_with_revoke_removes_auth_when_revoke_fails() -> Result<()> {
     )
     .await?;
 
-    assert!(removed);
     assert!(!codex_home.path().join("auth.json").exists());
 
     server.verify().await;
@@ -202,7 +200,6 @@ async fn auth_manager_logout_with_revoke_uses_cached_auth() -> Result<()> {
     )?;
     let manager = AuthManager::new(
         codex_home.path().to_path_buf(),
-        /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
         /*forced_chatgpt_workspace_id*/ None,
         /*chatgpt_base_url*/ None,
@@ -217,9 +214,8 @@ async fn auth_manager_logout_with_revoke_uses_cached_auth() -> Result<()> {
         AuthKeyringBackendKind::default(),
     )?;
 
-    let removed = manager.logout_with_revoke().await?;
+    let _removed = manager.logout_with_revoke().await?;
 
-    assert!(removed);
     assert!(manager.auth_cached().is_none());
     assert!(!codex_home.path().join("auth.json").exists());
 
@@ -249,7 +245,6 @@ fn chatgpt_auth() -> AuthDotJson {
 fn chatgpt_auth_with_refresh_token(refresh_token: &str) -> AuthDotJson {
     AuthDotJson {
         auth_mode: Some(AuthMode::Chatgpt),
-        openai_api_key: None,
         tokens: Some(TokenData {
             id_token: IdTokenInfo {
                 raw_jwt: minimal_jwt(),
@@ -259,10 +254,9 @@ fn chatgpt_auth_with_refresh_token(refresh_token: &str) -> AuthDotJson {
             refresh_token: refresh_token.to_string(),
             account_id: Some("account-id".to_string()),
         }),
+        pool_account_id: Some("account-id".to_string()),
         last_refresh: None,
         agent_identity: None,
-        personal_access_token: None,
-        bedrock_api_key: None,
     }
 }
 

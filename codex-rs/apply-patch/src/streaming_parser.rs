@@ -10,6 +10,7 @@ use crate::parser::EOF_MARKER;
 use crate::parser::Hunk;
 use crate::parser::MOVE_TO_MARKER;
 use crate::parser::ParseError;
+use crate::parser::REPLACE_FILE_MARKER;
 use crate::parser::UPDATE_FILE_MARKER;
 use crate::parser::UpdateFileChunk;
 
@@ -39,6 +40,7 @@ enum StreamingParserMode {
     StartedPatch,
     AddFile,
     DeleteFile,
+    ReplaceFile,
     UpdateFile {
         hunk_line_number: usize,
     },
@@ -121,6 +123,15 @@ impl StreamingPatchParser {
             self.state.mode = StreamingParserMode::DeleteFile;
             return Ok(true);
         }
+        if let Some(path) = trimmed.strip_prefix(REPLACE_FILE_MARKER) {
+            self.ensure_update_hunk_is_not_empty(trimmed)?;
+            self.state.hunks.push(ReplaceFile {
+                path: PathBuf::from(path),
+                contents: String::new(),
+            });
+            self.state.mode = StreamingParserMode::ReplaceFile;
+            return Ok(true);
+        }
         if let Some(path) = trimmed.strip_prefix(UPDATE_FILE_MARKER) {
             self.ensure_update_hunk_is_not_empty(trimmed)?;
             self.state.hunks.push(UpdateFile {
@@ -190,7 +201,7 @@ impl StreamingPatchParser {
                 }
                 Err(InvalidHunkError {
                     message: format!(
-                        "'{trimmed}' is not a valid hunk header. Valid hunk headers: '*** Add File: {{path}}', '*** Delete File: {{path}}', '*** Update File: {{path}}'"
+                        "'{trimmed}' is not a valid hunk header. Valid hunk headers: '*** Add File: {{path}}', '*** Delete File: {{path}}', '*** Replace File: {{path}}', '*** Update File: {{path}}'"
                     ),
                     line_number: self.line_number,
                 })
@@ -208,7 +219,7 @@ impl StreamingPatchParser {
                 }
                 Err(InvalidHunkError {
                     message: format!(
-                        "'{trimmed}' is not a valid hunk header. Valid hunk headers: '*** Add File: {{path}}', '*** Delete File: {{path}}', '*** Update File: {{path}}'"
+                        "'{trimmed}' is not a valid hunk header. Valid hunk headers: '*** Add File: {{path}}', '*** Delete File: {{path}}', '*** Replace File: {{path}}', '*** Update File: {{path}}'"
                     ),
                     line_number: self.line_number,
                 })
@@ -219,7 +230,25 @@ impl StreamingPatchParser {
                 }
                 Err(InvalidHunkError {
                     message: format!(
-                        "'{trimmed}' is not a valid hunk header. Valid hunk headers: '*** Add File: {{path}}', '*** Delete File: {{path}}', '*** Update File: {{path}}'"
+                        "'{trimmed}' is not a valid hunk header. Valid hunk headers: '*** Add File: {{path}}', '*** Delete File: {{path}}', '*** Replace File: {{path}}', '*** Update File: {{path}}'"
+                    ),
+                    line_number: self.line_number,
+                })
+            }
+            StreamingParserMode::ReplaceFile => {
+                if self.handle_hunk_headers_and_end_patch(trimmed)? {
+                    return Ok(());
+                }
+                if let Some(line_to_add) = line.strip_prefix('+')
+                    && let Some(ReplaceFile { contents, .. }) = self.state.hunks.last_mut()
+                {
+                    contents.push_str(line_to_add);
+                    contents.push('\n');
+                    return Ok(());
+                }
+                Err(InvalidHunkError {
+                    message: format!(
+                        "'{trimmed}' is not a valid hunk header. Valid hunk headers: '*** Add File: {{path}}', '*** Delete File: {{path}}', '*** Replace File: {{path}}', '*** Update File: {{path}}'"
                     ),
                     line_number: self.line_number,
                 })
@@ -416,6 +445,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_streaming_patch_parser_accepts_empty_replace_file_hunk() {
+        let mut parser = StreamingPatchParser::default();
+        assert_eq!(
+            parser.push_delta("*** Begin Patch\n*** Replace File: empty.txt\n*** End Patch\n"),
+            Ok(vec![ReplaceFile {
+                path: PathBuf::from("empty.txt"),
+                contents: String::new(),
+            }])
+        );
+        assert_eq!(
+            parser.finish(),
+            Ok(vec![ReplaceFile {
+                path: PathBuf::from("empty.txt"),
+                contents: String::new(),
+            }])
+        );
+    }
+
+    #[test]
     fn test_streaming_patch_parser_streams_complete_lines_before_end_patch() {
         let mut parser = StreamingPatchParser::default();
         assert_eq!(
@@ -589,6 +637,7 @@ mod tests {
                 .map(|hunk| match hunk {
                     AddFile { .. } => "add",
                     DeleteFile { .. } => "delete",
+                    ReplaceFile { .. } => "replace",
                     UpdateFile {
                         move_path: Some(_), ..
                     } => "move-update",
@@ -845,7 +894,7 @@ mod tests {
         assert_eq!(
             parser.push_delta("bad\n"),
             Err(InvalidHunkError {
-                message: "'bad' is not a valid hunk header. Valid hunk headers: '*** Add File: {path}', '*** Delete File: {path}', '*** Update File: {path}'"
+                message: "'bad' is not a valid hunk header. Valid hunk headers: '*** Add File: {path}', '*** Delete File: {path}', '*** Replace File: {path}', '*** Update File: {path}'"
                     .to_string(),
                 line_number: 2,
             })
@@ -855,7 +904,7 @@ mod tests {
         assert_eq!(
             parser.push_delta("*** Begin Patch\n*** Add File: file.txt\nbad\n"),
             Err(InvalidHunkError {
-                message: "'bad' is not a valid hunk header. Valid hunk headers: '*** Add File: {path}', '*** Delete File: {path}', '*** Update File: {path}'"
+                message: "'bad' is not a valid hunk header. Valid hunk headers: '*** Add File: {path}', '*** Delete File: {path}', '*** Replace File: {path}', '*** Update File: {path}'"
                     .to_string(),
                 line_number: 3,
             })
@@ -865,7 +914,7 @@ mod tests {
         assert_eq!(
             parser.push_delta("*** Begin Patch\n*** Delete File: file.txt\nbad\n"),
             Err(InvalidHunkError {
-                message: "'bad' is not a valid hunk header. Valid hunk headers: '*** Add File: {path}', '*** Delete File: {path}', '*** Update File: {path}'"
+                message: "'bad' is not a valid hunk header. Valid hunk headers: '*** Add File: {path}', '*** Delete File: {path}', '*** Replace File: {path}', '*** Update File: {path}'"
                     .to_string(),
                 line_number: 3,
             })

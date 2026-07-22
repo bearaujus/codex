@@ -74,16 +74,7 @@ impl ToolExecutor<ToolInvocation> for McpHandler {
     }
 
     fn supports_parallel_tool_calls(&self) -> bool {
-        // Correctly implemented MCP servers should tolerate parallel calls to
-        // tools that advertise themselves as read-only.
         self.tool_info.supports_parallel_tool_calls
-            || self
-                .tool_info
-                .tool
-                .annotations
-                .as_ref()
-                .and_then(|annotations| annotations.read_only_hint)
-                .unwrap_or(false)
     }
 
     fn search_info(&self) -> Option<ToolSearchInfo> {
@@ -493,19 +484,19 @@ mod tests {
     }
 
     #[test]
-    fn mcp_read_only_hint_supports_parallel_calls_without_server_opt_in() {
+    fn mcp_read_only_hint_does_not_enable_parallel_calls_without_server_opt_in() {
         let mut read_only_info = tool_info("foo", "mcp__foo__", "read");
         read_only_info.tool.annotations = Some(rmcp::model::ToolAnnotations::new().read_only(true));
 
         assert!(
-            McpHandler::new(read_only_info)
+            !McpHandler::new(read_only_info)
                 .expect("MCP tool spec should build")
                 .supports_parallel_tool_calls()
         );
     }
 
     #[test]
-    fn mcp_parallel_calls_require_read_only_hint_or_server_opt_in() {
+    fn mcp_parallel_calls_require_server_opt_in() {
         let missing_hint_info = tool_info("foo", "mcp__foo__", "unannotated");
         assert!(
             !McpHandler::new(missing_hint_info)

@@ -85,13 +85,7 @@ fn managed_chatgpt_tokens(auth_dot_json: &AuthDotJson) -> Option<&TokenData> {
 }
 
 fn resolved_auth_mode(auth_dot_json: &AuthDotJson) -> AuthMode {
-    if let Some(mode) = auth_dot_json.auth_mode {
-        return mode;
-    }
-    if auth_dot_json.openai_api_key.is_some() {
-        return AuthMode::ApiKey;
-    }
-    AuthMode::Chatgpt
+    auth_dot_json.auth_mode.unwrap_or(AuthMode::Chatgpt)
 }
 
 async fn revoke_oauth_token(

@@ -80,7 +80,7 @@ impl App {
     ) {
         let request_handle = app_server.request_handle();
         let app_event_tx = self.app_event_tx.clone();
-        let hard_stop_generation = self.rate_limit_hard_stop_generation;
+        let update_generation = self.rate_limit_update_generation;
         tokio::spawn(async move {
             let request = fetch_account_rate_limits(request_handle);
             let result = match origin {
@@ -99,7 +99,7 @@ impl App {
             };
             app_event_tx.send(AppEvent::RateLimitsLoaded {
                 origin,
-                hard_stop_generation,
+                update_generation,
                 result,
             });
         });

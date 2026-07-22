@@ -240,6 +240,8 @@ impl ChatWidget {
         self.plan_type = plan_type;
         self.has_chatgpt_account = has_chatgpt_account;
         self.has_codex_backend_auth = has_codex_backend_auth;
+        self.rate_limit_snapshots_by_limit_id.clear();
+        self.rate_limit_full_refresh_pending = has_chatgpt_account;
         self.bottom_pane
             .set_connectors_enabled(self.connectors_enabled());
         self.bottom_pane

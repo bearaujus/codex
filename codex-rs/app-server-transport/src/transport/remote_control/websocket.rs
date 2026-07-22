@@ -2036,17 +2036,15 @@ mod tests {
 
         AuthDotJson {
             auth_mode: Some(AuthMode::Chatgpt),
-            openai_api_key: None,
             tokens: Some(TokenData {
                 id_token: parse_chatgpt_jwt_claims(&fake_jwt).expect("fake jwt should parse"),
                 access_token: access_token.to_string(),
                 refresh_token: "refresh-token".to_string(),
                 account_id: Some("account_id".to_string()),
             }),
+            pool_account_id: Some("account_id".to_string()),
             last_refresh: Some(Utc::now()),
             agent_identity: None,
-            personal_access_token: None,
-            bedrock_api_key: None,
         }
     }
 
@@ -2223,7 +2221,6 @@ mod tests {
         let state_db = remote_control_state_runtime(&codex_home).await;
         let auth_manager = AuthManager::shared(
             codex_home.path().to_path_buf(),
-            /*enable_codex_api_key_env*/ false,
             AuthCredentialsStoreMode::File,
             /*forced_chatgpt_workspace_id*/ None,
             /*chatgpt_base_url*/ None,
@@ -2322,7 +2319,6 @@ mod tests {
         let state_db = remote_control_state_runtime(&codex_home).await;
         let auth_manager = AuthManager::shared(
             codex_home.path().to_path_buf(),
-            /*enable_codex_api_key_env*/ false,
             AuthCredentialsStoreMode::File,
             /*forced_chatgpt_workspace_id*/ None,
             /*chatgpt_base_url*/ None,
@@ -2450,7 +2446,6 @@ mod tests {
         let state_db = remote_control_state_runtime(&codex_home).await;
         let auth_manager = AuthManager::shared(
             codex_home.path().to_path_buf(),
-            /*enable_codex_api_key_env*/ false,
             AuthCredentialsStoreMode::File,
             /*forced_chatgpt_workspace_id*/ None,
             /*chatgpt_base_url*/ None,

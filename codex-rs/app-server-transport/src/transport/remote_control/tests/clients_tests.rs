@@ -200,7 +200,6 @@ async fn list_remote_control_clients_recovers_auth_after_unauthorized() {
     .expect("stale auth should save");
     let auth_manager = AuthManager::shared(
         codex_home.path().to_path_buf(),
-        /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
         /*forced_chatgpt_workspace_id*/ None,
         /*chatgpt_base_url*/ None,
@@ -298,7 +297,6 @@ async fn list_remote_control_clients_retries_unauthorized_only_once() {
     .expect("stale auth should save");
     let auth_manager = AuthManager::shared(
         codex_home.path().to_path_buf(),
-        /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
         /*forced_chatgpt_workspace_id*/ None,
         /*chatgpt_base_url*/ None,

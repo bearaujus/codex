@@ -383,9 +383,6 @@ impl ChatWidget {
             SlashCommand::Quit | SlashCommand::Exit => {
                 self.request_quit_without_confirmation();
             }
-            SlashCommand::Logout => {
-                self.app_event_tx.send(AppEvent::Logout);
-            }
             SlashCommand::Copy => {
                 self.copy_last_agent_markdown();
             }
@@ -1091,7 +1088,6 @@ impl ChatWidget {
             | SlashCommand::Memories
             | SlashCommand::Quit
             | SlashCommand::Exit
-            | SlashCommand::Logout
             | SlashCommand::Mention
             | SlashCommand::Skills
             | SlashCommand::Import

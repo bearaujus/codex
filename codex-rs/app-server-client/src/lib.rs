@@ -318,8 +318,6 @@ pub struct InProcessClientStartArgs {
     pub config_warnings: Vec<ConfigWarningNotification>,
     /// Session source recorded in app-server thread metadata.
     pub session_source: SessionSource,
-    /// Whether auth loading should honor the `CODEX_API_KEY` environment variable.
-    pub enable_codex_api_key_env: bool,
     /// Client name reported during initialize.
     pub client_name: String,
     /// Client version reported during initialize.
@@ -382,7 +380,6 @@ impl InProcessClientStartArgs {
             environment_manager: self.environment_manager,
             config_warnings: self.config_warnings,
             session_source: self.session_source,
-            enable_codex_api_key_env: self.enable_codex_api_key_env,
             initialize,
             channel_capacity: self.channel_capacity,
         }
@@ -520,25 +517,6 @@ impl InProcessAppServerClient {
                         let Some(event) = event else {
                             break;
                         };
-                        if let InProcessServerEvent::ServerRequest(
-                            ServerRequest::ChatgptAuthTokensRefresh { request_id, .. }
-                        ) = &event
-                        {
-                            let send_result = request_sender.fail_server_request(
-                                request_id.clone(),
-                                JSONRPCErrorError {
-                                    code: -32000,
-                                    message: "chatgpt auth token refresh is not supported for in-process app-server clients".to_string(),
-                                    data: None,
-                                },
-                            );
-                            if let Err(err) = send_result {
-                                warn!(
-                                    "failed to reject unsupported chatgpt auth token refresh request: {err}"
-                                );
-                            }
-                            continue;
-                        }
 
                         match forward_in_process_event(
                             &event_tx,
@@ -1019,7 +997,6 @@ mod tests {
             environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
             config_warnings: Vec::new(),
             session_source,
-            enable_codex_api_key_env: false,
             client_name: "codex-app-server-client-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -1744,6 +1721,7 @@ mod tests {
                             AccountUpdatedNotification {
                                 auth_mode: None,
                                 plan_type: None,
+                                account_email: None,
                             },
                         ))
                         .expect("notification should serialize"),
@@ -2215,7 +2193,6 @@ mod tests {
             environment_manager: environment_manager.clone(),
             config_warnings: Vec::new(),
             session_source: SessionSource::Exec,
-            enable_codex_api_key_env: false,
             client_name: "codex-app-server-client-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,
@@ -2264,7 +2241,6 @@ mod tests {
             environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
             config_warnings: Vec::new(),
             session_source: SessionSource::Exec,
-            enable_codex_api_key_env: false,
             client_name: "codex-app-server-client-test".to_string(),
             client_version: "0.0.0-test".to_string(),
             experimental_api: true,

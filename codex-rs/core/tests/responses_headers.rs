@@ -355,10 +355,11 @@ async fn responses_respects_model_info_overrides_from_config() {
     let config = Arc::new(config);
 
     let thread_id = ThreadId::new();
-    let auth_mode =
-        codex_core::test_support::auth_manager_from_auth(CodexAuth::from_api_key("Test API Key"))
-            .auth_mode()
-            .map(TelemetryAuthMode::from);
+    let auth_mode = codex_core::test_support::auth_manager_from_auth(
+        CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+    )
+    .auth_mode()
+    .map(TelemetryAuthMode::from);
     let session_source =
         SessionSource::SubAgent(SubAgentSource::Other("override-check".to_string()));
     let model_info =

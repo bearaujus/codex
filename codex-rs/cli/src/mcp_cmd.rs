@@ -547,8 +547,7 @@ async fn run_list(config_overrides: &CliConfigOverrides, list_args: ListArgs) ->
     let mcp_manager = McpManager::new(Arc::new(PluginsManager::new(
         config.codex_home.to_path_buf(),
     )));
-    let auth_manager =
-        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ true).await;
+    let auth_manager = AuthManager::shared_from_config(&config).await;
     let auth = auth_manager.auth().await;
     let mcp_servers = mcp_manager.configured_servers(&config).await;
     let effective_mcp_servers = mcp_manager.effective_servers(&config, auth.as_ref()).await;

@@ -14,17 +14,18 @@ use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 
-fn sse_incomplete() -> String {
-    responses::sse(vec![serde_json::json!({
-        "type": "response.output_item.done",
-    })])
+fn sse_incomplete_with_reasoning_output() -> String {
+    responses::sse(vec![
+        responses::ev_response_created("resp_incomplete"),
+        responses::ev_reasoning_item("reasoning_incomplete", &["partial reasoning"], &[]),
+    ])
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retries_on_early_close() {
     skip_if_no_network!();
 
-    let incomplete_sse = sse_incomplete();
+    let incomplete_sse = sse_incomplete_with_reasoning_output();
     let completed_sse = responses::sse_completed("resp_ok");
 
     let (server, _) = start_streaming_sse_server(vec![

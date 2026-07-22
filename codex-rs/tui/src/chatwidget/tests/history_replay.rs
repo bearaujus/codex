@@ -1139,6 +1139,7 @@ async fn replayed_in_progress_mcp_tool_call_stays_active() {
 async fn live_reasoning_summary_is_not_rendered_twice_when_item_completes() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.show_welcome_banner = false;
+    chat.config.stream_reasoning_live = true;
 
     chat.handle_server_notification(
         ServerNotification::TurnStarted(TurnStartedNotification {
@@ -1168,6 +1169,10 @@ async fn live_reasoning_summary_is_not_rendered_twice_when_item_completes() {
         }),
         /*replay_kind*/ None,
     );
+    // Reasoning streams line-by-line: a pending summary with no trailing newline is
+    // not previewed in the active cell; it commits when the item completes. The point
+    // of this test is that completion renders it exactly once (no double render).
+    let mut committed = drain_insert_history_text(&mut rx);
 
     chat.handle_server_notification(
         ServerNotification::ItemCompleted(ItemCompletedNotification {
@@ -1182,14 +1187,81 @@ async fn live_reasoning_summary_is_not_rendered_twice_when_item_completes() {
         }),
         /*replay_kind*/ None,
     );
-
-    let rendered = match rx.try_recv() {
-        Ok(AppEvent::InsertHistoryCell(cell)) => {
-            lines_to_single_string(&cell.transcript_lines(/*width*/ 80))
-        }
-        other => panic!("expected InsertHistoryCell, got {other:?}"),
-    };
+    committed.push_str(&drain_insert_history_text(&mut rx));
+    let rendered = format!("{committed}{}", active_blob_or_empty(&chat));
     assert_eq!(rendered.matches("Summary only").count(), 1);
+    assert!(chat.transcript.active_cell.is_none());
+}
+
+#[tokio::test]
+async fn exec_output_is_preserved_while_reasoning_streams_live() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.show_welcome_banner = false;
+    chat.config.stream_reasoning_live = true;
+    handle_turn_started(&mut chat, "turn-1");
+    chat.bottom_pane.set_task_running(/*running*/ true);
+    let _ = drain_insert_history(&mut rx);
+
+    // Reasoning starts streaming live and takes the active cell.
+    handle_agent_reasoning_delta(&mut chat, "Thinking about the task.\n");
+
+    // A command runs; reasoning must yield the active slot so its output deltas
+    // land in the exec cell instead of being dropped (trimmed).
+    let _item = begin_exec_with_source(&mut chat, "exec-1", "echo hi", ExecCommandSource::Agent);
+    handle_exec_output_delta(&mut chat, "exec-1", "FIRST_OUTPUT");
+    // More reasoning arrives mid-exec; it must not steal the slot back.
+    handle_agent_reasoning_delta(&mut chat, "Still thinking.\n");
+    handle_exec_output_delta(&mut chat, "exec-1", "SECOND_OUTPUT");
+
+    // Streamed exec output is rendered from the active exec cell's display lines.
+    let rendered = format!(
+        "{}{}",
+        drain_insert_history_text(&mut rx),
+        active_blob(&chat)
+    );
+    assert!(
+        rendered.contains("FIRST_OUTPUT"),
+        "first exec output dropped: {rendered}"
+    );
+    assert!(
+        rendered.contains("SECOND_OUTPUT"),
+        "second exec output dropped: {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn exec_output_reclaims_active_cell_when_a_non_exec_cell_holds_it() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.show_welcome_banner = false;
+    chat.config.stream_reasoning_live = true;
+    handle_turn_started(&mut chat, "turn-1");
+    chat.bottom_pane.set_task_running(/*running*/ true);
+
+    // Begin a command so it is tracked as running and owns the active exec cell.
+    let _item = begin_exec_with_source(&mut chat, "exec-1", "echo hi", ExecCommandSource::Agent);
+
+    // Force the pathological state the fix recovers from: a non-exec cell (here a
+    // live reasoning tail) has taken the active slot while the command still runs.
+    // The guards normally prevent reaching this state, so set it directly to prove
+    // the safety net re-homes the output instead of dropping (trimming) it.
+    chat.transcript.active_cell = Some(Box::new(history_cell::ReasoningStreamCell::new(
+        Vec::new(),
+        /*is_continuation*/ false,
+    )));
+    chat.transcript.active_cell_revision += 1;
+    let _ = drain_insert_history(&mut rx);
+
+    handle_exec_output_delta(&mut chat, "exec-1", "RECLAIMED_OUTPUT");
+
+    let rendered = format!(
+        "{}{}",
+        drain_insert_history_text(&mut rx),
+        active_blob(&chat)
+    );
+    assert!(
+        rendered.contains("RECLAIMED_OUTPUT"),
+        "exec output was not reclaimed: {rendered}"
+    );
 }
 
 #[tokio::test]

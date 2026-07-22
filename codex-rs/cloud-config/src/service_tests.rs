@@ -51,7 +51,6 @@ async fn auth_manager_with_api_key() -> Arc<AuthManager> {
     Arc::new(
         AuthManager::new(
             tmp.path().to_path_buf(),
-            /*enable_codex_api_key_env*/ false,
             AuthCredentialsStoreMode::File,
             /*forced_chatgpt_workspace_id*/ None,
             /*chatgpt_base_url*/ None,
@@ -82,7 +81,6 @@ async fn auth_manager_with_plan_and_identity(
     Arc::new(
         AuthManager::new(
             tmp.path().to_path_buf(),
-            /*enable_codex_api_key_env*/ false,
             AuthCredentialsStoreMode::File,
             /*forced_chatgpt_workspace_id*/ None,
             /*chatgpt_base_url*/ None,
@@ -699,7 +697,6 @@ async fn get_bundle_recovers_after_unauthorized_reload() {
     let auth_manager = Arc::new(
         AuthManager::new(
             auth_home.path().to_path_buf(),
-            /*enable_codex_api_key_env*/ false,
             AuthCredentialsStoreMode::File,
             /*forced_chatgpt_workspace_id*/ None,
             /*chatgpt_base_url*/ None,
@@ -756,7 +753,6 @@ async fn get_bundle_recovers_after_unauthorized_reload_updates_cache_identity() 
     let auth_manager = Arc::new(
         AuthManager::new(
             auth_home.path().to_path_buf(),
-            /*enable_codex_api_key_env*/ false,
             AuthCredentialsStoreMode::File,
             /*forced_chatgpt_workspace_id*/ None,
             /*chatgpt_base_url*/ None,
@@ -821,7 +817,6 @@ async fn get_bundle_surfaces_auth_recovery_message() {
     let auth_manager = Arc::new(
         AuthManager::new(
             auth_home.path().to_path_buf(),
-            /*enable_codex_api_key_env*/ false,
             AuthCredentialsStoreMode::File,
             /*forced_chatgpt_workspace_id*/ None,
             /*chatgpt_base_url*/ None,
@@ -867,62 +862,6 @@ async fn get_bundle_surfaces_auth_recovery_message() {
         )
     );
     assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 1);
-}
-
-#[tokio::test]
-async fn get_bundle_refreshes_external_auth_after_unauthorized() {
-    let auth_home = tempdir().expect("tempdir");
-    let auth_manager = Arc::new(
-        AuthManager::new(
-            auth_home.path().to_path_buf(),
-            /*enable_codex_api_key_env*/ false,
-            AuthCredentialsStoreMode::Ephemeral,
-            /*forced_chatgpt_workspace_id*/ None,
-            /*chatgpt_base_url*/ None,
-            AuthKeyringBackendKind::default(),
-            /*auth_route_config*/ None,
-        )
-        .await,
-    );
-    let initial_auth = CodexAuth::from_external_chatgpt_tokens(
-        &fake_chatgpt_jwt("enterprise", Some("user-12345"), b"initial"),
-        "account-12345",
-        Some("enterprise"),
-    )
-    .expect("initial external auth");
-    let refreshed_token = fake_chatgpt_jwt("enterprise", Some("user-12345"), b"refreshed");
-    let refreshed_auth = CodexAuth::from_external_chatgpt_tokens(
-        &refreshed_token,
-        "account-12345",
-        Some("enterprise"),
-    )
-    .expect("refreshed external auth");
-    let external_auth = Arc::new(TestExternalChatgptAuth {
-        current: RwLock::new(initial_auth),
-        refreshed: refreshed_auth,
-        refresh_count: AtomicUsize::new(0),
-    });
-    auth_manager
-        .set_external_auth(external_auth.clone())
-        .await
-        .expect("set external auth");
-
-    let fetcher = Arc::new(TokenBundleClient {
-        expected_token: refreshed_token,
-        bundle: test_bundle(),
-        request_count: AtomicUsize::new(0),
-    });
-    let codex_home = tempdir().expect("tempdir");
-    let service = CloudConfigBundleService::new(
-        auth_manager,
-        fetcher.clone(),
-        codex_home.path().to_path_buf(),
-        CLOUD_CONFIG_BUNDLE_TIMEOUT,
-    );
-
-    assert_eq!(service.load_startup_bundle().await, Ok(Some(test_bundle())));
-    assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 2);
-    assert_eq!(external_auth.refresh_count.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

@@ -113,8 +113,7 @@ async fn run_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
     let config = new_config(args.model, arg0_paths)?;
     let state_db = init_state_db(&config).await;
 
-    let auth_manager =
-        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await;
+    let auth_manager = AuthManager::shared_from_config(&config).await;
     let local_runtime_paths = ExecServerRuntimePaths::from_optional_paths(
         config.codex_self_exe.clone(),
         config.codex_linux_sandbox_exe.clone(),
@@ -222,6 +221,7 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         tui_terminal_title: None,
         tui_theme: None,
         tui_raw_output_mode: false,
+        stream_reasoning_live: false,
         tui_pet: None,
         tui_pet_anchor: TuiPetAnchor::Composer,
         terminal_resize_reflow: TerminalResizeReflowConfig::default(),

@@ -339,6 +339,34 @@ index {left_oid_b}..{right_oid_b}
 }
 
 #[tokio::test]
+async fn refresh_required_for_existing_path_after_turn_edit_but_not_for_new_add() {
+    let dir = tempdir().expect("tempdir");
+    fs::write(dir.path().join("existing.txt"), "before\n").expect("seed file");
+
+    let mut tracker = TurnDiffTracker::with_environment_display_roots([(
+        String::new(),
+        dir.path().to_path_buf(),
+    )]);
+    let update_existing = apply_verified_patch(
+        dir.path(),
+        "*** Begin Patch\n*** Update File: existing.txt\n@@\n-before\n+after\n*** End Patch",
+    )
+    .await;
+    tracker.track_delta("", &update_existing);
+
+    assert!(tracker.requires_refresh_for_exact_match_update(&dir.path().join("existing.txt")));
+
+    let add_new = apply_verified_patch(
+        dir.path(),
+        "*** Begin Patch\n*** Add File: new.txt\n+hello\n*** End Patch",
+    )
+    .await;
+    tracker.track_delta("", &add_new);
+
+    assert!(!tracker.requires_refresh_for_exact_match_update(&dir.path().join("new.txt")));
+}
+
+#[tokio::test]
 async fn preserves_committed_change_order_with_delete_then_move_overwrite() {
     let dir = tempdir().expect("tempdir");
     fs::write(dir.path().join("a.txt"), "from\n").expect("seed source");

@@ -29,6 +29,7 @@ pub static CODEX_ALIASES_TEMP_DIR: Option<TestBinaryDispatchGuard> = {
 
 #[cfg(not(target_os = "windows"))]
 mod abort_tasks;
+mod account_pool_failover;
 mod additional_context;
 mod agent_execution;
 mod agent_jobs;
@@ -69,7 +70,6 @@ mod items;
 mod json_result;
 mod live_cli;
 mod mcp_auth_elicitation;
-mod mcp_auth_refresh;
 #[cfg(unix)]
 mod mcp_refresh_cleanup;
 mod mcp_tool_cache;

@@ -80,8 +80,14 @@ impl ChatWidget {
         if self.mcp_startup_status.is_none() || !self.status_header_is_mcp_startup_owned() {
             self.set_status_header(String::from("Working"));
         }
-        self.reasoning_summary_parts.clear();
+        // Discard leftover reasoning from an aborted prior turn rather than
+        // committing it here. Committing at this point would insert the reasoning
+        // blocks after the new user message in history, which is out of order and
+        // confusing. The content was already visible to the user in the live stream.
         self.reasoning_buffer.clear();
+        self.full_reasoning_buffer.clear();
+        self.clear_live_reasoning();
+        self.reasoning_summary_parts.clear();
         self.reasoning_header = None;
         self.set_ambient_pet_notification(
             crate::pets::PetNotificationKind::Running,
@@ -128,6 +134,14 @@ impl ChatWidget {
         self.transcript.saw_copy_source_this_turn = false;
         // If a stream is currently active, finalize it.
         self.flush_answer_stream_with_separator();
+        // Flush any tool/exec events that were deferred while the text stream was
+        // active. Without this, MCP tool completions, exec outputs, and file-change
+        // events queued during streaming are permanently dropped at turn end.
+        self.flush_interrupt_queue();
+        // Commit any live reasoning that did not receive its final event (e.g., the
+        // server sent TurnCompleted before AgentReasoningFinal in a race).
+        self.commit_pending_reasoning_to_history();
+        self.clear_live_reasoning();
         if let Some(mut controller) = self.plan_stream_controller.take() {
             let had_live_tail = controller.has_live_tail();
             self.clear_active_stream_tail();
@@ -311,9 +325,17 @@ impl ChatWidget {
     /// and should continue to drive the bottom-pane running indicator while it is in progress.
     pub(super) fn finalize_turn(&mut self) {
         self.clear_safety_buffering();
+        // Every terminal path must preserve partial assistant output. Specialized errors such as
+        // server overload and policy blocks call this shared teardown directly rather than
+        // `on_error`, so finalizing only in `on_error` silently dropped their active stream.
+        self.flush_answer_stream_with_separator();
         // Drop preview-only stream tail content on any termination path before
         // failed-cell finalization, so transient tail cells are never persisted.
         self.clear_active_stream_tail();
+        // Commit any in-progress live reasoning so content visible to the user is
+        // not silently discarded on turn failure/interrupt.
+        self.commit_pending_reasoning_to_history();
+        self.clear_live_reasoning();
         // Ensure any spinner is replaced by a red ✗ and flushed into history.
         self.finalize_active_cell_as_failed();
         // Turn-scoped hook rows are transient live state; once the turn is over,
@@ -331,6 +353,12 @@ impl ChatWidget {
         self.adaptive_chunking.reset();
         self.stream_controller = None;
         self.plan_stream_controller = None;
+        // commit_pending_reasoning_to_history above already finalized this; reset
+        // defensively so a stray controller never survives turn teardown.
+        self.reasoning_stream_controller = None;
+        // Flush deferred tool/exec events so outputs that arrived while text was
+        // streaming are still shown, even on abort or error paths.
+        self.flush_interrupt_queue();
         self.request_pending_usage_output_insertion_after_stream_shutdown();
         self.status_state.pending_status_indicator_restore = false;
         self.safety_buffering_prompt = None;
@@ -356,7 +384,6 @@ impl ChatWidget {
 
     pub(super) fn on_error(&mut self, message: String) {
         self.input_queue.submit_pending_steers_after_interrupt = false;
-        self.flush_answer_stream_with_separator();
         self.finalize_turn();
         self.add_to_history(history_cell::new_error_event(message));
         self.set_ambient_pet_notification(

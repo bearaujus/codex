@@ -32,11 +32,12 @@ async fn emits_warning_when_unstable_features_enabled_via_config() {
     );
 
     let thread_manager = codex_core::test_support::thread_manager_with_models_provider(
-        CodexAuth::from_api_key("test"),
+        CodexAuth::create_dummy_chatgpt_auth_for_testing(),
         config.model_provider.clone(),
     );
-    let auth_manager =
-        codex_core::test_support::auth_manager_from_auth(CodexAuth::from_api_key("test"));
+    let auth_manager = codex_core::test_support::auth_manager_from_auth(
+        CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+    );
 
     let NewThread {
         thread: conversation,
@@ -79,11 +80,12 @@ async fn suppresses_warning_when_configured() {
     );
 
     let thread_manager = codex_core::test_support::thread_manager_with_models_provider(
-        CodexAuth::from_api_key("test"),
+        CodexAuth::create_dummy_chatgpt_auth_for_testing(),
         config.model_provider.clone(),
     );
-    let auth_manager =
-        codex_core::test_support::auth_manager_from_auth(CodexAuth::from_api_key("test"));
+    let auth_manager = codex_core::test_support::auth_manager_from_auth(
+        CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+    );
 
     let NewThread {
         thread: conversation,

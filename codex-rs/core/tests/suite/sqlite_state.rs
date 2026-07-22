@@ -579,7 +579,7 @@ async fn standalone_web_search_marks_thread_memory_mode_polluted_when_configured
     )
     .await;
 
-    let auth = CodexAuth::from_api_key("dummy");
+    let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
     let auth_manager = codex_core::test_support::auth_manager_from_auth(auth.clone());
     let mut extension_builder = ExtensionRegistryBuilder::<Config>::new();
     install_web_search_extension(&mut extension_builder, auth_manager);

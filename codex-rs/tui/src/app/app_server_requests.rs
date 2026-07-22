@@ -146,7 +146,6 @@ impl PendingAppServerRequests {
                     message: "Dynamic tool calls are not available in TUI yet.".to_string(),
                 })
             }
-            ServerRequest::ChatgptAuthTokensRefresh { .. } => None,
             ServerRequest::AttestationGenerate { request_id, .. } => {
                 Some(UnsupportedAppServerRequest {
                     request_id: request_id.clone(),
@@ -356,7 +355,6 @@ impl PendingAppServerRequests {
                 .values()
                 .any(|pending_request_id| pending_request_id == request_id),
             ServerRequest::DynamicToolCall { .. }
-            | ServerRequest::ChatgptAuthTokensRefresh { .. }
             | ServerRequest::AttestationGenerate { .. }
             | ServerRequest::CurrentTimeRead { .. }
             | ServerRequest::ApplyPatchApproval { .. }
@@ -416,15 +414,12 @@ struct McpRequestKey {
 #[cfg(test)]
 mod tests {
     use super::PendingAppServerRequests;
-    use super::ResolvedAppServerRequest;
     use super::UnsupportedAppServerRequest;
     use crate::app_command::AppCommand as Op;
     use codex_app_server_protocol::AdditionalFileSystemPermissions;
     use codex_app_server_protocol::AdditionalNetworkPermissions;
     use codex_app_server_protocol::CommandExecutionApprovalDecision;
     use codex_app_server_protocol::CommandExecutionRequestApprovalParams;
-    use codex_app_server_protocol::FileChangeApprovalDecision;
-    use codex_app_server_protocol::FileChangeRequestApprovalParams;
     use codex_app_server_protocol::McpElicitationObjectType;
     use codex_app_server_protocol::McpElicitationSchema;
     use codex_app_server_protocol::McpServerElicitationAction;
@@ -738,147 +733,6 @@ mod tests {
         assert_eq!(
             unsupported.message,
             "Dynamic tool calls are not available in TUI yet."
-        );
-    }
-
-    #[test]
-    fn does_not_mark_chatgpt_auth_refresh_as_unsupported() {
-        let mut pending = PendingAppServerRequests::default();
-
-        assert_eq!(
-            pending.note_server_request(&ServerRequest::ChatgptAuthTokensRefresh {
-                request_id: AppServerRequestId::Integer(100),
-                params: codex_app_server_protocol::ChatgptAuthTokensRefreshParams {
-                    reason: codex_app_server_protocol::ChatgptAuthTokensRefreshReason::Unauthorized,
-                    previous_account_id: Some("workspace-1".to_string()),
-                },
-            }),
-            None
-        );
-    }
-
-    #[test]
-    fn resolves_patch_approval_through_app_server_request_id() {
-        let mut pending = PendingAppServerRequests::default();
-        assert_eq!(
-            pending.note_server_request(&ServerRequest::FileChangeRequestApproval {
-                request_id: AppServerRequestId::Integer(13),
-                params: FileChangeRequestApprovalParams {
-                    thread_id: "thread-1".to_string(),
-                    turn_id: "turn-1".to_string(),
-                    item_id: "patch-1".to_string(),
-                    started_at_ms: 0,
-                    reason: None,
-                    grant_root: None,
-                },
-            }),
-            None
-        );
-
-        let resolution = pending
-            .take_resolution(&Op::PatchApproval {
-                id: "patch-1".to_string(),
-                decision: FileChangeApprovalDecision::Cancel,
-            })
-            .expect("resolution should serialize")
-            .expect("request should be pending");
-
-        assert_eq!(resolution.request_id, AppServerRequestId::Integer(13));
-        assert_eq!(resolution.result, json!({ "decision": "cancel" }));
-    }
-
-    #[test]
-    fn resolve_notification_returns_resolved_exec_request() {
-        let mut pending = PendingAppServerRequests::default();
-        assert_eq!(
-            pending.note_server_request(&ServerRequest::CommandExecutionRequestApproval {
-                request_id: AppServerRequestId::Integer(41),
-                params: CommandExecutionRequestApprovalParams {
-                    thread_id: "thread-1".to_string(),
-                    turn_id: "turn-1".to_string(),
-                    item_id: "call-1".to_string(),
-                    started_at_ms: 0,
-                    approval_id: Some("approval-1".to_string()),
-                    environment_id: None,
-                    reason: None,
-                    network_approval_context: None,
-                    command: Some("ls".to_string()),
-                    cwd: None,
-                    command_actions: None,
-                    additional_permissions: None,
-                    proposed_execpolicy_amendment: None,
-                    proposed_network_policy_amendments: None,
-                    available_decisions: None,
-                },
-            }),
-            None
-        );
-
-        assert_eq!(
-            pending.resolve_notification(&AppServerRequestId::Integer(41)),
-            Some(ResolvedAppServerRequest::ExecApproval {
-                id: "approval-1".to_string(),
-            })
-        );
-        assert_eq!(
-            pending.resolve_notification(&AppServerRequestId::Integer(41)),
-            None
-        );
-    }
-
-    #[test]
-    fn resolve_notification_returns_resolved_mcp_request() {
-        let mut pending = PendingAppServerRequests::default();
-        assert_eq!(
-            pending.note_server_request(&ServerRequest::McpServerElicitationRequest {
-                request_id: AppServerRequestId::Integer(12),
-                params: McpServerElicitationRequestParams {
-                    thread_id: "thread-1".to_string(),
-                    turn_id: Some("turn-1".to_string()),
-                    server_name: "example".to_string(),
-                    request: McpServerElicitationRequest::Form {
-                        meta: None,
-                        message: "Need input".to_string(),
-                        requested_schema: McpElicitationSchema {
-                            schema_uri: None,
-                            type_: McpElicitationObjectType::Object,
-                            properties: BTreeMap::new(),
-                            required: None,
-                        },
-                    },
-                },
-            }),
-            None
-        );
-
-        assert_eq!(
-            pending.resolve_notification(&AppServerRequestId::Integer(12)),
-            Some(ResolvedAppServerRequest::McpElicitation {
-                server_name: "example".to_string(),
-                request_id: AppServerRequestId::Integer(12),
-            })
-        );
-    }
-
-    #[test]
-    fn resolve_notification_returns_resolved_user_input_item_id() {
-        let mut pending = PendingAppServerRequests::default();
-        pending.note_server_request(&ServerRequest::ToolRequestUserInput {
-            request_id: AppServerRequestId::Integer(8),
-            params: ToolRequestUserInputParams {
-                thread_id: "thread-1".to_string(),
-                turn_id: "turn-1".to_string(),
-                item_id: "tool-1".to_string(),
-                questions: Vec::new(),
-                auto_resolution_ms: None,
-            },
-        });
-
-        assert_eq!(
-            pending.resolve_notification(&AppServerRequestId::Integer(8)),
-            Some(ResolvedAppServerRequest::UserInput {
-                call_id: "tool-1".to_string(),
-            })
         );
     }
 

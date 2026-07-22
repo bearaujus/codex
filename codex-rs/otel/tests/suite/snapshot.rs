@@ -107,7 +107,7 @@ fn manager_snapshot_metrics_collects_without_shutdown() -> Result<()> {
         "gpt-5.1",
         Some("account-id".to_string()),
         /*account_email*/ None,
-        Some(TelemetryAuthMode::ApiKey),
+        Some(TelemetryAuthMode::Chatgpt),
         "test_originator".to_string(),
         /*log_user_prompts*/ true,
         "tty".to_string(),
@@ -142,7 +142,7 @@ fn manager_snapshot_metrics_collects_without_shutdown() -> Result<()> {
         ),
         (
             "auth_mode".to_string(),
-            TelemetryAuthMode::ApiKey.to_string(),
+            TelemetryAuthMode::Chatgpt.to_string(),
         ),
         ("model".to_string(), "gpt-5.1".to_string()),
         ("originator".to_string(), "test_originator".to_string()),

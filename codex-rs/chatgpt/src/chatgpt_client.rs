@@ -25,8 +25,7 @@ pub(crate) async fn chatgpt_get_request_with_timeout<T: DeserializeOwned>(
     timeout: Option<Duration>,
 ) -> anyhow::Result<T> {
     let chatgpt_base_url = &config.chatgpt_base_url;
-    let auth_manager =
-        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await;
+    let auth_manager = AuthManager::shared_from_config(config).await;
     let auth = auth_manager
         .auth()
         .await
@@ -37,7 +36,7 @@ pub(crate) async fn chatgpt_get_request_with_timeout<T: DeserializeOwned>(
     );
     anyhow::ensure!(
         auth.get_account_id().is_some(),
-        "ChatGPT account ID not available, please re-run `codex login`"
+        "ChatGPT account ID not available; configure ChatGPT through app-server OAuth or device-code login"
     );
 
     // Make direct HTTP request to ChatGPT backend API with the token
@@ -94,7 +93,7 @@ pub(crate) async fn chatgpt_post_request_with_timeout<
     );
     anyhow::ensure!(
         auth.get_account_id().is_some(),
-        "ChatGPT account ID not available, please re-run codex login"
+        "ChatGPT account ID not available; configure ChatGPT through app-server OAuth or device-code login and retry"
     );
 
     let url = format!(

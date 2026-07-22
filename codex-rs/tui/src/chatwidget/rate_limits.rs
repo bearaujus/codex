@@ -162,13 +162,26 @@ fn has_usable_workspace_credits(credits: &CreditsSnapshot) -> bool {
 }
 
 impl ChatWidget {
+    pub(super) fn finish_rate_limit_full_refresh(&mut self) {
+        self.rate_limit_full_refresh_pending = false;
+    }
+
     pub(crate) fn on_rate_limit_snapshot(&mut self, snapshot: Option<RateLimitSnapshot>) {
         self.on_rate_limit_snapshot_from(snapshot, RateLimitSnapshotSource::AccountUsage);
     }
 
     pub(crate) fn on_rolling_rate_limit_snapshot(&mut self, snapshot: RateLimitSnapshot) {
+        self.on_rolling_rate_limit_update(Some(snapshot));
+    }
+
+    pub(crate) fn on_rolling_rate_limit_update(&mut self, snapshot: Option<RateLimitSnapshot>) {
+        if self.rate_limit_full_refresh_pending && snapshot.is_some() {
+            return;
+        }
         // Rolling app-server notifications are sparse. Preserve metadata learned from the full read.
-        self.on_rate_limit_snapshot_from(Some(snapshot), RateLimitSnapshotSource::RollingUpdate);
+        // A missing snapshot is an explicit account-boundary clear and must not be ignored while a
+        // full refresh is pending, or the previous account's limits remain visible.
+        self.on_rate_limit_snapshot_from(snapshot, RateLimitSnapshotSource::RollingUpdate);
     }
 
     fn on_rate_limit_snapshot_from(
@@ -176,6 +189,9 @@ impl ChatWidget {
         snapshot: Option<RateLimitSnapshot>,
         source: RateLimitSnapshotSource,
     ) {
+        if matches!(source, RateLimitSnapshotSource::AccountUsage) {
+            self.rate_limit_full_refresh_pending = false;
+        }
         if let Some(mut snapshot) = snapshot {
             let limit_id = snapshot
                 .limit_id

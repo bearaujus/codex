@@ -338,6 +338,15 @@ pub(super) fn drain_insert_history(
     out
 }
 
+pub(super) fn drain_insert_history_text(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+) -> String {
+    drain_insert_history(rx)
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect()
+}
+
 pub(super) fn lines_to_single_string(lines: &[ratatui::text::Line<'static>]) -> String {
     let mut s = String::new();
     for line in lines {
@@ -1104,6 +1113,24 @@ pub(super) fn handle_exec_end(chat: &mut ChatWidget, item: AppServerThreadItem) 
     );
 }
 
+pub(super) fn handle_exec_output_delta(chat: &mut ChatWidget, call_id: &str, delta: &str) {
+    chat.handle_server_notification(
+        ServerNotification::CommandExecutionOutputDelta(
+            codex_app_server_protocol::CommandExecutionOutputDeltaNotification {
+                thread_id: thread_id(chat),
+                turn_id: chat
+                    .turn_lifecycle
+                    .last_turn_id
+                    .clone()
+                    .unwrap_or_else(|| "turn-1".to_string()),
+                item_id: call_id.to_string(),
+                delta: delta.to_string(),
+            },
+        ),
+        /*replay_kind*/ None,
+    );
+}
+
 pub(super) fn active_blob(chat: &ChatWidget) -> String {
     let lines = chat
         .transcript
@@ -1112,6 +1139,12 @@ pub(super) fn active_blob(chat: &ChatWidget) -> String {
         .expect("active cell present")
         .display_lines(/*width*/ 80);
     lines_to_single_string(&lines)
+}
+
+pub(super) fn active_blob_or_empty(chat: &ChatWidget) -> String {
+    chat.active_cell_transcript_lines(/*width*/ 80)
+        .map(|lines| lines_to_single_string(&lines))
+        .unwrap_or_default()
 }
 
 pub(super) fn active_hook_blob(chat: &ChatWidget) -> String {

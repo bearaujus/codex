@@ -2609,7 +2609,7 @@ impl PluginsManager {
         let curated_marketplace_path = if include_openai_curated {
             if matches!(
                 self.auth_mode(),
-                Some(AuthMode::ApiKey | AuthMode::BedrockApiKey)
+                Some(AuthMode::Chatgpt | AuthMode::Headers)
             ) {
                 let api_marketplace_path =
                     curated_plugins_api_marketplace_path(self.codex_home.as_path());

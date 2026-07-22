@@ -78,8 +78,8 @@ async fn returns_api_curated_fallback_plugins_for_direct_provider_auth() {
 
     let plugins = load_plugins_config(codex_home.path(), codex_home.path()).await;
     let plugins_manager = PluginsManager::new(codex_home.path().to_path_buf());
-    plugins_manager.set_auth_mode(Some(AuthMode::ApiKey));
-    let auth = CodexAuth::from_api_key("test-api-key");
+    plugins_manager.set_auth_mode(Some(AuthMode::Chatgpt));
+    let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
     let discoverable_plugins = list_discoverable_plugins(
         &plugins_manager,
         discovery_input(plugins, &[], &[], &[]),
@@ -273,7 +273,7 @@ source = "/tmp/{marketplace_name}"
     };
     assert_eq!(chatgpt_projection, vec![expected.clone()]);
 
-    assert!(plugins_manager.set_auth_mode(Some(AuthMode::ApiKey)));
+    assert!(plugins_manager.set_auth_mode(Some(AuthMode::Chatgpt)));
     let api_key_projection = list_discoverable_plugins(
         &plugins_manager,
         discovery_input(plugins, &[plugin_id.as_str()], &[], &[]),

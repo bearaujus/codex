@@ -1154,6 +1154,37 @@ async fn live_app_server_failed_turn_consolidates_streamed_answer() {
 }
 
 #[tokio::test]
+async fn live_app_server_server_overloaded_error_consolidates_streamed_answer() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    handle_turn_started(&mut chat, "turn-1");
+    while rx.try_recv().is_ok() {}
+
+    handle_agent_message_delta(&mut chat, "Partial answer before overload.\n");
+    chat.run_commit_tick();
+    while rx.try_recv().is_ok() {}
+
+    handle_error(
+        &mut chat,
+        "server overloaded",
+        Some(CodexErrorInfo::ServerOverloaded),
+    );
+
+    let mut saw_consolidate = false;
+    while let Ok(event) = rx.try_recv() {
+        if let AppEvent::ConsolidateAgentMessage { source, .. } = event {
+            saw_consolidate = true;
+            assert_eq!(source, "Partial answer before overload.");
+        }
+    }
+    assert!(
+        saw_consolidate,
+        "expected partial assistant output to be consolidated"
+    );
+    assert!(!chat.bottom_pane.is_task_running());
+}
+
+#[tokio::test]
 async fn live_app_server_stream_recovery_restores_previous_status_header() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 

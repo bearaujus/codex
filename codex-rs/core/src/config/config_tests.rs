@@ -939,6 +939,7 @@ fn config_toml_deserializes_model_availability_nux() {
             show_tooltips: true,
             vim_mode_default: false,
             raw_output_mode: false,
+            stream_reasoning_live: false,
             alternate_screen: AltScreenMode::default(),
             status_line: None,
             status_line_use_colors: true,
@@ -3792,6 +3793,7 @@ fn tui_config_missing_notifications_field_defaults_to_enabled() {
             show_tooltips: true,
             vim_mode_default: false,
             raw_output_mode: false,
+            stream_reasoning_live: false,
             alternate_screen: AltScreenMode::Auto,
             status_line: None,
             status_line_use_colors: true,
@@ -4010,6 +4012,35 @@ async fn runtime_config_resolves_resume_cwd_default_and_override() {
     .expect("load root override config");
 
     assert_eq!(cfg.tui_resume_cwd, Some(ResumeCwdMode::Session));
+}
+
+#[tokio::test]
+async fn runtime_config_resolves_stream_reasoning_live_default_and_override() {
+    let cfg = Config::load_from_base_config_with_overrides(
+        ConfigToml::default(),
+        ConfigOverrides::default(),
+        tempdir().expect("tempdir").abs(),
+    )
+    .await
+    .expect("load default config");
+
+    assert!(!cfg.stream_reasoning_live);
+
+    let cfg = Config::load_from_base_config_with_overrides(
+        ConfigToml {
+            tui: Some(Tui {
+                stream_reasoning_live: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        ConfigOverrides::default(),
+        tempdir().expect("tempdir").abs(),
+    )
+    .await
+    .expect("load overridden config");
+
+    assert!(cfg.stream_reasoning_live);
 }
 
 #[tokio::test]

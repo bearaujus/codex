@@ -44,6 +44,7 @@ use crate::style::proposed_plan_style;
 use crate::terminal_hyperlinks::HyperlinkLine;
 use crate::terminal_hyperlinks::prefix_hyperlink_lines;
 use ratatui::prelude::Stylize;
+use ratatui::style::Style;
 use ratatui::text::Line;
 use std::path::Path;
 use std::path::PathBuf;
@@ -756,6 +757,161 @@ impl PlanStreamController {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ReasoningStreamController — agent reasoning summary streams
+// ---------------------------------------------------------------------------
+
+/// Controller that streams reasoning-summary markdown into dim-italic cells.
+///
+/// Wraps [`StreamCore`] so completed reasoning lines commit to scrollback while
+/// the model is still thinking, leaving only the in-progress tail in the live
+/// `active_cell` — exactly like agent-message and proposed-plan streaming. This
+/// replaces the old approach that accumulated all reasoning into a single
+/// unbounded live cell, which clipped/scrolled long reasoning out of view.
+///
+/// Reasoning is prose, so the `StreamCore` table holdback never engages and
+/// every completed line flows straight to the stable region.
+pub(crate) struct ReasoningStreamController {
+    core: StreamCore,
+    header_emitted: bool,
+}
+
+impl ReasoningStreamController {
+    pub(crate) fn new(width: Option<usize>, cwd: &Path, render_mode: HistoryRenderMode) -> Self {
+        Self {
+            core: StreamCore::new(
+                width,
+                cwd,
+                render_mode,
+                /*inline_visualization_context*/ None,
+            ),
+            header_emitted: false,
+        }
+    }
+
+    pub(crate) fn push(&mut self, delta: &str) -> bool {
+        self.core.push_delta(delta)
+    }
+
+    /// Finalize the active reasoning stream, emitting any not-yet-committed lines.
+    pub(crate) fn finalize(&mut self) -> Option<Box<dyn HistoryCell>> {
+        let (remaining, source) = self.core.finalize_remaining();
+        if source.is_empty() {
+            self.core.reset();
+            return None;
+        }
+        let out = self.emit(remaining);
+        self.core.reset();
+        out
+    }
+
+    pub(crate) fn on_commit_tick(&mut self) -> (Option<Box<dyn HistoryCell>>, bool) {
+        let step = self.core.tick();
+        (self.emit(step), self.core.is_idle())
+    }
+
+    pub(crate) fn on_commit_tick_batch(
+        &mut self,
+        max_lines: usize,
+    ) -> (Option<Box<dyn HistoryCell>>, bool) {
+        let step = self.core.tick_batch(max_lines);
+        (self.emit(step), self.core.is_idle())
+    }
+
+    #[inline]
+    pub(crate) fn queued_lines(&self) -> usize {
+        self.core.queued_lines()
+    }
+
+    pub(crate) fn oldest_queued_age(&self, now: Instant) -> Option<Duration> {
+        self.core.oldest_queued_age(now)
+    }
+
+    pub(crate) fn current_tail_display_lines(&self) -> Vec<HyperlinkLine> {
+        // Reasoning streams line-by-line: completed lines commit to scrollback and the
+        // thinking spinner shows current activity, mirroring agent-message streaming.
+        // We intentionally do NOT preview the in-progress (not-yet-newline-terminated)
+        // line here. That preview was the only stream tail that overlapped the
+        // viewport/scrollback boundary while re-rendering on every delta, which on some
+        // terminals produced a transient "sliding window" duplication (a/b/c → b/c/d).
+        // Agent-message prose has no such preview and never ghosts; reasoning now matches.
+        //
+        // The held-back table region (the only case `has_tail()` is true for reasoning,
+        // since tables must re-render as a unit) is still surfaced so streamed tables do
+        // not vanish mid-render.
+        if !self.core.has_tail() {
+            return Vec::new();
+        }
+        let lines = self.core.current_tail_lines();
+        // Drop leading blank lines: the tail renders directly below already-committed
+        // reasoning, separated by the active cell's top inset, so a leading
+        // paragraph-break blank would double the visible gap.
+        let first_non_blank = lines.iter().position(|line| {
+            line.line
+                .spans
+                .iter()
+                .any(|span| !span.content.trim().is_empty())
+        });
+        let lines = match first_non_blank {
+            Some(idx) => lines[idx..].to_vec(),
+            None => return Vec::new(),
+        };
+        self.render_display_lines(lines)
+    }
+
+    pub(crate) fn clear_queue(&mut self) {
+        self.core.state.clear_queue();
+        self.core.enqueued_stable_len = self.core.emitted_stable_len;
+    }
+
+    pub(crate) fn set_width(&mut self, width: Option<usize>) {
+        self.core.set_width(width);
+    }
+
+    pub(crate) fn set_render_mode(&mut self, render_mode: HistoryRenderMode) {
+        self.core.set_render_mode(render_mode);
+    }
+
+    /// Whether the next emitted (or tail) cell continues the current reasoning
+    /// block. The first chunk of a block starts it (and gets a separating blank
+    /// line); every later chunk is a continuation and must not.
+    pub(crate) fn tail_is_continuation(&self) -> bool {
+        self.header_emitted
+    }
+
+    fn emit(&mut self, lines: Vec<HyperlinkLine>) -> Option<Box<dyn HistoryCell>> {
+        if lines.is_empty() {
+            return None;
+        }
+        let is_continuation = self.header_emitted;
+        let out_lines = self.render_display_lines(lines);
+        self.header_emitted = true;
+        Some(Box::new(history_cell::ReasoningStreamCell::new(
+            out_lines,
+            is_continuation,
+        )))
+    }
+
+    /// Style rendered lines as reasoning (dim italic) and apply the `• `/`  `
+    /// indent. The first emitted line of the stream gets the bullet; every
+    /// continuation (committed or tail) gets the blank indent.
+    fn render_display_lines(&self, lines: Vec<HyperlinkLine>) -> Vec<HyperlinkLine> {
+        let reasoning_style = Style::default().dim().italic();
+        prefix_hyperlink_lines(
+            lines,
+            if self.header_emitted {
+                "  ".into()
+            } else {
+                "• ".dim()
+            },
+            "  ".into(),
+        )
+        .into_iter()
+        .map(|line| line.style(reasoning_style))
+        .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -856,6 +1012,88 @@ mod tests {
             lines.extend(cell.transcript_lines(u16::MAX));
         }
         lines_to_plain_strings(&lines)
+    }
+
+    fn reasoning_stream_controller(width: Option<usize>) -> ReasoningStreamController {
+        ReasoningStreamController::new(width, &test_cwd(), HistoryRenderMode::Rich)
+    }
+
+    fn collect_reasoning_streamed_lines(deltas: &[&str], width: Option<usize>) -> Vec<String> {
+        let mut ctrl = reasoning_stream_controller(width);
+        let mut lines = Vec::new();
+        for d in deltas {
+            ctrl.push(d);
+            while let (Some(cell), idle) = ctrl.on_commit_tick() {
+                lines.extend(cell.transcript_lines(u16::MAX));
+                if idle {
+                    break;
+                }
+            }
+        }
+        if let Some(cell) = ctrl.finalize() {
+            lines.extend(cell.transcript_lines(u16::MAX));
+        }
+        lines_to_plain_strings(&lines)
+    }
+
+    #[test]
+    fn reasoning_controller_streams_lines_to_scrollback_with_bullet() {
+        // The whole point of routing reasoning through a stream controller: each
+        // completed reasoning line commits to scrollback as the model thinks,
+        // rather than piling up in one growing live cell that clips out of view.
+        // The block opens with the reasoning bullet; continuations use blank indent.
+        let out = collect_reasoning_streamed_lines(
+            &[
+                "First reasoning line.\n",
+                "Second reasoning line.\n",
+                "Third reasoning line.",
+            ],
+            Some(80),
+        );
+        let joined = out.join("\n");
+        assert!(joined.contains("First reasoning line."), "got: {out:?}");
+        assert!(joined.contains("Second reasoning line."), "got: {out:?}");
+        assert!(joined.contains("Third reasoning line."), "got: {out:?}");
+        assert!(
+            out.iter().any(|l| l.starts_with("• ")),
+            "reasoning block should carry the bullet prefix, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn reasoning_chunk_cells_after_first_are_stream_continuations() {
+        // The history inserter prefixes a blank line before every cell that is not
+        // a stream continuation. Reasoning commits one cell per commit tick, so if
+        // those chunk-cells were not marked as continuations the block would gain a
+        // stray blank line between chunks (varying with tick batching). Only the
+        // first chunk of the block starts it; the rest must be continuations.
+        let mut ctrl = reasoning_stream_controller(Some(80));
+        ctrl.push("Line one.\nLine two.\nLine three.\n");
+        let mut cells: Vec<Box<dyn HistoryCell>> = Vec::new();
+        while let (Some(cell), idle) = ctrl.on_commit_tick() {
+            cells.push(cell);
+            if idle {
+                break;
+            }
+        }
+        if let Some(cell) = ctrl.finalize() {
+            cells.push(cell);
+        }
+        assert!(
+            cells.len() >= 2,
+            "expected multiple chunk cells, got {}",
+            cells.len()
+        );
+        assert!(
+            !cells[0].is_stream_continuation(),
+            "first chunk should start the reasoning block"
+        );
+        for (i, cell) in cells.iter().enumerate().skip(1) {
+            assert!(
+                cell.is_stream_continuation(),
+                "chunk {i} should be a stream continuation (no separating blank line)"
+            );
+        }
     }
 
     #[test]

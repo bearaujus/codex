@@ -580,6 +580,10 @@ async fn test_rate_limit_warnings_use_secondary_fallback_for_unsupported_window(
 #[tokio::test]
 async fn status_line_uses_secondary_fallback_for_unsupported_window() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.status_account_display = Some(StatusAccountDisplay::ChatGpt {
+        email: Some("user@example.com".to_string()),
+        plan: Some("Pro".to_string()),
+    });
 
     chat.on_rate_limit_snapshot(Some(RateLimitSnapshot {
         limit_id: None,
@@ -598,14 +602,18 @@ async fn status_line_uses_secondary_fallback_for_unsupported_window() {
     }));
 
     assert_eq!(
-        chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::WeeklyLimit),
-        Some("secondary usage 50% left".to_string())
+        chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::AccountStatus),
+        Some("user@example.com  ·  secondary usage 50% left".to_string())
     );
 }
 
 #[tokio::test]
 async fn status_line_legacy_limit_items_prefer_matching_windows() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.status_account_display = Some(StatusAccountDisplay::ChatGpt {
+        email: Some("user@example.com".to_string()),
+        plan: Some("Pro".to_string()),
+    });
 
     chat.on_rate_limit_snapshot(Some(RateLimitSnapshot {
         limit_id: None,
@@ -628,18 +636,18 @@ async fn status_line_legacy_limit_items_prefer_matching_windows() {
     }));
 
     assert_eq!(
-        chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::FiveHourLimit),
-        Some("5h 60% left".to_string())
-    );
-    assert_eq!(
-        chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::WeeklyLimit),
-        Some("weekly 6% left".to_string())
+        chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::AccountStatus),
+        Some("user@example.com  ·  5h 60% left  ·  weekly 6% left".to_string())
     );
 }
 
 #[tokio::test]
 async fn status_line_shows_secondary_non_weekly_when_primary_is_weekly() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.status_account_display = Some(StatusAccountDisplay::ChatGpt {
+        email: Some("user@example.com".to_string()),
+        plan: Some("Pro".to_string()),
+    });
 
     chat.on_rate_limit_snapshot(Some(RateLimitSnapshot {
         limit_id: None,
@@ -662,17 +670,43 @@ async fn status_line_shows_secondary_non_weekly_when_primary_is_weekly() {
     }));
 
     assert_eq!(
-        chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::FiveHourLimit),
-        Some("monthly 65% left".to_string())
-    );
-    assert_eq!(
-        chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::WeeklyLimit),
-        Some("weekly 6% left".to_string())
+        chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::AccountStatus),
+        Some("user@example.com  ·  monthly 65% left  ·  weekly 6% left".to_string())
     );
 }
 
 #[tokio::test]
-async fn status_line_five_hour_item_omits_weekly_only_limit() {
+async fn status_line_account_status_omits_unavailable_five_hour_limit() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.status_account_display = Some(StatusAccountDisplay::ChatGpt {
+        email: Some("user@example.com".to_string()),
+        plan: Some("Pro".to_string()),
+    });
+
+    chat.on_rate_limit_snapshot(Some(RateLimitSnapshot {
+        limit_id: None,
+        limit_name: None,
+        primary: Some(RateLimitWindow {
+            used_percent: 9,
+            window_duration_mins: Some(7 * 24 * 60),
+            resets_at: None,
+        }),
+        secondary: None,
+        credits: None,
+        individual_limit: None,
+        plan_type: None,
+        spend_control_reached: None,
+        rate_limit_reached_type: None,
+    }));
+
+    assert_eq!(
+        chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::AccountStatus),
+        Some("user@example.com  ·  weekly 91% left".to_string())
+    );
+}
+
+#[tokio::test]
+async fn status_line_account_status_falls_back_to_rate_limits_without_account_identity() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
     chat.on_rate_limit_snapshot(Some(RateLimitSnapshot {
@@ -692,18 +726,18 @@ async fn status_line_five_hour_item_omits_weekly_only_limit() {
     }));
 
     assert_eq!(
-        chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::FiveHourLimit),
-        None
-    );
-    assert_eq!(
-        chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::WeeklyLimit),
+        chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::AccountStatus),
         Some("weekly 91% left".to_string())
     );
 }
 
 #[tokio::test]
-async fn status_line_single_monthly_primary_omits_weekly_limit_item() {
+async fn status_line_account_status_omits_unavailable_weekly_limit() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.status_account_display = Some(StatusAccountDisplay::ChatGpt {
+        email: Some("user@example.com".to_string()),
+        plan: Some("Pro".to_string()),
+    });
 
     chat.on_rate_limit_snapshot(Some(RateLimitSnapshot {
         limit_id: None,
@@ -722,18 +756,18 @@ async fn status_line_single_monthly_primary_omits_weekly_limit_item() {
     }));
 
     assert_eq!(
-        chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::FiveHourLimit),
-        Some("monthly 65% left".to_string())
-    );
-    assert_eq!(
-        chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::WeeklyLimit),
-        None
+        chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::AccountStatus),
+        Some("user@example.com  ·  monthly 65% left".to_string())
     );
 }
 
 #[tokio::test]
-async fn status_line_secondary_only_non_weekly_limit_omits_primary_limit_item() {
+async fn status_line_account_status_uses_secondary_non_weekly_limit_when_primary_missing() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.status_account_display = Some(StatusAccountDisplay::ChatGpt {
+        email: Some("user@example.com".to_string()),
+        plan: Some("Pro".to_string()),
+    });
 
     chat.on_rate_limit_snapshot(Some(RateLimitSnapshot {
         limit_id: None,
@@ -752,12 +786,96 @@ async fn status_line_secondary_only_non_weekly_limit_omits_primary_limit_item() 
     }));
 
     assert_eq!(
-        chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::FiveHourLimit),
-        None
+        chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::AccountStatus),
+        Some("user@example.com  ·  monthly 65% left".to_string())
     );
+}
+
+#[tokio::test]
+async fn legacy_limit_aliases_collapse_to_one_account_status_item() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.config.tui_status_line = Some(vec![
+        "five-hour-limit".to_string(),
+        "weekly-limit".to_string(),
+        "account-status".to_string(),
+    ]);
+
+    let (items, invalid) = chat.status_line_items_with_invalids();
+
+    assert_eq!(invalid, Vec::<String>::new());
     assert_eq!(
-        chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::WeeklyLimit),
-        Some("monthly 65% left".to_string())
+        items,
+        vec![crate::bottom_pane::StatusLineItem::AccountStatus]
+    );
+}
+
+#[tokio::test]
+async fn account_updates_replace_chatgpt_email_when_new_email_is_present() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.update_account_state(
+        Some(StatusAccountDisplay::ChatGpt {
+            email: Some("user@example.com".to_string()),
+            plan: Some("Pro".to_string()),
+        }),
+        /*plan_type*/ None,
+        /*has_chatgpt_account*/ true,
+        /*has_codex_backend_auth*/ true,
+    );
+
+    chat.update_account_state(
+        Some(StatusAccountDisplay::ChatGpt {
+            email: Some("other@example.com".to_string()),
+            plan: Some("Business".to_string()),
+        }),
+        /*plan_type*/ None,
+        /*has_chatgpt_account*/ true,
+        /*has_codex_backend_auth*/ true,
+    );
+
+    assert!(matches!(
+        chat.status_account_display.as_ref(),
+        Some(StatusAccountDisplay::ChatGpt {
+            email: Some(email),
+            plan: Some(plan),
+        }) if email == "other@example.com" && plan == "Business"
+    ));
+}
+
+#[tokio::test]
+async fn account_updates_clear_email_when_new_identity_has_none() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.update_account_state(
+        Some(StatusAccountDisplay::ChatGpt {
+            email: Some("user@example.com".to_string()),
+            plan: Some("Pro".to_string()),
+        }),
+        /*plan_type*/ None,
+        /*has_chatgpt_account*/ true,
+        /*has_codex_backend_auth*/ true,
+    );
+    chat.update_account_state(
+        Some(StatusAccountDisplay::ChatGpt {
+            email: None,
+            plan: Some("Business".to_string()),
+        }),
+        /*plan_type*/ None,
+        /*has_chatgpt_account*/ true,
+        /*has_codex_backend_auth*/ true,
+    );
+
+    assert_eq!(
+        chat.status_account_display,
+        Some(StatusAccountDisplay::ChatGpt {
+            email: None,
+            plan: Some("Business".to_string()),
+        })
+    );
+    assert_chatwidget_snapshot!(
+        "account_status_after_identity_without_email",
+        chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::AccountStatus)
+            .expect("account status should render")
     );
 }
 
@@ -981,6 +1099,30 @@ async fn rate_limit_snapshots_keep_separate_entries_per_limit_id() {
     );
     assert_eq!(other.primary.as_ref().map(|w| w.used_percent), Some(90.0));
     assert!(other.credits.is_none());
+}
+
+#[tokio::test]
+async fn expired_rate_limit_countdown_does_not_keep_waking_idle_ui() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.config.tui_status_line = Some(vec!["account-status".to_string()]);
+
+    chat.on_rate_limit_snapshot(Some(RateLimitSnapshot {
+        limit_id: Some("codex".to_string()),
+        limit_name: Some("codex".to_string()),
+        primary: Some(RateLimitWindow {
+            used_percent: 20,
+            window_duration_mins: Some(300),
+            resets_at: Some(1),
+        }),
+        secondary: None,
+        credits: None,
+        individual_limit: None,
+        plan_type: Some(PlanType::Pro),
+        spend_control_reached: None,
+        rate_limit_reached_type: None,
+    }));
+
+    assert_eq!(chat.rate_limit_countdown_refresh_due, None);
 }
 
 #[tokio::test]
@@ -1930,6 +2072,29 @@ fn assert_no_owner_nudge_or_rate_limit_refresh(
 }
 
 #[tokio::test]
+async fn previous_item_delta_does_not_hide_next_completed_response() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.on_agent_message_delta_for_item(
+        "item-before-retry".to_string(),
+        "Partial response before retry.\n".to_string(),
+    );
+    complete_assistant_message(
+        &mut chat,
+        "item-after-retry",
+        "Completed response after retry.",
+        Some(MessagePhase::FinalAnswer),
+    );
+
+    let rendered = drain_insert_history(&mut rx)
+        .into_iter()
+        .map(|cell| lines_to_single_string(&cell))
+        .collect::<String>();
+    assert!(rendered.contains("Completed response after retry."));
+    assert_chatwidget_snapshot!("completed_response_after_prior_item_delta", rendered);
+}
+
+#[tokio::test]
 async fn streaming_final_answer_keeps_task_running_state() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.thread_id = Some(ThreadId::new());
@@ -2575,6 +2740,16 @@ async fn status_widget_active_snapshot() {
 }
 
 #[tokio::test]
+async fn plain_reasoning_delta_sets_thinking_status_header() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    handle_turn_started(&mut chat, "turn-1");
+    handle_agent_reasoning_delta(&mut chat, "analyzing request");
+
+    assert_eq!(chat.status_state.current_status.header, "Thinking");
+}
+
+#[tokio::test]
 async fn stream_error_updates_status_indicator() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.bottom_pane.set_task_running(/*running*/ true);
@@ -2710,7 +2885,7 @@ async fn status_line_context_used_renders_labeled_percent() {
 
     chat.refresh_status_line();
 
-    assert_eq!(status_line_text(&chat), Some("Context 0% used".to_string()));
+    assert_eq!(status_line_text(&chat), Some("ctx 0% used".to_string()));
     assert!(
         drain_insert_history(&mut rx).is_empty(),
         "context-used should remain a valid status line item"
@@ -2725,10 +2900,7 @@ async fn status_line_context_remaining_renders_labeled_percent() {
 
     chat.refresh_status_line();
 
-    assert_eq!(
-        status_line_text(&chat),
-        Some("Context 100% left".to_string())
-    );
+    assert_eq!(status_line_text(&chat), Some("ctx 100%".to_string()));
     assert!(
         drain_insert_history(&mut rx).is_empty(),
         "context-remaining should remain a valid status line item"
@@ -2743,7 +2915,7 @@ async fn status_line_legacy_context_usage_renders_context_used_percent() {
 
     chat.refresh_status_line();
 
-    assert_eq!(status_line_text(&chat), Some("Context 0% used".to_string()));
+    assert_eq!(status_line_text(&chat), Some("ctx 0% used".to_string()));
     assert!(
         drain_insert_history(&mut rx).is_empty(),
         "legacy context-usage should remain a valid status line item"
@@ -3117,7 +3289,7 @@ async fn status_line_model_with_reasoning_includes_fast_for_fast_capable_models(
 
     assert_eq!(
         status_line_text(&chat),
-        Some(format!("gpt-5.4 xhigh fast · Context 0% used · {test_cwd}"))
+        Some(format!("gpt-5.4 xhigh fast  │  ctx 0% used  │  {test_cwd}"))
     );
 
     chat.set_model("gpt-5.2");
@@ -3125,7 +3297,7 @@ async fn status_line_model_with_reasoning_includes_fast_for_fast_capable_models(
 
     assert_eq!(
         status_line_text(&chat),
-        Some(format!("gpt-5.2 xhigh · Context 0% used · {test_cwd}"))
+        Some(format!("gpt-5.2 xhigh  │  ctx 0% used  │  {test_cwd}"))
     );
 }
 
@@ -3749,7 +3921,7 @@ async fn deltas_then_same_final_message_are_rendered_snapshot() {
 
     complete_assistant_message(
         &mut chat,
-        "msg-result",
+        "msg-1",
         "Here is the result.",
         /*phase*/ None,
     );

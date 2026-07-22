@@ -33,13 +33,9 @@ pub enum PlanType {
 /// Account state returned by a model provider before it is adapted to an app-facing wire type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderAccount {
-    ApiKey,
     Chatgpt {
         email: Option<String>,
         plan_type: PlanType,
-    },
-    AmazonBedrock {
-        uses_codex_managed_credentials: bool,
     },
 }
 

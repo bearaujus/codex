@@ -10,14 +10,6 @@ use codex_arg0::Arg0DispatchPaths;
 use codex_arg0::arg0_dispatch_or_else;
 use codex_chatgpt::apply_command::ApplyCommand;
 use codex_chatgpt::apply_command::run_apply_command;
-use codex_cli::read_access_token_from_stdin;
-use codex_cli::read_api_key_from_stdin;
-use codex_cli::run_login_status;
-use codex_cli::run_login_with_access_token;
-use codex_cli::run_login_with_api_key;
-use codex_cli::run_login_with_chatgpt;
-use codex_cli::run_login_with_device_code;
-use codex_cli::run_logout;
 use codex_cloud_tasks::Cli as CloudTasksCli;
 use codex_exec::Cli as ExecCli;
 use codex_exec::Command as ExecCommand;
@@ -50,6 +42,7 @@ mod app_cmd;
 mod desktop_app;
 mod doctor;
 mod exec_server_telemetry;
+mod info_cmd;
 mod marketplace_cmd;
 mod mcp_cmd;
 mod plugin_cmd;
@@ -65,6 +58,7 @@ use crate::plugin_cmd::PluginCli;
 use crate::plugin_cmd::PluginSubcommand;
 use crate::remote_control_cmd::RemoteControlCommand;
 use doctor::DoctorCommand;
+use info_cmd::InfoCommand;
 use state_db_recovery as local_state_db;
 
 use codex_config::LoaderOverrides;
@@ -104,6 +98,16 @@ use codex_terminal_detection::TerminalName;
     override_usage = "codex [OPTIONS] [PROMPT]\n       codex [OPTIONS] <COMMAND> [ARGS]"
 )]
 struct MultitoolCli {
+    /// Override the Codex home directory (defaults to ~/.codex or $CODEX_HOME).
+    /// The directory is created automatically if it does not exist, making this
+    /// convenient for project-scoped or workspace-scoped Codex invocations.
+    ///
+    /// Examples:
+    ///   codex --codex-home /projects/myapp/.codex
+    ///   codex --codex-home ~/workspaces/myapp
+    #[arg(long = "codex-home", global = true, value_name = "PATH")]
+    pub codex_home: Option<std::path::PathBuf>,
+
     #[clap(flatten)]
     pub config_overrides: CliConfigOverrides,
 
@@ -128,12 +132,6 @@ enum Subcommand {
 
     /// Run a code review non-interactively.
     Review(ReviewCommand),
-
-    /// Manage login.
-    Login(LoginCommand),
-
-    /// Remove stored authentication credentials.
-    Logout(LogoutCommand),
 
     /// Manage external MCP servers for Codex.
     Mcp(McpCli),
@@ -162,6 +160,9 @@ enum Subcommand {
 
     /// Diagnose local Codex installation, config, auth, and runtime health.
     Doctor(DoctorCommand),
+
+    /// Print the client metadata and headers Codex derives for API requests.
+    Info(InfoCommand),
 
     /// Run commands within a Codex-provided sandbox.
     Sandbox(HostSandboxArgs),
@@ -454,61 +455,6 @@ enum ExecpolicySubcommand {
     /// Check execpolicy files against a command.
     #[clap(name = "check")]
     Check(ExecPolicyCheckCommand),
-}
-
-#[derive(Debug, Parser)]
-struct LoginCommand {
-    #[clap(skip)]
-    config_overrides: CliConfigOverrides,
-
-    #[arg(
-        long = "with-api-key",
-        help = "Read the API key from stdin (e.g. `printenv OPENAI_API_KEY | codex login --with-api-key`)"
-    )]
-    with_api_key: bool,
-
-    #[arg(
-        long = "with-access-token",
-        help = "Read the access token from stdin (e.g. `printenv CODEX_ACCESS_TOKEN | codex login --with-access-token`)"
-    )]
-    with_access_token: bool,
-
-    #[arg(
-        long = "api-key",
-        num_args = 0..=1,
-        default_missing_value = "",
-        value_name = "API_KEY",
-        help = "(deprecated) Previously accepted the API key directly; now exits with guidance to use --with-api-key",
-        hide = true
-    )]
-    api_key: Option<String>,
-
-    #[arg(long = "device-auth")]
-    use_device_code: bool,
-
-    /// EXPERIMENTAL: Use custom OAuth issuer base URL (advanced)
-    /// Override the OAuth issuer base URL (advanced)
-    #[arg(long = "experimental_issuer", value_name = "URL", hide = true)]
-    issuer_base_url: Option<String>,
-
-    /// EXPERIMENTAL: Use custom OAuth client ID (advanced)
-    #[arg(long = "experimental_client-id", value_name = "CLIENT_ID", hide = true)]
-    client_id: Option<String>,
-
-    #[command(subcommand)]
-    action: Option<LoginSubcommand>,
-}
-
-#[derive(Debug, clap::Subcommand)]
-enum LoginSubcommand {
-    /// Show login status.
-    Status,
-}
-
-#[derive(Debug, Parser)]
-struct LogoutCommand {
-    #[clap(skip)]
-    config_overrides: CliConfigOverrides,
 }
 
 #[derive(Debug, Parser)]
@@ -954,6 +900,11 @@ fn stage_str(stage: Stage) -> &'static str {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Apply `--codex-home` here, before `arg0_dispatch_or_else` starts a
+    // multi-threaded Tokio runtime. Mutating the environment is only sound
+    // while the process is single-threaded, which is no longer true once the
+    // runtime (and its worker threads) exist.
+    apply_codex_home_override_from_args()?;
     let remote_control_disabled = codex_app_server::take_remote_control_disabled_env();
     arg0_dispatch_or_else(move |arg0_paths: Arg0DispatchPaths| async move {
         cli_main(arg0_paths, remote_control_disabled).await?;
@@ -961,11 +912,45 @@ fn main() -> anyhow::Result<()> {
     })
 }
 
+/// Scans the raw process arguments for `--codex-home <PATH>` (or
+/// `--codex-home=<PATH>`) and, when present, creates the directory and points
+/// `CODEX_HOME` at it. The clap flag on [`MultitoolCli`] still documents and
+/// validates the option; this early pass exists only so the `set_var` runs
+/// while the process is still single-threaded. Auto-creation is intentionally
+/// limited to this explicit flag — a missing ambient `CODEX_HOME` remains an
+/// error (see `codex_utils_home_dir::find_codex_home`).
+fn apply_codex_home_override_from_args() -> anyhow::Result<()> {
+    if let Some(path) = codex_home_override_from_args(std::env::args_os()) {
+        std::fs::create_dir_all(&path).map_err(|err| {
+            anyhow::anyhow!("failed to create --codex-home {}: {err}", path.display())
+        })?;
+        // SAFETY: called from `main()` before the async runtime starts, so the
+        // process is single-threaded and no other thread can be reading the
+        // environment concurrently.
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::set_var("CODEX_HOME", &path);
+        }
+    }
+    Ok(())
+}
+
+fn codex_home_override_from_args<I, T>(args: I) -> Option<PathBuf>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    MultitoolCli::try_parse_from(args).ok()?.codex_home
+}
+
 async fn cli_main(
     arg0_paths: Arg0DispatchPaths,
     remote_control_disabled: bool,
 ) -> anyhow::Result<()> {
     let MultitoolCli {
+        // `--codex-home` is applied in `main()` before the runtime starts; see
+        // `apply_codex_home_override_from_args`.
+        codex_home: _,
         config_overrides: mut root_config_overrides,
         feature_toggles,
         remote,
@@ -1096,6 +1081,14 @@ async fn cli_main(
                     plugin_cmd::run_plugin_remove(overrides, args).await?;
                 }
             }
+        }
+        Some(Subcommand::Info(info)) => {
+            reject_remote_mode_for_subcommand(
+                root_remote.as_deref(),
+                root_remote_auth_token_env.as_deref(),
+                "info",
+            )?;
+            info_cmd::run_info(info)?;
         }
         Some(Subcommand::AppServer(app_server_cli)) => {
             let AppServerCommand {
@@ -1335,62 +1328,6 @@ async fn cli_main(
             )
             .await?;
             handle_app_exit(exit_info)?;
-        }
-        Some(Subcommand::Login(mut login_cli)) => {
-            reject_remote_mode_for_subcommand(
-                root_remote.as_deref(),
-                root_remote_auth_token_env.as_deref(),
-                "login",
-            )?;
-            prepend_config_flags(
-                &mut login_cli.config_overrides,
-                root_config_overrides.clone(),
-            );
-            match login_cli.action {
-                Some(LoginSubcommand::Status) => {
-                    run_login_status(login_cli.config_overrides).await;
-                }
-                None => {
-                    if login_cli.with_api_key && login_cli.with_access_token {
-                        eprintln!(
-                            "Choose one login credential source: --with-api-key or --with-access-token."
-                        );
-                        std::process::exit(1);
-                    } else if login_cli.use_device_code {
-                        run_login_with_device_code(
-                            login_cli.config_overrides,
-                            login_cli.issuer_base_url,
-                            login_cli.client_id,
-                        )
-                        .await;
-                    } else if login_cli.api_key.is_some() {
-                        eprintln!(
-                            "The --api-key flag is no longer supported. Pipe the key instead, e.g. `printenv OPENAI_API_KEY | codex login --with-api-key`."
-                        );
-                        std::process::exit(1);
-                    } else if login_cli.with_api_key {
-                        let api_key = read_api_key_from_stdin();
-                        run_login_with_api_key(login_cli.config_overrides, api_key).await;
-                    } else if login_cli.with_access_token {
-                        let access_token = read_access_token_from_stdin();
-                        run_login_with_access_token(login_cli.config_overrides, access_token).await;
-                    } else {
-                        run_login_with_chatgpt(login_cli.config_overrides).await;
-                    }
-                }
-            }
-        }
-        Some(Subcommand::Logout(mut logout_cli)) => {
-            reject_remote_mode_for_subcommand(
-                root_remote.as_deref(),
-                root_remote_auth_token_env.as_deref(),
-                "logout",
-            )?;
-            prepend_config_flags(
-                &mut logout_cli.config_overrides,
-                root_config_overrides.clone(),
-            );
-            run_logout(logout_cli.config_overrides).await;
         }
         Some(Subcommand::Completion(completion_cli)) => {
             reject_remote_mode_for_subcommand(
@@ -1732,7 +1669,7 @@ async fn run_exec_server_command(
 
 async fn load_exec_server_remote_auth_provider(
     config: &codex_core::config::Config,
-    base_url: &str,
+    _base_url: &str,
     use_agent_identity_auth: bool,
 ) -> anyhow::Result<codex_api::SharedAuthProvider> {
     if use_agent_identity_auth {
@@ -1751,59 +1688,21 @@ async fn load_exec_server_remote_auth_provider(
 
     let auth = load_exec_server_remote_auth(
         config,
-        "remote exec-server registration requires ChatGPT authentication or API key authentication; run `codex login` or set CODEX_API_KEY",
+        "remote exec-server registration requires ChatGPT authentication; configure ChatGPT through app-server OAuth or device-code login, or use --use-agent-identity-auth with CODEX_ACCESS_TOKEN",
     )
     .await?;
 
     if !is_supported_exec_server_remote_auth(&auth) {
         anyhow::bail!(
-            "remote exec-server registration requires ChatGPT authentication or API key authentication; Agent Identity auth requires --use-agent-identity-auth"
+            "remote exec-server registration requires ChatGPT authentication; Agent Identity auth requires --use-agent-identity-auth"
         );
-    }
-
-    if auth.is_api_key_auth() {
-        validate_api_key_remote_host(base_url)?;
     }
 
     Ok(codex_model_provider::auth_provider_from_auth(&auth))
 }
 
 fn is_supported_exec_server_remote_auth(auth: &CodexAuth) -> bool {
-    auth.is_chatgpt_auth() || auth.is_api_key_auth()
-}
-
-fn validate_api_key_remote_host(base_url: &str) -> anyhow::Result<()> {
-    let url = url::Url::parse(base_url)
-        .map_err(|err| anyhow::anyhow!("invalid remote exec-server registration URL: {err}"))?;
-    let host = url.host().ok_or_else(|| {
-        anyhow::anyhow!("remote exec-server registration URL must include a host")
-    })?;
-
-    let is_loopback = match &host {
-        url::Host::Domain(host) => host.eq_ignore_ascii_case("localhost"),
-        url::Host::Ipv4(ip) => ip.is_loopback(),
-        url::Host::Ipv6(ip) => ip.is_loopback(),
-    };
-    let is_openai_host = match &host {
-        url::Host::Domain(host) => ["openai.com", "openai.org"].into_iter().any(|domain| {
-            host.eq_ignore_ascii_case(domain)
-                || host.to_ascii_lowercase().ends_with(&format!(".{domain}"))
-        }),
-        _ => false,
-    };
-    let is_allowed = match url.scheme() {
-        "https" => is_loopback || is_openai_host,
-        "http" => is_loopback,
-        _ => false,
-    };
-
-    if !is_allowed {
-        anyhow::bail!(
-            "remote exec-server API-key authentication is restricted to HTTPS openai.com and openai.org hosts and subdomains or loopback hosts"
-        );
-    }
-
-    Ok(())
+    auth.is_chatgpt_auth()
 }
 
 async fn load_exec_server_config(
@@ -1824,8 +1723,7 @@ async fn load_exec_server_remote_auth(
     config: &codex_core::config::Config,
     missing_auth_error: &'static str,
 ) -> anyhow::Result<codex_login::CodexAuth> {
-    let auth_manager =
-        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ true).await;
+    let auth_manager = AuthManager::shared_from_config(config).await;
 
     let auth = match auth_manager.auth().await {
         Some(auth) => auth,
@@ -1999,8 +1897,7 @@ async fn run_debug_models_command(
             .cli_overrides(cli_overrides)
             .build()
             .await?;
-        let auth_manager =
-            AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ true).await;
+        let auth_manager = AuthManager::shared_from_config(&config).await;
         let models_manager = build_models_manager(&config, auth_manager);
         models_manager
             .raw_model_catalog(
@@ -2124,10 +2021,9 @@ fn unsupported_subcommand_name_for_strict_config(
         Some(Subcommand::RemoteControl(remote_control)) => Some(remote_control.subcommand_name()),
         Some(Subcommand::Mcp(_)) => Some("mcp"),
         Some(Subcommand::Plugin(_)) => Some("plugin"),
+        Some(Subcommand::Info(_)) => Some("info"),
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         Some(Subcommand::App(_)) => Some("app"),
-        Some(Subcommand::Login(_)) => Some("login"),
-        Some(Subcommand::Logout(_)) => Some("logout"),
         Some(Subcommand::Completion(_)) => Some("completion"),
         Some(Subcommand::Update) => Some("update"),
         Some(Subcommand::Cloud(_)) => Some("cloud"),
@@ -2502,66 +2398,17 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn exec_server_remote_auth_accepts_api_key_auth() {
-        let auth = CodexAuth::from_api_key("sk-test");
+    fn exec_server_remote_auth_accepts_chatgpt_auth() {
+        let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
 
         assert!(is_supported_exec_server_remote_auth(&auth));
-    }
-
-    #[test]
-    fn exec_server_remote_api_key_auth_accepts_https_openai_domains() {
-        for base_url in [
-            "https://openai.com/api",
-            "https://service.openai.com/api",
-            "https://openai.org/api",
-            "https://service.openai.org/api",
-        ] {
-            assert!(validate_api_key_remote_host(base_url).is_ok());
-        }
-    }
-
-    #[test]
-    fn exec_server_remote_api_key_auth_accepts_http_loopback() {
-        for base_url in [
-            "http://localhost:8098/api",
-            "http://127.0.0.1:8098/api",
-            "http://[::1]:8098/api",
-        ] {
-            assert!(validate_api_key_remote_host(base_url).is_ok());
-        }
-    }
-
-    #[test]
-    fn exec_server_remote_api_key_auth_rejects_http_openai_domain() {
-        for base_url in [
-            "http://service.openai.com/api",
-            "http://service.openai.org/api",
-        ] {
-            let error = validate_api_key_remote_host(base_url)
-                .expect_err("reject plaintext OpenAI destination");
-
-            assert_eq!(
-                error.to_string(),
-                "remote exec-server API-key authentication is restricted to HTTPS openai.com and openai.org hosts and subdomains or loopback hosts"
-            );
-        }
-    }
-
-    #[test]
-    fn exec_server_remote_api_key_auth_rejects_suffix_spoof() {
-        let error = validate_api_key_remote_host("https://service.openai.org.evil.example/api")
-            .expect_err("reject suffix spoof");
-
-        assert_eq!(
-            error.to_string(),
-            "remote exec-server API-key authentication is restricted to HTTPS openai.com and openai.org hosts and subdomains or loopback hosts"
-        );
     }
 
     fn finalize_resume_from_args(args: &[&str]) -> TuiCli {
         let cli = MultitoolCli::try_parse_from(args).expect("parse");
         let MultitoolCli {
             interactive,
+            codex_home: _,
             config_overrides: root_overrides,
             subcommand,
             feature_toggles: _,
@@ -2596,6 +2443,7 @@ mod tests {
         let cli = MultitoolCli::try_parse_from(args).expect("parse");
         let MultitoolCli {
             interactive,
+            codex_home: _,
             config_overrides: root_overrides,
             subcommand,
             feature_toggles: _,
@@ -2625,6 +2473,7 @@ mod tests {
             subcommand,
             feature_toggles: _,
             remote: _,
+            codex_home: _,
         } = cli;
 
         let Subcommand::Archive(SessionArchiveCommand {
@@ -2689,6 +2538,24 @@ mod tests {
     }
 
     #[test]
+    fn codex_home_override_from_args_requires_a_valid_parse() {
+        assert_eq!(
+            codex_home_override_from_args(["codex", "--codex-home", "sandbox-home", "info"]),
+            Some(PathBuf::from("sandbox-home"))
+        );
+        assert_eq!(
+            codex_home_override_from_args(["codex", "--codex-home", "--json", "info"]),
+            None
+        );
+        assert_eq!(
+            codex_home_override_from_args(
+                ["codex", "--codex-home", "sandbox-home", "--bogusflag",]
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn import_remains_an_interactive_prompt() {
         let cli = MultitoolCli::try_parse_from(["codex", "import"]).expect("parse");
 
@@ -2719,6 +2586,16 @@ mod tests {
         assert!(args.last);
         assert_eq!(args.session_id, None);
         assert_eq!(args.prompt.as_deref(), Some("2+2"));
+    }
+
+    #[test]
+    fn info_command_accepts_json_flag() {
+        let cli = MultitoolCli::try_parse_from(["codex", "info", "--json"])
+            .expect("parse should succeed");
+        let Some(Subcommand::Info(InfoCommand { json })) = cli.subcommand else {
+            panic!("expected info subcommand");
+        };
+        assert!(json);
     }
 
     #[test]

@@ -19,18 +19,8 @@ use ts_rs::TS;
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Display, JsonSchema, TS)]
 #[serde(rename_all = "lowercase")]
 pub enum AuthMode {
-    /// OpenAI API key provided by the caller and stored by Codex.
-    ApiKey,
-    /// ChatGPT OAuth managed by Codex (tokens persisted and refreshed by Codex).
+    /// ChatGPT OAuth managed via the ChatGPT account pool.
     Chatgpt,
-    /// [UNSTABLE] FOR OPENAI INTERNAL USE ONLY - DO NOT USE.
-    ///
-    /// ChatGPT auth tokens are supplied by an external host app and are only
-    /// stored in memory. Token refresh must be handled by the external host app.
-    #[serde(rename = "chatgptAuthTokens")]
-    #[ts(rename = "chatgptAuthTokens")]
-    #[strum(serialize = "chatgptAuthTokens")]
-    ChatgptAuthTokens,
     /// Backend auth supplied as request headers.
     #[serde(rename = "headers")]
     #[ts(rename = "headers")]
@@ -41,37 +31,17 @@ pub enum AuthMode {
     #[ts(rename = "agentIdentity")]
     #[strum(serialize = "agentIdentity")]
     AgentIdentity,
-    /// Programmatic Codex auth backed by a personal access token.
-    #[serde(rename = "personalAccessToken")]
-    #[ts(rename = "personalAccessToken")]
-    #[strum(serialize = "personalAccessToken")]
-    PersonalAccessToken,
-    /// Amazon Bedrock bearer token managed by Codex.
-    #[serde(rename = "bedrockApiKey")]
-    #[ts(rename = "bedrockApiKey")]
-    #[strum(serialize = "bedrockApiKey")]
-    BedrockApiKey,
 }
 
 impl AuthMode {
     /// Returns whether this mode represents an authenticated human ChatGPT account.
     pub fn has_chatgpt_account(self) -> bool {
-        match self {
-            Self::Chatgpt | Self::ChatgptAuthTokens | Self::PersonalAccessToken => true,
-            Self::ApiKey | Self::Headers | Self::AgentIdentity | Self::BedrockApiKey => false,
-        }
+        matches!(self, Self::Chatgpt)
     }
 
     /// Returns whether this mode is backed by Codex services rather than a direct model API.
     pub fn uses_codex_backend(self) -> bool {
-        match self {
-            Self::Chatgpt
-            | Self::ChatgptAuthTokens
-            | Self::Headers
-            | Self::AgentIdentity
-            | Self::PersonalAccessToken => true,
-            Self::ApiKey | Self::BedrockApiKey => false,
-        }
+        matches!(self, Self::Chatgpt | Self::Headers | Self::AgentIdentity)
     }
 }
 
@@ -1519,11 +1489,6 @@ server_request_definitions! {
         response: v2::DynamicToolCallResponse,
     },
 
-    ChatgptAuthTokensRefresh => "account/chatgptAuthTokens/refresh" {
-        params: v2::ChatgptAuthTokensRefreshParams,
-        response: v2::ChatgptAuthTokensRefreshResponse,
-    },
-
     /// Generate a fresh upstream attestation result on demand.
     AttestationGenerate => "attestation/generate" {
         params: v2::AttestationGenerateParams,
@@ -2424,29 +2389,6 @@ mod tests {
     }
 
     #[test]
-    fn serialize_chatgpt_auth_tokens_refresh_request() -> Result<()> {
-        let request = ServerRequest::ChatgptAuthTokensRefresh {
-            request_id: RequestId::Integer(8),
-            params: v2::ChatgptAuthTokensRefreshParams {
-                reason: v2::ChatgptAuthTokensRefreshReason::Unauthorized,
-                previous_account_id: Some("org-123".to_string()),
-            },
-        };
-        assert_eq!(
-            json!({
-                "method": "account/chatgptAuthTokens/refresh",
-                "id": 8,
-                "params": {
-                    "reason": "unauthorized",
-                    "previousAccountId": "org-123"
-                }
-            }),
-            serde_json::to_value(&request)?,
-        );
-        Ok(())
-    }
-
-    #[test]
     fn serialize_attestation_generate_request() -> Result<()> {
         let params = v2::AttestationGenerateParams {};
         let request = ServerRequest::AttestationGenerate {
@@ -2753,56 +2695,6 @@ mod tests {
     }
 
     #[test]
-    fn serialize_account_login_api_key() -> Result<()> {
-        let request = ClientRequest::LoginAccount {
-            request_id: RequestId::Integer(2),
-            params: v2::LoginAccountParams::ApiKey {
-                api_key: "secret".to_string(),
-            },
-        };
-        assert_eq!(
-            json!({
-                "method": "account/login/start",
-                "id": 2,
-                "params": {
-                    "type": "apiKey",
-                    "apiKey": "secret"
-                }
-            }),
-            serde_json::to_value(&request)?,
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn serialize_account_login_amazon_bedrock() -> Result<()> {
-        let request = ClientRequest::LoginAccount {
-            request_id: RequestId::Integer(2),
-            params: v2::LoginAccountParams::AmazonBedrock {
-                api_key: "secret".to_string(),
-                region: "us-west-2".to_string(),
-            },
-        };
-        assert_eq!(
-            json!({
-                "method": "account/login/start",
-                "id": 2,
-                "params": {
-                    "type": "amazonBedrock",
-                    "apiKey": "secret",
-                    "region": "us-west-2"
-                }
-            }),
-            serde_json::to_value(&request)?,
-        );
-        assert_eq!(
-            json!({"type": "amazonBedrock"}),
-            serde_json::to_value(v2::LoginAccountResponse::AmazonBedrock {})?,
-        );
-        Ok(())
-    }
-
-    #[test]
     fn serialize_account_login_chatgpt() -> Result<()> {
         let request = ClientRequest::LoginAccount {
             request_id: RequestId::Integer(3),
@@ -2913,32 +2805,6 @@ mod tests {
     }
 
     #[test]
-    fn serialize_account_login_chatgpt_auth_tokens() -> Result<()> {
-        let request = ClientRequest::LoginAccount {
-            request_id: RequestId::Integer(6),
-            params: v2::LoginAccountParams::ChatgptAuthTokens {
-                access_token: "access-token".to_string(),
-                chatgpt_account_id: "org-123".to_string(),
-                chatgpt_plan_type: Some("business".to_string()),
-            },
-        };
-        assert_eq!(
-            json!({
-                "method": "account/login/start",
-                "id": 6,
-                "params": {
-                    "type": "chatgptAuthTokens",
-                    "accessToken": "access-token",
-                    "chatgptAccountId": "org-123",
-                    "chatgptPlanType": "business"
-                }
-            }),
-            serde_json::to_value(&request)?,
-        );
-        Ok(())
-    }
-
-    #[test]
     fn serialize_get_account() -> Result<()> {
         let request = ClientRequest::GetAccount {
             request_id: RequestId::Integer(6),
@@ -2975,14 +2841,6 @@ mod tests {
 
     #[test]
     fn account_serializes_fields_in_camel_case() -> Result<()> {
-        let api_key = v2::Account::ApiKey {};
-        assert_eq!(
-            json!({
-                "type": "apiKey",
-            }),
-            serde_json::to_value(&api_key)?,
-        );
-
         let chatgpt = v2::Account::Chatgpt {
             email: Some("user@example.com".to_string()),
             plan_type: PlanType::Plus,
@@ -3009,41 +2867,6 @@ mod tests {
             serde_json::to_value(&chatgpt_without_email)?,
         );
 
-        let codex_managed_bedrock = v2::Account::AmazonBedrock {
-            uses_codex_managed_credentials: true,
-        };
-        assert_eq!(
-            json!({
-                "type": "amazonBedrock",
-                "usesCodexManagedCredentials": true,
-            }),
-            serde_json::to_value(&codex_managed_bedrock)?,
-        );
-
-        let externally_managed_bedrock = v2::Account::AmazonBedrock {
-            uses_codex_managed_credentials: false,
-        };
-        assert_eq!(
-            json!({
-                "type": "amazonBedrock",
-                "usesCodexManagedCredentials": false,
-            }),
-            serde_json::to_value(&externally_managed_bedrock)?,
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn account_defaults_legacy_bedrock_managed_credentials_flag() -> Result<()> {
-        assert_eq!(
-            v2::Account::AmazonBedrock {
-                uses_codex_managed_credentials: false,
-            },
-            serde_json::from_value(json!({
-                "type": "amazonBedrock",
-            }))?,
-        );
         Ok(())
     }
 

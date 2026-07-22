@@ -1,0 +1,5 @@
+---
+source: tui/src/chatwidget/tests/status_and_layout.rs
+expression: "chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::AccountStatus).expect(\"account status should render\")"
+---
+Business

@@ -438,6 +438,7 @@ async fn strict_auto_review_turn_grant_forces_guardian_for_shell_command_policy_
     );
     let session = Arc::new(session);
     let turn_context = Arc::new(turn_context_raw);
+    let expiration_ms: u64 = if cfg!(windows) { 2_500 } else { 1_000 };
 
     let handler = crate::tools::handlers::ShellCommandHandler::from(
         codex_tools::ShellCommandBackendConfig::Classic,
@@ -460,7 +461,7 @@ async fn strict_auto_review_turn_grant_forces_guardian_for_shell_command_policy_
                     "command": "echo hi",
                     "login": false,
                     "workdir": workdir,
-                    "timeout_ms": 1_000_u64,
+                    "timeout_ms": expiration_ms,
                 })
                 .to_string(),
             },
@@ -707,7 +708,8 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
         }
     );
 
-    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
+    let auth_manager =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
     let models_manager = models_manager_with_provider(
         config.codex_home.to_path_buf(),
         auth_manager.clone(),

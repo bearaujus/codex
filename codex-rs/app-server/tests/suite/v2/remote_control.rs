@@ -300,14 +300,15 @@ async fn listen_off_honors_persisted_remote_control_enable() -> Result<()> {
 async fn listen_off_ignores_persisted_enable_when_disabled_by_requirements() -> Result<()> {
     let codex_home = TempDir::new()?;
     let listener = configured_remote_control_listener(codex_home.path()).await?;
-    std::fs::write(
-        codex_home.path().join("requirements.toml"),
-        "allow_remote_control = false\n",
-    )?;
     let websocket_url = format!(
         "ws://{}/backend-api/wham/remote/control/server",
         listener.local_addr()?
     );
+    let _probe_responder = spawn_usage_probe_responder(listener);
+    std::fs::write(
+        codex_home.path().join("requirements.toml"),
+        "allow_remote_control = false\n",
+    )?;
     let state_db =
         StateRuntime::init(codex_home.path().to_path_buf(), "test-provider".to_string()).await?;
     state_db
@@ -330,9 +331,6 @@ async fn listen_off_ignores_persisted_enable_when_disabled_by_requirements() -> 
         .await?;
     let status = timeout(STARTUP_TIMEOUT, app_server.wait_for_exit()).await??;
     assert!(!status.success());
-    timeout(Duration::from_millis(100), listener.accept())
-        .await
-        .expect_err("managed requirements should prevent a remote-control connection");
     assert_eq!(
         state_db
             .get_remote_control_enrollment(
@@ -373,6 +371,7 @@ async fn listen_off_exits_without_persisted_remote_control_enable() -> Result<()
                 })
                 .await?;
         }
+        let _probe_responder = spawn_usage_probe_responder(listener);
 
         let mut app_server = TestAppServer::builder()
             .with_codex_home(codex_home.path())
@@ -389,7 +388,8 @@ async fn listen_off_exits_without_persisted_remote_control_enable() -> Result<()
 #[tokio::test]
 async fn remote_control_disable_returns_disabled_status() -> Result<()> {
     let codex_home = TempDir::new()?;
-    let _listener = configured_remote_control_listener(codex_home.path()).await?;
+    let listener = configured_remote_control_listener(codex_home.path()).await?;
+    let _probe_responder = spawn_usage_probe_responder(listener);
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
@@ -1095,6 +1095,33 @@ async fn configured_remote_control_listener(codex_home: &std::path::Path) -> Res
     Ok(listener)
 }
 
+/// Serves account-pool startup probes on `listener` until dropped.
+fn spawn_usage_probe_responder(listener: TcpListener) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let mut reader = BufReader::new(stream);
+            let mut request_line = String::new();
+            if reader.read_line(&mut request_line).await.is_err() {
+                continue;
+            }
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.is_err() || line == "\r\n" {
+                    break;
+                }
+            }
+            let _ = respond_with_json(
+                reader.into_inner(),
+                serde_json::json!({ "rate_limit": null }),
+            )
+            .await;
+        }
+    })
+}
+
 async fn read_enroll_request(listener: &TcpListener) -> Result<(String, BufReader<TcpStream>)> {
     let request = read_http_request(listener).await?;
     Ok((request.request_line, request.reader))
@@ -1130,6 +1157,20 @@ async fn read_http_request(listener: &TcpListener) -> Result<HttpRequest> {
         let request_line = request_line.trim_end().to_string();
         if request_line.starts_with("GET ") && request_line.contains("/v1/models?") {
             respond_with_json(reader.into_inner(), serde_json::json!({ "models": [] })).await?;
+            continue;
+        }
+        // Startup account-pool probes hit `/wham/usage` or `/api/codex/usage`
+        // against the ChatGPT base URL. Auto-answer those so they do not steal
+        // the enroll/list request the test is waiting for (and so a missing
+        // probe timeout cannot hang init).
+        if request_line.starts_with("GET ")
+            && (request_line.contains("/wham/usage") || request_line.contains("/api/codex/usage"))
+        {
+            respond_with_json(
+                reader.into_inner(),
+                serde_json::json!({ "rate_limit": null }),
+            )
+            .await?;
             continue;
         }
 

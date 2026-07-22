@@ -61,6 +61,13 @@ fn cache_project_root(chat: &mut ChatWidget, root_name: &str) {
     });
 }
 
+fn cache_chatgpt_account(chat: &mut ChatWidget) {
+    chat.status_account_display = Some(StatusAccountDisplay::ChatGpt {
+        email: Some("user@example.com".to_string()),
+        plan: Some("Pro".to_string()),
+    });
+}
+
 fn cache_rate_limit_snapshot(chat: &mut ChatWidget) {
     chat.on_rate_limit_snapshot(Some(RateLimitSnapshot {
         limit_id: None,
@@ -219,11 +226,12 @@ async fn status_surface_preview_lines_mixed_snapshot() {
 #[tokio::test]
 async fn status_surface_preview_lines_rate_limits_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    cache_chatgpt_account(&mut chat);
     cache_rate_limit_snapshot(&mut chat);
 
     let snapshot = combined_preview_snapshot(
         &mut chat,
-        &[StatusLineItem::FiveHourLimit, StatusLineItem::WeeklyLimit],
+        &[StatusLineItem::AccountStatus],
         &[
             TerminalTitleItem::FiveHourLimit,
             TerminalTitleItem::WeeklyLimit,
@@ -236,6 +244,7 @@ async fn status_surface_preview_lines_rate_limits_snapshot() {
 #[tokio::test]
 async fn status_surface_preview_omits_unavailable_rate_limit_items() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    cache_chatgpt_account(&mut chat);
 
     chat.on_rate_limit_snapshot(Some(RateLimitSnapshot {
         limit_id: None,
@@ -254,15 +263,8 @@ async fn status_surface_preview_omits_unavailable_rate_limit_items() {
     }));
 
     assert_eq!(
-        status_preview_line_option(&mut chat, &[StatusLineItem::FiveHourLimit]),
-        None
-    );
-    assert_eq!(
-        status_preview_line(
-            &mut chat,
-            &[StatusLineItem::FiveHourLimit, StatusLineItem::WeeklyLimit]
-        ),
-        "weekly 91% left"
+        status_preview_line(&mut chat, &[StatusLineItem::AccountStatus]),
+        "user@example.com  ·  weekly 91% left"
     );
     assert_eq!(
         title_preview_line(
@@ -279,11 +281,9 @@ async fn status_surface_preview_omits_unavailable_rate_limit_items() {
 #[tokio::test]
 async fn status_line_setup_popup_rate_limits_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    cache_chatgpt_account(&mut chat);
     cache_rate_limit_snapshot(&mut chat);
-    chat.config.tui_status_line = Some(vec![
-        "five-hour-limit".to_string(),
-        "weekly-limit".to_string(),
-    ]);
+    chat.config.tui_status_line = Some(vec!["account-status".to_string()]);
 
     assert_chatwidget_snapshot!(
         "status_line_setup_popup_rate_limits",

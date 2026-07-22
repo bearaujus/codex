@@ -34,7 +34,7 @@ fn sorted_mcp_server_names(mcp_servers: &HashMap<String, i32>) -> Vec<String> {
 fn apps_route_available_tracks_auth_mode() {
     assert!(apps_route_available(Some(AuthMode::Chatgpt)));
     assert!(apps_route_available(Some(AuthMode::AgentIdentity)));
-    assert!(!apps_route_available(Some(AuthMode::ApiKey)));
+    assert!(!apps_route_available(Some(AuthMode::Chatgpt)));
     assert!(!apps_route_available(/*auth_mode*/ None));
 }
 
@@ -46,7 +46,7 @@ fn app_mcp_routing_clears_apps_when_apps_route_is_unavailable() {
     apply_app_mcp_routing_policy(
         &mut apps,
         &mut mcp_servers,
-        Some(AuthMode::ApiKey),
+        Some(AuthMode::Chatgpt),
         /*plugin_active*/ true,
     );
 

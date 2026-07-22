@@ -237,33 +237,41 @@ impl ReasoningSummaryCell {
     }
 
     fn lines(&self, width: u16) -> Vec<Line<'static>> {
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        append_markdown(
-            &self.content,
-            crate::width::usable_content_width_u16(width, /*reserved_cols*/ 2),
-            Some(self.cwd.as_path()),
-            &mut lines,
-        );
-        let summary_style = Style::default().dim().italic();
-        let summary_lines = lines
-            .into_iter()
-            .map(|mut line| {
-                line.spans = line
-                    .spans
-                    .into_iter()
-                    .map(|span| span.patch_style(summary_style))
-                    .collect();
-                line
-            })
-            .collect::<Vec<_>>();
-
-        adaptive_wrap_lines(
-            &summary_lines,
-            RtOptions::new(width as usize)
-                .initial_indent("• ".dim().into())
-                .subsequent_indent("  ".into()),
-        )
+        format_reasoning_summary_lines(&self.content, width, self.cwd.as_path())
     }
+}
+
+fn format_reasoning_summary_lines(content: &str, width: u16, cwd: &Path) -> Vec<Line<'static>> {
+    if content.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    append_markdown(
+        content,
+        crate::width::usable_content_width_u16(width, /*reserved_cols*/ 2),
+        Some(cwd),
+        &mut lines,
+    );
+    let summary_style = Style::default().dim().italic();
+    let summary_lines = lines
+        .into_iter()
+        .map(|mut line| {
+            line.spans = line
+                .spans
+                .into_iter()
+                .map(|span| span.patch_style(summary_style))
+                .collect();
+            line
+        })
+        .collect::<Vec<_>>();
+
+    adaptive_wrap_lines(
+        &summary_lines,
+        RtOptions::new(width as usize)
+            .initial_indent("• ".dim().into())
+            .subsequent_indent("  ".into()),
+    )
 }
 
 impl HistoryCell for ReasoningSummaryCell {
@@ -522,6 +530,93 @@ impl HistoryCell for StreamingAgentTailCell {
         !self.is_first_line
     }
 }
+
+/// Streamed reasoning content emitted by `ReasoningStreamController`.
+///
+/// Used both for committed reasoning lines (pushed to scrollback as the model
+/// thinks) and for the transient in-progress tail in the `active_cell` slot. The
+/// lines are already fully styled (dim italic + `• `/`  ` indent) by the
+/// controller, so this cell renders them verbatim — mirroring
+/// `StreamingPlanTailCell`. This is what lets live reasoning flow into scrollback
+/// like agent messages instead of clipping inside the bounded live region.
+#[derive(Debug)]
+pub(crate) struct ReasoningStreamCell {
+    lines: Vec<HyperlinkLine>,
+    /// True for every chunk-cell after the first one in a reasoning block. The
+    /// history inserter prefixes a blank line before each non-continuation cell to
+    /// separate distinct blocks; without this flag every commit-tick chunk of the
+    /// *same* reasoning block would be treated as a new block and get a stray blank
+    /// line, so the rendered spacing would vary with commit-tick batching.
+    is_continuation: bool,
+}
+
+impl ReasoningStreamCell {
+    pub(crate) fn new(lines: Vec<HyperlinkLine>, is_continuation: bool) -> Self {
+        Self {
+            lines,
+            is_continuation,
+        }
+    }
+}
+
+impl HistoryCell for ReasoningStreamCell {
+    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
+        visible_lines(self.lines.clone())
+    }
+
+    fn display_hyperlink_lines(&self, _width: u16) -> Vec<HyperlinkLine> {
+        self.lines.clone()
+    }
+
+    fn transcript_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
+        self.display_hyperlink_lines(width)
+    }
+
+    fn raw_lines(&self) -> Vec<Line<'static>> {
+        plain_lines(visible_lines(self.lines.clone()))
+    }
+
+    fn is_stream_continuation(&self) -> bool {
+        self.is_continuation
+    }
+}
+
+/// Source-backed cell that the streamed `ReasoningStreamCell` run is consolidated
+/// into once a live reasoning block finishes.
+///
+/// `ReasoningStreamCell` stores lines that were wrapped at the width that was
+/// live at commit time, so they cannot re-wrap on resize. This cell instead keeps
+/// the raw reasoning markdown and re-renders it at the requested width — the same
+/// trick `AgentMarkdownCell` uses for finalized agent answers — so live reasoning
+/// reflows correctly after the terminal is resized. It renders the *full* source
+/// (header included) so consolidation never drops content that was visible while
+/// streaming.
+#[derive(Debug)]
+pub(crate) struct ReasoningMarkdownCell {
+    source: String,
+    /// Session cwd used to render local file links inside the reasoning body.
+    cwd: PathBuf,
+}
+
+impl ReasoningMarkdownCell {
+    pub(crate) fn new(source: String, cwd: &Path) -> Self {
+        Self {
+            source,
+            cwd: cwd.to_path_buf(),
+        }
+    }
+}
+
+impl HistoryCell for ReasoningMarkdownCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        format_reasoning_summary_lines(&self.source, width, self.cwd.as_path())
+    }
+
+    fn raw_lines(&self) -> Vec<Line<'static>> {
+        raw_lines_from_source(self.source.trim())
+    }
+}
+
 pub(crate) fn new_user_prompt(
     message: String,
     text_elements: Vec<TextElement>,

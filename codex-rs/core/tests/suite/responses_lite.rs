@@ -260,7 +260,7 @@ async fn responses_lite_exposes_standalone_tools_for_actor_authorized_provider()
     )
     .await;
 
-    let auth = CodexAuth::from_api_key("dummy");
+    let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
     let extensions = responses_extensions(&auth);
     let mut builder = test_codex()
         .with_auth(auth)

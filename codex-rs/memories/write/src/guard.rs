@@ -1,4 +1,3 @@
-use codex_backend_client::Client as BackendClient;
 use codex_core::config::Config;
 use codex_login::AuthManager;
 use codex_protocol::protocol::RateLimitSnapshot;
@@ -17,21 +16,19 @@ async fn rate_limits_check(auth_manager: &AuthManager, config: &Config) -> Optio
     if !auth.uses_codex_backend() {
         return None;
     }
-
-    let client = BackendClient::from_auth(config.chatgpt_base_url.clone(), &auth)
-        .map_err(|err| warn!(%err, "failed to construct backend client"))
-        .ok()?;
-
-    let snapshots = client
-        .get_rate_limits_many()
+    let account_id = auth.get_pool_account_id()?;
+    let account_pool = auth_manager.chatgpt_account_pool()?;
+    let cached_entry = account_pool
+        .list_rate_limits()
         .await
-        .map_err(|err| warn!(%err, "failed to fetch rate limits"))
-        .ok()?;
-
-    let snapshot = snapshots
-        .iter()
-        .find(|s| s.limit_id.as_deref() == Some(crate::guard_limits::CODEX_LIMIT_ID))
-        .or_else(|| snapshots.first())?;
+        .map_err(|err| warn!(%err, "failed to read cached rate limits"))
+        .ok()?
+        .into_iter()
+        .find(|entry| entry.account_id == account_id)?;
+    let snapshot = cached_entry
+        .rate_limits
+        .get(crate::guard_limits::CODEX_LIMIT_ID)
+        .or_else(|| cached_entry.rate_limits.values().next())?;
 
     let min_remaining_percent = config.memories.min_rate_limit_remaining_percent;
     let allowed = snapshot_allows_startup(snapshot, min_remaining_percent);

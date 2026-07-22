@@ -2076,7 +2076,7 @@ API key, personal access token, Bedrock API key, and external ChatGPT auth-token
 - `account/login/completed` (notify) — emitted when a login attempt finishes (success or error).
 - `account/login/cancel` — cancel a pending managed ChatGPT login by `loginId`.
 - `account/logout` — sign out; triggers `account/updated` on success.
-- `account/updated` (notify) — emitted whenever auth mode changes (`authMode`: `chatgpt`, `headers`, `agentIdentity`, or `null`) and includes the current ChatGPT `planType` and `accountEmail` when available. Nullable values clear previously cached account identity.
+- `account/updated` (notify) — emitted whenever the effective account identity changes, including login, logout, auth-mode changes, and account-pool switches (`authMode`: `chatgpt`, `headers`, `agentIdentity`, or `null`). Routine token rotation for the same account does not emit this notification. The payload includes the current ChatGPT `planType` and `accountEmail` when available; nullable values clear previously cached account identity.
 - `account/rateLimits/read` — fetch ChatGPT rate limits, an optional effective monthly credit limit, whether spend control has been reached, and the earned rate-limit resets currently available, including expiry details when provided by the backend. Rate-limit updates arrive via `account/rateLimits/updated` (notify); reset-credit data is snapshot-only.
 - `account/rateLimitResetCredit/consume` — consume one earned reset using a caller-provided idempotency key, optionally selecting a reset-credit ID returned by `account/rateLimits/read`.
 - `account/usage/read` — fetch ChatGPT account token-activity summary and daily buckets.

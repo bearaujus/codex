@@ -58,11 +58,7 @@ impl MessageProcessor {
         installation_id: String,
     ) -> Self {
         let outgoing = Arc::new(outgoing);
-        let auth_manager = AuthManager::shared_from_config(
-            config.as_ref(),
-            /*enable_codex_api_key_env*/ false,
-        )
-        .await;
+        let auth_manager = AuthManager::shared_from_config(config.as_ref()).await;
         let user_instructions_provider = Arc::new(CodexHomeUserInstructionsProvider::new(
             config.codex_home.clone(),
         ));

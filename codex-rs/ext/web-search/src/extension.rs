@@ -193,7 +193,7 @@ mod tests {
         let mut builder = ExtensionRegistryBuilder::<Config>::new();
         install(
             &mut builder,
-            AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy")),
+            AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing()),
         );
         let registry = builder.build();
         let session_store = ExtensionData::new("session");

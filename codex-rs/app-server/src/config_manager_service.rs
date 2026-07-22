@@ -182,6 +182,7 @@ impl ConfigManager {
     }
 
     /// Clears a value from the active user config only when its current raw value matches.
+    #[cfg(test)]
     pub(crate) async fn clear_user_value_if_matches(
         &self,
         key_path: &str,

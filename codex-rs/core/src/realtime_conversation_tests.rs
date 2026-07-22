@@ -221,6 +221,7 @@ fn uses_quicksilver_alpha_header_for_realtime_v1() {
     let headers = realtime_request_headers(
         Some("session_1"),
         Some("sk-test"),
+        None,
         RealtimeEventParser::V1,
         "codex_work_desktop",
     )
@@ -240,6 +241,7 @@ fn omits_quicksilver_alpha_header_for_realtime_v2() {
     let headers = realtime_request_headers(
         Some("session_1"),
         Some("sk-test"),
+        None,
         RealtimeEventParser::RealtimeV2,
         "codex_work_desktop",
     )
@@ -254,6 +256,7 @@ fn uses_frameless_alpha_header_for_realtime_v3() {
     let headers = realtime_request_headers(
         Some("session_1"),
         Some("sk-test"),
+        None,
         RealtimeEventParser::FramelessBidi,
         "codex_work_desktop",
     )
@@ -278,6 +281,7 @@ fn realtime_headers_include_only_non_default_originator() {
         let headers = realtime_request_headers(
             Some("session_1"),
             Some("sk-test"),
+            None,
             RealtimeEventParser::RealtimeV2,
             originator,
         )
@@ -291,4 +295,24 @@ fn realtime_headers_include_only_non_default_originator() {
             expected_header
         );
     }
+}
+
+#[test]
+fn realtime_headers_include_chatgpt_account_id() {
+    let headers = realtime_request_headers(
+        Some("session_1"),
+        Some("chatgpt-token"),
+        Some("workspace-1"),
+        RealtimeEventParser::RealtimeV2,
+        "codex_work_desktop",
+    )
+    .expect("headers")
+    .expect("headers");
+
+    assert_eq!(
+        headers
+            .get("ChatGPT-Account-ID")
+            .and_then(|value| value.to_str().ok()),
+        Some("workspace-1")
+    );
 }

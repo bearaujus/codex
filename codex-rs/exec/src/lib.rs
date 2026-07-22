@@ -361,7 +361,6 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     )?;
     let cloud_config_bundle = cloud_config_bundle_loader_for_storage(
         codex_home.to_path_buf(),
-        /*enable_codex_api_key_env*/ false,
         bootstrap_config_toml
             .cli_auth_credentials_store
             .unwrap_or_default(),
@@ -568,7 +567,6 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         environment_manager: std::sync::Arc::new(environment_manager),
         config_warnings,
         session_source: SessionSource::Exec,
-        enable_codex_api_key_env: true,
         client_name: "codex_exec".to_string(),
         client_version: env!("CARGO_PKG_VERSION").to_string(),
         experimental_api: true,
@@ -1721,15 +1719,6 @@ async fn handle_server_request(
                     "dynamic tool calls are not supported in exec mode for thread `{}`",
                     params.thread_id
                 ),
-            )
-            .await
-        }
-        ServerRequest::ChatgptAuthTokensRefresh { request_id, .. } => {
-            reject_server_request(
-                client,
-                request_id,
-                &method,
-                "chatgpt auth token refresh is not supported in exec mode".to_string(),
             )
             .await
         }

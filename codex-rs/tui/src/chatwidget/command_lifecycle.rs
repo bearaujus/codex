@@ -57,18 +57,75 @@ impl ChatWidget {
             return;
         }
 
+        if self.append_exec_output_to_active_cell(call_id, delta) {
+            return;
+        }
+
+        // The active cell is not this call's exec cell, so a plain append would
+        // silently drop the output and the rendered tool output ends up trimmed.
+        // This shows up with `stream_reasoning_live` because the live reasoning
+        // tail (a `ReasoningStreamCell`) can hold the active slot, and it can also
+        // happen when this call's `begin` is still queued in the interrupt manager.
+        // Recover so streamed output is never lost:
+        //   1. Drain any deferred begin so its exec cell is materialized.
+        if !self.interrupts.is_empty() {
+            self.flush_interrupt_queue();
+            if self.append_exec_output_to_active_cell(call_id, delta) {
+                return;
+            }
+        }
+        //   2. Otherwise re-establish the running command's exec cell as active —
+        //      committing whatever currently owns the slot (e.g. live reasoning)
+        //      to scrollback first so it is preserved, not discarded. Only do this
+        //      when the active cell is NOT itself an exec cell: a different active
+        //      exec cell means parallel/grouped calls are streaming, and flushing it
+        //      mid-run would trim *its* output. In that (rare) case leave the output
+        //      to the completion event's aggregated payload rather than risk worse.
+        let active_is_exec = self
+            .transcript
+            .active_cell
+            .as_ref()
+            .is_some_and(|cell| cell.as_any().is::<ExecCell>());
+        if !active_is_exec && let Some(running) = self.running_commands.get(call_id).cloned() {
+            self.flush_active_cell();
+            let mut cell = new_active_exec_command(
+                call_id.to_string(),
+                running.command,
+                running.parsed_cmd,
+                running.source,
+                /*interaction_input*/ None,
+                self.config.animations,
+            );
+            let appended = cell.append_output(call_id, delta);
+            self.transcript.active_cell = Some(Box::new(cell));
+            self.bump_active_cell_revision();
+            if appended {
+                self.request_redraw();
+            }
+        }
+    }
+
+    /// Appends `delta` to the active exec cell when it tracks `call_id`.
+    ///
+    /// Returns `false` (without mutating) when the active cell is absent or is not
+    /// the exec cell for this call, so callers can fall back to recovery instead of
+    /// dropping the output.
+    fn append_exec_output_to_active_cell(&mut self, call_id: &str, delta: &str) -> bool {
         let Some(cell) = self
             .transcript
             .active_cell
             .as_mut()
             .and_then(|c| c.as_any_mut().downcast_mut::<ExecCell>())
         else {
-            return;
+            return false;
         };
 
         if cell.append_output(call_id, delta) {
             self.bump_active_cell_revision();
             self.request_redraw();
+            true
+        } else {
+            false
         }
     }
 

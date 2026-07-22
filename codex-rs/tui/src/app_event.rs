@@ -293,9 +293,6 @@ pub(crate) enum AppEvent {
     /// background tasks, rollout flush, or child process cleanup).
     Exit(ExitMode),
 
-    /// Request app-server account logout, then exit after it succeeds.
-    Logout,
-
     /// Request to exit the application due to a fatal error.
     #[allow(dead_code)]
     FatalExitRequest(String),
@@ -359,7 +356,7 @@ pub(crate) enum AppEvent {
     /// Result of refreshing rate limits.
     RateLimitsLoaded {
         origin: RateLimitRefreshOrigin,
-        hard_stop_generation: u64,
+        update_generation: u64,
         result: Result<GetAccountRateLimitsResponse, String>,
     },
 
@@ -746,6 +743,12 @@ pub(crate) enum AppEvent {
     /// Emitted by `ChatWidget::on_plan_item_completed` after plan stream
     /// finalization.
     ConsolidateProposedPlan(String),
+
+    /// Replace the contiguous run of streaming `ReasoningStreamCell`s at the end
+    /// of the transcript with a single source-backed `ReasoningMarkdownCell` so
+    /// finalized live reasoning re-wraps on resize. Carries the full reasoning
+    /// markdown source. Emitted by `ChatWidget::finalize_reasoning_stream`.
+    ConsolidateReasoning(String),
 
     StartCommitAnimation,
     StopCommitAnimation,

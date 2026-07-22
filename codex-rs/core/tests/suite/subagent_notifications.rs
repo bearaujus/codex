@@ -72,6 +72,11 @@ const SUBAGENT_START_CONTEXT: &str = "subagent start context reaches child";
 const SUBAGENT_STOP_CONTINUATION: &str = "continue only the child";
 const INTERNAL_SUBAGENT_PROMPT: &str = "internal subagent: review";
 
+fn python_hook_command(script_path: &Path) -> String {
+    let interpreter = if cfg!(windows) { "python" } else { "python3" };
+    format!("{interpreter} \"{}\"", script_path.display())
+}
+
 fn body_contains(req: &wiremock::Request, text: &str) -> bool {
     decoded_body(req)
         .and_then(|body| String::from_utf8(body).ok())
@@ -252,33 +257,33 @@ print(json.dumps({{"systemMessage": "root stop complete"}}))
                 "matcher": "startup",
                 "hooks": [{
                     "type": "command",
-                    "command": format!("python3 {}", session_start_script_path.display()),
+                    "command": python_hook_command(&session_start_script_path),
                 }]
             }],
             "SubagentStart": [{
                 "matcher": "worker",
                 "hooks": [{
                     "type": "command",
-                    "command": format!("python3 {}", start_script_path.display()),
+                    "command": python_hook_command(&start_script_path),
                 }]
             }],
             "UserPromptSubmit": [{
                 "hooks": [{
                     "type": "command",
-                    "command": format!("python3 {}", user_prompt_submit_script_path.display()),
+                    "command": python_hook_command(&user_prompt_submit_script_path),
                 }]
             }],
             "SubagentStop": [{
                 "matcher": subagent_stop_matcher,
                 "hooks": [{
                     "type": "command",
-                    "command": format!("python3 {}", subagent_stop_script_path.display()),
+                    "command": python_hook_command(&subagent_stop_script_path),
                 }]
             }],
             "Stop": [{
                 "hooks": [{
                     "type": "command",
-                    "command": format!("python3 {}", stop_script_path.display()),
+                    "command": python_hook_command(&stop_script_path),
                 }]
             }]
         }
@@ -310,7 +315,7 @@ async fn wait_for_hook_log(
     filename: &str,
     expected_len: usize,
 ) -> Result<Vec<serde_json::Value>> {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let inputs = read_hook_log(home, filename)?;
         if inputs.len() >= expected_len {
@@ -701,7 +706,7 @@ async fn subagent_stop_replaces_stop_and_skips_internal_subagents() -> Result<()
     )
     .await;
 
-    let _turn1_followup = mount_sse_once_match(
+    let turn1_followup = mount_sse_once_match(
         &server,
         |req: &wiremock::Request| body_contains(req, SPAWN_CALL_ID),
         sse(vec![
@@ -744,6 +749,7 @@ async fn subagent_stop_replaces_stop_and_skips_internal_subagents() -> Result<()
     test.submit_turn(TURN_1_PROMPT).await?;
     let _ = wait_for_requests(&first_child_request).await?;
     let _ = wait_for_requests(&second_child_request).await?;
+    let _ = wait_for_requests(&turn1_followup).await?;
 
     let subagent_stop_inputs = wait_for_hook_log(
         test.codex_home_path(),

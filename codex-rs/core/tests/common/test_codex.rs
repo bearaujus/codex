@@ -32,6 +32,7 @@ use codex_extension_api::UserInstructionsProvider;
 use codex_extension_api::empty_extension_registry;
 use codex_features::Feature;
 use codex_home::CodexHomeUserInstructionsProvider;
+use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::built_in_model_providers;
@@ -300,6 +301,7 @@ pub fn turn_permission_fields(
 pub struct TestCodexBuilder {
     config_mutators: Vec<Box<ConfigMutator>>,
     auth: CodexAuth,
+    auth_manager: Option<Arc<AuthManager>>,
     pre_build_hooks: Vec<Box<PreBuildHook>>,
     workspace_setups: Vec<Box<WorkspaceSetup>>,
     home: Option<Arc<TempDir>>,
@@ -325,6 +327,13 @@ impl TestCodexBuilder {
 
     pub fn with_auth(mut self, auth: CodexAuth) -> Self {
         self.auth = auth;
+        self
+    }
+
+    /// Inject a fully constructed [`AuthManager`], for example one opened via
+    /// [`AuthManager::shared`] over a ChatGPT account-pool home directory.
+    pub fn with_auth_manager(mut self, auth_manager: Arc<AuthManager>) -> Self {
+        self.auth_manager = Some(auth_manager);
         self
     }
 
@@ -631,11 +640,14 @@ impl TestCodexBuilder {
                     config.codex_home.clone(),
                 ))
             });
-        let auth_manager = codex_core::test_support::auth_manager_from_auth(auth.clone());
+        let auth_manager = self
+            .auth_manager
+            .clone()
+            .unwrap_or_else(|| codex_core::test_support::auth_manager_from_auth(auth.clone()));
         let thread_manager = ThreadManager::new(
             &config,
             auth_manager.clone(),
-            codex_core::build_models_manager(&config, auth_manager),
+            codex_core::build_models_manager(&config, auth_manager.clone()),
             codex_core::CodexAppsToolsCache::default(),
             SessionSource::Exec,
             Arc::clone(&environment_manager),
@@ -665,65 +677,62 @@ impl TestCodexBuilder {
         let thread_manager = Arc::new(thread_manager);
         let user_shell_override = self.user_shell_override.clone();
 
-        let new_conversation = match (resume_from, user_shell_override) {
-            (Some(path), Some(user_shell_override)) => {
-                let auth_manager = codex_core::test_support::auth_manager_from_auth(auth);
-                Box::pin(
+        let new_conversation =
+            match (resume_from, user_shell_override) {
+                (Some(path), Some(user_shell_override)) => Box::pin(
                     codex_core::test_support::resume_thread_from_rollout_with_user_shell_override(
                         thread_manager.as_ref(),
                         config.clone(),
                         path,
-                        auth_manager,
+                        auth_manager.clone(),
                         user_shell_override,
                         self.supports_openai_form_elicitation,
                     ),
                 )
-                .await?
-            }
-            (Some(path), None) => {
-                let auth_manager = codex_core::test_support::auth_manager_from_auth(auth);
-                Box::pin(thread_manager.resume_thread_from_rollout(
-                    config.clone(),
-                    path,
-                    auth_manager,
-                    /*parent_trace*/ None,
-                    self.supports_openai_form_elicitation,
-                ))
-                .await?
-            }
-            (None, Some(user_shell_override)) => {
-                Box::pin(
-                    codex_core::test_support::start_thread_with_user_shell_override(
-                        thread_manager.as_ref(),
+                .await?,
+                (Some(path), None) => {
+                    Box::pin(thread_manager.resume_thread_from_rollout(
                         config.clone(),
-                        user_shell_override,
+                        path,
+                        auth_manager.clone(),
+                        /*parent_trace*/ None,
                         self.supports_openai_form_elicitation,
-                    ),
-                )
-                .await?
-            }
-            (None, None) => {
-                let environments = thread_manager
-                    .default_environment_selections(&config.cwd, &config.workspace_roots);
-                Box::pin(
-                    thread_manager.start_thread_with_options(StartThreadOptions {
-                        config: config.clone(),
-                        allow_provider_model_fallback: false,
-                        initial_history: InitialHistory::New,
-                        history_mode: self.history_mode,
-                        session_source: None,
-                        thread_source: None,
-                        dynamic_tools: Vec::new(),
-                        metrics_service_name: None,
-                        parent_trace: None,
-                        environments,
-                        thread_extension_init: Default::default(),
-                        supports_openai_form_elicitation: self.supports_openai_form_elicitation,
-                    }),
-                )
-                .await?
-            }
-        };
+                    ))
+                    .await?
+                }
+                (None, Some(user_shell_override)) => {
+                    Box::pin(
+                        codex_core::test_support::start_thread_with_user_shell_override(
+                            thread_manager.as_ref(),
+                            config.clone(),
+                            user_shell_override,
+                            self.supports_openai_form_elicitation,
+                        ),
+                    )
+                    .await?
+                }
+                (None, None) => {
+                    let environments = thread_manager
+                        .default_environment_selections(&config.cwd, &config.workspace_roots);
+                    Box::pin(
+                        thread_manager.start_thread_with_options(StartThreadOptions {
+                            config: config.clone(),
+                            allow_provider_model_fallback: false,
+                            initial_history: InitialHistory::New,
+                            history_mode: self.history_mode,
+                            session_source: None,
+                            thread_source: None,
+                            dynamic_tools: Vec::new(),
+                            metrics_service_name: None,
+                            parent_trace: None,
+                            environments,
+                            thread_extension_init: Default::default(),
+                            supports_openai_form_elicitation: self.supports_openai_form_elicitation,
+                        }),
+                    )
+                    .await?
+                }
+            };
 
         Ok(TestCodex {
             home,
@@ -1265,8 +1274,16 @@ pub fn test_codex() -> TestCodexBuilder {
                 .features
                 .disable(Feature::ShellSnapshot)
                 .expect("test config should allow ShellSnapshot override");
+            // The historical API-key fixture did not compress requests. Preserve that generic
+            // harness contract now that its replacement uses ChatGPT auth; compression tests opt
+            // in explicitly.
+            config
+                .features
+                .disable(Feature::EnableRequestCompression)
+                .expect("test config should allow request-compression override");
         })],
-        auth: CodexAuth::from_api_key("dummy"),
+        auth: CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+        auth_manager: None,
         pre_build_hooks: vec![],
         workspace_setups: vec![],
         home: None,

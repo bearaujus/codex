@@ -754,6 +754,9 @@ pub struct Config {
     /// Start the TUI in raw scrollback mode for copy-friendly transcript output.
     pub tui_raw_output_mode: bool,
 
+    /// Stream agent reasoning chunks live in the TUI instead of buffering them until completion.
+    pub stream_reasoning_live: bool,
+
     /// Start the TUI in the specified collaboration mode (plan/default).
 
     /// Controls whether the TUI uses the terminal's alternate screen buffer.
@@ -4098,6 +4101,11 @@ impl Config {
                 .tui
                 .as_ref()
                 .map(|t| t.raw_output_mode)
+                .unwrap_or(false),
+            stream_reasoning_live: cfg
+                .tui
+                .as_ref()
+                .map(|t| t.stream_reasoning_live)
                 .unwrap_or(false),
             tui_alternate_screen: cfg
                 .tui

@@ -24,6 +24,9 @@
 //! fails, normal stream retry/fallback logic handles recovery on the same turn.
 
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::Hash;
+use std::hash::Hasher;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
@@ -68,6 +71,8 @@ use codex_http_client::HttpClientFactory;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::RefreshTokenError;
+use codex_login::RefreshTokenFailedError;
+use codex_login::RefreshTokenFailedReason;
 use codex_login::UnauthorizedRecovery;
 use codex_login::default_client::add_originator_header;
 use codex_login::default_client::build_default_reqwest_client_for_route;
@@ -295,6 +300,7 @@ struct LastResponse {
 #[derive(Debug, Default)]
 struct WebsocketSession {
     connection: Option<ApiWebSocketConnection>,
+    auth_key: Option<WebsocketAuthKey>,
     last_request: Option<ResponsesApiRequest>,
     last_response_rx: Option<oneshot::Receiver<LastResponse>>,
     last_response_from_untraced_warmup: bool,
@@ -372,6 +378,44 @@ impl WebsocketSession {
             .connection_reused
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WebsocketAuthKey {
+    mode: String,
+    account_id: Option<String>,
+    pool_account_id: Option<String>,
+    credential_hash: Option<u64>,
+}
+
+fn websocket_auth_key(auth: Option<&CodexAuth>, api_auth: &dyn AuthProvider) -> WebsocketAuthKey {
+    let mut auth_headers = ApiHeaderMap::new();
+    api_auth.add_auth_headers(&mut auth_headers);
+    let credential_hash = (!auth_headers.is_empty()).then(|| {
+        let mut entries = auth_headers
+            .iter()
+            .map(|(name, value)| (name.as_str().to_string(), value.as_bytes().to_vec()))
+            .collect::<Vec<_>>();
+        entries.sort_unstable();
+        let mut hasher = DefaultHasher::new();
+        entries.hash(&mut hasher);
+        hasher.finish()
+    });
+    let Some(auth) = auth else {
+        return WebsocketAuthKey {
+            mode: "none".to_string(),
+            account_id: None,
+            pool_account_id: None,
+            credential_hash,
+        };
+    };
+
+    WebsocketAuthKey {
+        mode: format!("{:?}", auth.api_auth_mode()),
+        account_id: auth.get_account_id(),
+        pool_account_id: auth.get_pool_account_id(),
+        credential_hash,
     }
 }
 
@@ -1119,6 +1163,7 @@ impl ModelClientSession {
 
     fn reset_websocket_session(&mut self) {
         self.websocket_session.connection = None;
+        self.websocket_session.auth_key = None;
         self.websocket_session.last_request = None;
         self.websocket_session.last_response_rx = None;
         self.websocket_session.last_response_from_untraced_warmup = false;
@@ -1264,15 +1309,21 @@ impl ModelClientSession {
         if !self.client.responses_websocket_enabled() {
             return Ok(());
         }
-        if self.websocket_session.connection.is_some() {
-            return Ok(());
-        }
-
         let client_setup = self.client.current_client_setup().await.map_err(|err| {
             ApiError::Stream(format!(
                 "failed to build websocket prewarm client setup: {err}"
             ))
         })?;
+        let auth_key =
+            websocket_auth_key(client_setup.auth.as_ref(), client_setup.api_auth.as_ref());
+        if let Some(conn) = self.websocket_session.connection.as_ref() {
+            if self.websocket_session.auth_key.as_ref() == Some(&auth_key)
+                && !conn.is_closed().await
+            {
+                return Ok(());
+            }
+            self.reset_websocket_session();
+        }
         let auth_context = AuthRequestTelemetryContext::new(
             client_setup.auth.as_ref().map(CodexAuth::auth_mode),
             client_setup.api_auth.as_ref(),
@@ -1291,6 +1342,7 @@ impl ModelClientSession {
             )
             .await?;
         self.websocket_session.connection = Some(connection);
+        self.websocket_session.auth_key = Some(auth_key);
         self.websocket_session
             .set_connection_reused(/*connection_reused*/ false);
         Ok(())
@@ -1316,12 +1368,16 @@ impl ModelClientSession {
             session_telemetry,
             api_provider,
             api_auth,
+            auth_key,
             responses_metadata,
             auth_context,
             request_route_telemetry,
         } = params;
         let needs_new = match self.websocket_session.connection.as_ref() {
-            Some(conn) => conn.is_closed().await,
+            Some(conn) => {
+                self.websocket_session.auth_key.as_ref() != Some(&auth_key)
+                    || conn.is_closed().await
+            }
             None => true,
         };
 
@@ -1350,6 +1406,7 @@ impl ModelClientSession {
                 }
             };
             self.websocket_session.connection = Some(new_conn);
+            self.websocket_session.auth_key = Some(auth_key);
             self.websocket_session
                 .set_connection_reused(/*connection_reused*/ false);
         } else {
@@ -1580,11 +1637,14 @@ impl ModelClientSession {
                 ws_payload.generate = Some(false);
             }
 
+            let auth_key =
+                websocket_auth_key(client_setup.auth.as_ref(), client_setup.api_auth.as_ref());
             match self
                 .websocket_connection(WebsocketConnectParams {
                     session_telemetry,
                     api_provider: client_setup.api_provider,
                     api_auth: client_setup.api_auth,
+                    auth_key,
                     responses_metadata,
                     auth_context: request_auth_context,
                     request_route_telemetry: RequestRouteTelemetry::for_endpoint(
@@ -2116,12 +2176,8 @@ impl AuthRequestTelemetryContext {
         let auth_telemetry = auth_header_telemetry(api_auth);
         Self {
             auth_mode: auth_mode.map(|mode| match mode {
-                AuthMode::ApiKey | AuthMode::BedrockApiKey => "ApiKey",
-                AuthMode::Chatgpt
-                | AuthMode::ChatgptAuthTokens
-                | AuthMode::Headers
-                | AuthMode::AgentIdentity
-                | AuthMode::PersonalAccessToken => "Chatgpt",
+                AuthMode::Chatgpt | AuthMode::AgentIdentity => "Chatgpt",
+                AuthMode::Headers => "Headers",
             }),
             auth_header_attached: auth_telemetry.attached,
             auth_header_name: auth_telemetry.name,
@@ -2141,6 +2197,7 @@ struct WebsocketConnectParams<'a> {
     session_telemetry: &'a SessionTelemetry,
     api_provider: codex_api::Provider,
     api_auth: SharedAuthProvider,
+    auth_key: WebsocketAuthKey,
     responses_metadata: &'a CodexResponsesMetadata,
     auth_context: AuthRequestTelemetryContext,
     request_route_telemetry: RequestRouteTelemetry,
@@ -2226,7 +2283,14 @@ async fn handle_unauthorized(
                     debug.auth_error.as_deref(),
                     debug.auth_error_code.as_deref(),
                 );
-                Err(CodexErr::Io(other))
+                if recovery.current_auth_is_chatgpt() {
+                    Err(CodexErr::RefreshTokenFailed(RefreshTokenFailedError::new(
+                        RefreshTokenFailedReason::Other,
+                        other.to_string(),
+                    )))
+                } else {
+                    Err(CodexErr::Io(other))
+                }
             }
         };
     }
@@ -2259,6 +2323,27 @@ async fn handle_unauthorized(
         debug.auth_error.as_deref(),
         debug.auth_error_code.as_deref(),
     );
+
+    // Surface an exhausted ChatGPT 401 through the account-pool failover path.
+    // Only an authoritative invalidation code is permanent; an unclassified
+    // 401 rotates away temporarily without killing a potentially healthy token.
+    if let Some(recovery) = auth_recovery.as_ref()
+        && recovery.current_auth_is_chatgpt()
+        && !recovery.has_next()
+        && let TransportError::Http { status, .. } = &transport
+        && *status == StatusCode::UNAUTHORIZED
+    {
+        let reason = match debug.auth_error_code.as_deref() {
+            Some("token_invalidated") => RefreshTokenFailedReason::Revoked,
+            _ => RefreshTokenFailedReason::Other,
+        };
+        let message = debug.auth_error.clone().unwrap_or_else(|| {
+            "Authentication failed after all recovery steps were exhausted.".to_string()
+        });
+        return Err(CodexErr::RefreshTokenFailed(RefreshTokenFailedError::new(
+            reason, message,
+        )));
+    }
 
     Err(provider.map_api_error(ApiError::Transport(transport)))
 }

@@ -727,6 +727,11 @@ pub struct Tui {
     #[serde(default)]
     pub raw_output_mode: bool,
 
+    /// Stream agent reasoning chunks live in the TUI instead of buffering them until completion.
+    /// Defaults to `false`.
+    #[serde(default)]
+    pub stream_reasoning_live: bool,
+
     /// Controls whether the TUI uses the terminal's alternate screen buffer.
     ///
     /// - `auto` (default): Use alternate screen.

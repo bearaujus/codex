@@ -9,22 +9,6 @@
       "oneOf": [
         {
           "properties": {
-            "type": {
-              "enum": [
-                "apiKey"
-              ],
-              "title": "ApiKeyAccountType",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type"
-          ],
-          "title": "ApiKeyAccount",
-          "type": "object"
-        },
-        {
-          "properties": {
             "email": {
               "type": [
                 "string",
@@ -48,26 +32,6 @@
             "type"
           ],
           "title": "ChatgptAccount",
-          "type": "object"
-        },
-        {
-          "properties": {
-            "type": {
-              "enum": [
-                "amazonBedrock"
-              ],
-              "title": "AmazonBedrockAccountType",
-              "type": "string"
-            },
-            "usesCodexManagedCredentials": {
-              "default": false,
-              "type": "boolean"
-            }
-          },
-          "required": [
-            "type"
-          ],
-          "title": "AmazonBedrockAccount",
           "type": "object"
         }
       ]
@@ -102,12 +66,17 @@
       "description": "Sparse rolling rate-limit update.\n\nClients should merge available values into the most recent `account/rateLimits/read` response or refetch that snapshot. Nullable account metadata may be unavailable in a rolling update and does not clear a previously observed value.",
       "properties": {
         "rateLimits": {
-          "$ref": "#/definitions/RateLimitSnapshot"
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RateLimitSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`null` clears previously cached rate-limit data after the active account changes."
         }
       },
-      "required": [
-        "rateLimits"
-      ],
       "title": "AccountRateLimitsUpdatedNotification",
       "type": "object"
     },
@@ -170,6 +139,13 @@
     "AccountUpdatedNotification": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
+        "accountEmail": {
+          "description": "Email for the current account, or `null` when unavailable or signed out.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "authMode": {
           "anyOf": [
             {
@@ -1150,23 +1126,9 @@
       "description": "Authentication mode for OpenAI-backed providers.",
       "oneOf": [
         {
-          "description": "OpenAI API key provided by the caller and stored by Codex.",
-          "enum": [
-            "apikey"
-          ],
-          "type": "string"
-        },
-        {
-          "description": "ChatGPT OAuth managed by Codex (tokens persisted and refreshed by Codex).",
+          "description": "ChatGPT OAuth managed via the ChatGPT account pool.",
           "enum": [
             "chatgpt"
-          ],
-          "type": "string"
-        },
-        {
-          "description": "[UNSTABLE] FOR OPENAI INTERNAL USE ONLY - DO NOT USE.\n\nChatGPT auth tokens are supplied by an external host app and are only stored in memory. Token refresh must be handled by the external host app.",
-          "enum": [
-            "chatgptAuthTokens"
           ],
           "type": "string"
         },
@@ -1181,20 +1143,6 @@
           "description": "Programmatic Codex auth backed by a registered Agent Identity.",
           "enum": [
             "agentIdentity"
-          ],
-          "type": "string"
-        },
-        {
-          "description": "Programmatic Codex auth backed by a personal access token.",
-          "enum": [
-            "personalAccessToken"
-          ],
-          "type": "string"
-        },
-        {
-          "description": "Amazon Bedrock bearer token managed by Codex.",
-          "enum": [
-            "bedrockApiKey"
           ],
           "type": "string"
         }
@@ -6414,8 +6362,7 @@
     },
     "ForcedLoginMethod": {
       "enum": [
-        "chatgpt",
-        "api"
+        "chatgpt"
       ],
       "type": "string"
     },
@@ -7018,7 +6965,7 @@
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
         "refreshToken": {
-          "description": "When `true`, requests a proactive token refresh before returning.\n\nIn managed auth mode this triggers the normal refresh-token flow. In external auth mode this flag is ignored. Clients should refresh tokens themselves and call `account/login/start` with `chatgptAuthTokens`.",
+          "description": "When `true`, requests a proactive token refresh before returning.\n\nTriggers the normal ChatGPT refresh-token flow for pool-managed auth.",
           "type": "boolean"
         }
       },
@@ -8265,26 +8212,6 @@
       "oneOf": [
         {
           "properties": {
-            "apiKey": {
-              "type": "string"
-            },
-            "type": {
-              "enum": [
-                "apiKey"
-              ],
-              "title": "ApiKeyv2::LoginAccountParamsType",
-              "type": "string"
-            }
-          },
-          "required": [
-            "apiKey",
-            "type"
-          ],
-          "title": "ApiKeyv2::LoginAccountParams",
-          "type": "object"
-        },
-        {
-          "properties": {
             "appBrand": {
               "anyOf": [
                 {
@@ -8331,65 +8258,6 @@
           ],
           "title": "ChatgptDeviceCodev2::LoginAccountParams",
           "type": "object"
-        },
-        {
-          "description": "[UNSTABLE] FOR OPENAI INTERNAL USE ONLY - DO NOT USE. The access token must contain the same scopes that Codex-managed ChatGPT auth tokens have.",
-          "properties": {
-            "accessToken": {
-              "description": "Access token (JWT) supplied by the client. This token is used for backend API requests and email extraction.",
-              "type": "string"
-            },
-            "chatgptAccountId": {
-              "description": "Workspace/account identifier supplied by the client.",
-              "type": "string"
-            },
-            "chatgptPlanType": {
-              "description": "Optional plan type supplied by the client.\n\nWhen `null`, Codex attempts to derive the plan type from access-token claims. If unavailable, the plan defaults to `unknown`.",
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "type": {
-              "enum": [
-                "chatgptAuthTokens"
-              ],
-              "title": "ChatgptAuthTokensv2::LoginAccountParamsType",
-              "type": "string"
-            }
-          },
-          "required": [
-            "accessToken",
-            "chatgptAccountId",
-            "type"
-          ],
-          "title": "ChatgptAuthTokensv2::LoginAccountParams",
-          "type": "object"
-        },
-        {
-          "description": "[UNSTABLE] Managed Amazon Bedrock login is experimental.",
-          "properties": {
-            "apiKey": {
-              "type": "string"
-            },
-            "region": {
-              "type": "string"
-            },
-            "type": {
-              "enum": [
-                "amazonBedrock"
-              ],
-              "title": "AmazonBedrockv2::LoginAccountParamsType",
-              "type": "string"
-            }
-          },
-          "required": [
-            "apiKey",
-            "region",
-            "type"
-          ],
-          "title": "AmazonBedrockv2::LoginAccountParams",
-          "type": "object"
         }
       ],
       "title": "LoginAccountParams"
@@ -8397,22 +8265,6 @@
     "LoginAccountResponse": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "oneOf": [
-        {
-          "properties": {
-            "type": {
-              "enum": [
-                "apiKey"
-              ],
-              "title": "ApiKeyv2::LoginAccountResponseType",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type"
-          ],
-          "title": "ApiKeyv2::LoginAccountResponse",
-          "type": "object"
-        },
         {
           "properties": {
             "authUrl": {
@@ -8466,38 +8318,6 @@
             "verificationUrl"
           ],
           "title": "ChatgptDeviceCodev2::LoginAccountResponse",
-          "type": "object"
-        },
-        {
-          "properties": {
-            "type": {
-              "enum": [
-                "chatgptAuthTokens"
-              ],
-              "title": "ChatgptAuthTokensv2::LoginAccountResponseType",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type"
-          ],
-          "title": "ChatgptAuthTokensv2::LoginAccountResponse",
-          "type": "object"
-        },
-        {
-          "properties": {
-            "type": {
-              "enum": [
-                "amazonBedrock"
-              ],
-              "title": "AmazonBedrockv2::LoginAccountResponseType",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type"
-          ],
-          "title": "AmazonBedrockv2::LoginAccountResponse",
           "type": "object"
         }
       ],

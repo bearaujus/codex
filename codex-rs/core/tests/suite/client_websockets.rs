@@ -2355,8 +2355,9 @@ async fn websocket_harness_with_provider_options(
     let model_info = codex_core::test_support::construct_model_info_offline(MODEL, &config);
     let thread_id = ThreadId::new();
     let session_id = SessionId::new();
-    let auth_manager =
-        codex_core::test_support::auth_manager_from_auth(CodexAuth::from_api_key("Test API Key"));
+    let auth_manager = codex_core::test_support::auth_manager_from_auth(
+        CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+    );
     let exporter = InMemoryMetricExporter::default();
     let metrics = MetricsClient::new(
         MetricsConfig::in_memory("test", "codex-core", env!("CARGO_PKG_VERSION"), exporter)

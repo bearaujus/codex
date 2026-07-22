@@ -182,6 +182,18 @@ impl TurnDiffTracker {
         self.unified_diff = (!aggregated.is_empty()).then_some(aggregated);
     }
 
+    /// Returns whether an exact-match `*** Update File` should require a fresh
+    /// read before touching `path` again in the current turn.
+    pub fn requires_refresh_for_exact_match_update(&self, path: &Path) -> bool {
+        if !self.valid {
+            return false;
+        }
+
+        self.baseline_by_path.keys().any(|k| k.path == path)
+            || self.origin_by_current_path.keys().any(|k| k.path == path)
+            || self.origin_by_current_path.values().any(|k| k.path == path)
+    }
+
     fn apply_change(&mut self, environment_id: &str, change: &AppliedPatchChange) {
         let source_path = TrackedPath::new(environment_id, change.path.as_path());
         match &change.change {

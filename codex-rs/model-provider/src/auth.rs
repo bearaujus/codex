@@ -14,15 +14,11 @@ use codex_login::auth::AgentIdentityAuth;
 use codex_login::auth::AgentIdentityAuthError;
 use codex_login::auth::AgentIdentityAuthPolicy;
 use codex_model_provider_info::ModelProviderInfo;
-use codex_protocol::error::CodexErr;
 use codex_protocol::protocol::SessionSource;
 use http::HeaderMap;
 use http::HeaderValue;
 
 use crate::bearer_auth_provider::BearerAuthProvider;
-
-const BEDROCK_API_KEY_UNSUPPORTED_MESSAGE: &str =
-    "Bedrock API key auth is only supported by the Amazon Bedrock model provider";
 
 #[derive(Clone, Debug)]
 pub struct ProviderAuthScope {
@@ -180,12 +176,6 @@ pub(crate) fn resolve_provider_auth(
     auth: Option<&CodexAuth>,
     provider: &ModelProviderInfo,
 ) -> codex_protocol::error::Result<SharedAuthProvider> {
-    if matches!(auth, Some(CodexAuth::BedrockApiKey(_))) {
-        return Err(CodexErr::UnsupportedOperation(
-            BEDROCK_API_KEY_UNSUPPORTED_MESSAGE.to_string(),
-        ));
-    }
-
     if let Some(auth) = bearer_auth_for_provider(provider)? {
         return Ok(Arc::new(auth));
     }
@@ -285,11 +275,7 @@ pub fn auth_provider_from_auth(auth: &CodexAuth) -> SharedAuthProvider {
             Arc::new(AgentIdentityAuthProvider { auth: auth.clone() })
         }
         CodexAuth::Headers(auth) => Arc::new(HeaderAuthProvider { auth: auth.clone() }),
-        CodexAuth::BedrockApiKey(_) => unreachable!("{BEDROCK_API_KEY_UNSUPPORTED_MESSAGE}"),
-        CodexAuth::ApiKey(_)
-        | CodexAuth::Chatgpt(_)
-        | CodexAuth::ChatgptAuthTokens(_)
-        | CodexAuth::PersonalAccessToken(_) => Arc::new(BearerAuthProvider {
+        CodexAuth::Chatgpt(_) => Arc::new(BearerAuthProvider {
             token: auth.get_token().ok(),
             account_id: auth.get_account_id(),
             is_fedramp_account: auth.is_fedramp_account(),
@@ -318,8 +304,6 @@ mod tests {
     use codex_login::AuthCredentialsStoreMode;
     use codex_login::AuthKeyringBackendKind;
     use codex_login::auth::AgentIdentityAuthRecord;
-    use codex_login::auth::BedrockApiKeyAuth;
-    use codex_login::auth::login_with_chatgpt_auth_tokens;
     use codex_model_provider_info::WireApi;
     use codex_model_provider_info::create_oss_provider_with_base_url;
     use codex_protocol::account::PlanType;
@@ -407,7 +391,6 @@ mod tests {
         write_chatgpt_auth_json(&codex_home);
         let auth_manager = AuthManager::shared(
             codex_home.clone(),
-            /*enable_codex_api_key_env*/ false,
             AuthCredentialsStoreMode::File,
             /*forced_chatgpt_workspace_id*/ None,
             /*chatgpt_base_url*/ None,
@@ -460,81 +443,6 @@ mod tests {
         let actual = auth_provider_from_auth(&auth).to_auth_headers();
 
         assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn openai_provider_rejects_bedrock_api_key_auth() {
-        let provider = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
-        let auth = CodexAuth::BedrockApiKey(BedrockApiKeyAuth {
-            api_key: "bedrock-api-key-test".to_string(),
-            region: "us-east-1".to_string(),
-        });
-
-        match resolve_provider_auth(Some(&auth), &provider) {
-            Err(CodexErr::UnsupportedOperation(message)) => {
-                assert_eq!(message, BEDROCK_API_KEY_UNSUPPORTED_MESSAGE);
-            }
-            Err(err) => panic!("unexpected auth error: {err:?}"),
-            Ok(_) => panic!("Bedrock API key auth should be rejected"),
-        }
-    }
-
-    #[tokio::test]
-    async fn auth_manager_provider_follows_refreshes_but_not_account_switches() {
-        let codex_home = test_codex_home();
-        login_with_chatgpt_auth_tokens(
-            &codex_home,
-            "header.e30.first",
-            "test-account",
-            /*chatgpt_plan_type*/ None,
-        )
-        .expect("save initial auth");
-        let auth_manager = Arc::new(
-            AuthManager::new(
-                codex_home.clone(),
-                /*enable_codex_api_key_env*/ false,
-                AuthCredentialsStoreMode::Ephemeral,
-                /*forced_chatgpt_workspace_id*/ None,
-                /*chatgpt_base_url*/ None,
-                AuthKeyringBackendKind::default(),
-                /*auth_route_config*/ None,
-            )
-            .await,
-        );
-        let expected_auth = auth_manager
-            .auth_cached()
-            .expect("initial auth should be cached");
-        let provider = auth_provider_from_auth_manager(Arc::clone(&auth_manager), &expected_auth);
-
-        assert_eq!(
-            provider.to_auth_headers().get(AUTHORIZATION),
-            Some(&HeaderValue::from_static("Bearer header.e30.first"))
-        );
-
-        login_with_chatgpt_auth_tokens(
-            &codex_home,
-            "header.e30.reloaded",
-            "test-account",
-            /*chatgpt_plan_type*/ None,
-        )
-        .expect("save reloaded auth");
-        auth_manager.reload().await;
-
-        assert_eq!(
-            provider.to_auth_headers().get(AUTHORIZATION),
-            Some(&HeaderValue::from_static("Bearer header.e30.reloaded"))
-        );
-
-        login_with_chatgpt_auth_tokens(
-            &codex_home,
-            "header.e30.other-account",
-            "other-account",
-            /*chatgpt_plan_type*/ None,
-        )
-        .expect("save switched-account auth");
-        auth_manager.reload().await;
-
-        assert!(provider.to_auth_headers().is_empty());
     }
 
     #[tokio::test]

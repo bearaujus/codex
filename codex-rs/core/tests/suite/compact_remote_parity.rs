@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use anyhow::Result;
 use codex_features::Feature;
 use codex_login::CodexAuth;
-use codex_protocol::config_types::ServiceTier;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
@@ -34,35 +33,8 @@ enum Mode {
     V2,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum AuthCase {
-    ChatGpt,
-    ApiKey,
-}
-
-impl AuthCase {
-    fn build(self) -> CodexAuth {
-        match self {
-            AuthCase::ChatGpt => CodexAuth::create_dummy_chatgpt_auth_for_testing(),
-            AuthCase::ApiKey => CodexAuth::from_api_key("dummy"),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct RunSettings {
-    auth: AuthCase,
-    service_tier_fast: bool,
-}
-
-impl Default for RunSettings {
-    fn default() -> Self {
-        Self {
-            auth: AuthCase::ChatGpt,
-            service_tier_fast: false,
-        }
-    }
-}
+#[derive(Clone, Copy, Debug, Default)]
+struct RunSettings;
 
 #[derive(Clone, Copy, Debug)]
 enum Step {
@@ -138,40 +110,9 @@ async fn remote_compaction_parity_manual_transcripts() -> Result<()> {
     ];
 
     for scenario in scenarios {
-        compare_manual_scenario(&scenario, RunSettings::default()).await?;
+        compare_manual_scenario(&scenario, RunSettings).await?;
     }
 
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn remote_compaction_parity_v2_api_key_sends_service_tier_upgrade() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let scenario = Scenario {
-        name: "api_key_service_tier",
-        steps: TOOL_MIX,
-    };
-    let settings = RunSettings {
-        auth: AuthCase::ApiKey,
-        service_tier_fast: true,
-    };
-    let legacy = run_manual_session(&scenario, Mode::Legacy, settings).await?;
-    let v2 = run_manual_session(&scenario, Mode::V2, settings).await?;
-
-    assert_eq!(
-        legacy.compact_body.get("service_tier"),
-        None,
-        "legacy /responses/compact should continue omitting service_tier for API-key auth"
-    );
-    assert_eq!(
-        v2.compact_body.get("service_tier").and_then(Value::as_str),
-        Some(ServiceTier::Fast.request_value()),
-        "v2 compaction should send service_tier through /responses for API-key auth"
-    );
-
-    assert_compact_requests_eq_except_v2_service_tier("api-key service tier", &legacy, &v2);
-    assert_follow_up_and_history_eq("api-key service tier", &legacy, &v2);
     Ok(())
 }
 
@@ -251,42 +192,6 @@ fn assert_capture_eq(label: &str, legacy: &Capture, v2: &Capture) {
         compact_input_len(&legacy.compact_body, Mode::Legacy),
         replacement_history_len(&legacy.replacement_history),
         follow_up_input_len(&legacy.follow_up_body)
-    );
-}
-
-fn assert_compact_requests_eq_except_v2_service_tier(label: &str, legacy: &Capture, v2: &Capture) {
-    assert_eq!(
-        legacy.compact_requests, 1,
-        "legacy compact endpoint should be called exactly once for {label}",
-    );
-    assert_eq!(
-        v2.compact_requests, 0,
-        "v2 should not call /responses/compact for {label}",
-    );
-
-    let legacy_compact = compact_request_view(&legacy.compact_body, Mode::Legacy);
-    let mut v2_compact = compact_request_view(&v2.compact_body, Mode::V2);
-    remove_object_field(&mut v2_compact, "service_tier");
-    assert_json_eq(
-        &format!("compact request parity mismatch for {label} after service_tier upgrade"),
-        &legacy_compact,
-        &v2_compact,
-    );
-}
-
-fn assert_follow_up_and_history_eq(label: &str, legacy: &Capture, v2: &Capture) {
-    let legacy_follow_up = follow_up_request_view(&legacy.follow_up_body);
-    let v2_follow_up = follow_up_request_view(&v2.follow_up_body);
-    assert_json_eq(
-        &format!("post-compact follow-up request parity mismatch for {label}"),
-        &legacy_follow_up,
-        &v2_follow_up,
-    );
-
-    assert_json_eq(
-        &format!("replacement history parity mismatch for {label}"),
-        &legacy.replacement_history,
-        &v2.replacement_history,
     );
 }
 
@@ -457,7 +362,7 @@ async fn run_manual_hook_session(mode: Mode) -> Result<Value> {
             compaction_v2_response_body(),
         ],
     };
-    let harness = build_harness(mode, RunSettings::default(), /*hooks*/ true).await?;
+    let harness = build_harness(mode, RunSettings, /*hooks*/ true).await?;
     let codex = harness.test().codex.clone();
     responses::mount_sse_sequence(harness.server(), response_bodies).await;
     let compact_mock = mount_legacy_compact_if_needed(&harness, mode).await;
@@ -487,13 +392,7 @@ async fn run_manual_hook_session(mode: Mode) -> Result<Value> {
 }
 
 async fn build_auto_harness(mode: Mode) -> Result<TestCodexHarness> {
-    build_harness_inner(
-        mode,
-        RunSettings::default(),
-        /*hooks*/ false,
-        Some(200),
-    )
-    .await
+    build_harness_inner(mode, RunSettings, /*hooks*/ false, Some(200)).await
 }
 
 async fn build_harness(mode: Mode, settings: RunSettings, hooks: bool) -> Result<TestCodexHarness> {
@@ -502,13 +401,13 @@ async fn build_harness(mode: Mode, settings: RunSettings, hooks: bool) -> Result
 
 async fn build_harness_inner(
     mode: Mode,
-    settings: RunSettings,
+    _settings: RunSettings,
     hooks: bool,
     auto_compact_limit: Option<i64>,
 ) -> Result<TestCodexHarness> {
     fs::create_dir_all(FIXED_CWD)?;
     let mut builder = test_codex()
-        .with_auth(settings.auth.build())
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_pre_build_hook(|home| {
             fs::write(home.join("AGENTS.md"), USER_INSTRUCTIONS)
                 .expect("write global instructions");
@@ -522,9 +421,6 @@ async fn build_harness_inner(
         ))
         .expect("fixed cwd should be absolute");
         config.developer_instructions = Some("PARITY_DEVELOPER_INSTRUCTIONS".to_string());
-        if settings.service_tier_fast {
-            config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
-        }
         config.model_auto_compact_token_limit = auto_compact_limit;
         if hooks {
             trust_discovered_hooks(config);
@@ -849,7 +745,8 @@ with Path(r"{log_path}").open("a", encoding="utf-8") as handle:
 }
 
 fn python_hook_command(script_path: &Path) -> String {
-    format!("python3 \"{}\"", script_path.display())
+    let interpreter = if cfg!(windows) { "python" } else { "python3" };
+    format!("{interpreter} \"{}\"", script_path.display())
 }
 
 fn hook_log_view(path: &Path) -> Result<Value> {
@@ -1086,12 +983,6 @@ fn canonical_json(value: &Value) -> Value {
         }
         Value::Array(values) => Value::Array(values.iter().map(canonical_json).collect()),
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => value.clone(),
-    }
-}
-
-fn remove_object_field(value: &mut Value, field: &str) {
-    if let Value::Object(map) = value {
-        map.remove(field);
     }
 }
 

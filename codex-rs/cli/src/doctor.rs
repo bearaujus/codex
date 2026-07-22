@@ -350,8 +350,7 @@ async fn build_report(
     let config_result = load_config(root_config_overrides, interactive, arg0_paths).await;
     match &config_result {
         Ok(config) => {
-            let auth_manager =
-                AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ true).await;
+            let auth_manager = AuthManager::shared_from_config(config).await;
             let reachability_plan = provider_reachability_plan(config);
             let (
                 config_check,
@@ -1212,7 +1211,6 @@ fn auth_check(config: &Config) -> DoctorCheck {
     ) {
         Ok(Some(auth)) => {
             details.push(format!("stored auth mode: {}", stored_auth_mode(&auth)));
-            details.push(format!("stored API key: {}", auth.openai_api_key.is_some()));
             details.push(format!("stored ChatGPT tokens: {}", auth.tokens.is_some()));
             details.push(format!(
                 "stored agent identity: {}",
@@ -1244,8 +1242,9 @@ fn auth_check(config: &Config) -> DoctorCheck {
             let mut check =
                 DoctorCheck::new("auth.credentials", "auth", status, summary).details(details);
             if status == CheckStatus::Fail {
-                check =
-                    check.remediation("Run codex login again or provide a supported auth env var.");
+                check = check.remediation(
+                    "Configure ChatGPT through app-server OAuth or device-code login, or ask your administrator to provision managed auth.",
+                );
             }
             check
         }
@@ -1263,7 +1262,9 @@ fn auth_check(config: &Config) -> DoctorCheck {
             "no Codex credentials were found",
         )
         .details(details)
-        .remediation("Run codex login or provide an API key through a supported auth env var."),
+        .remediation(
+            "Configure ChatGPT through app-server OAuth or device-code login, or ask your administrator to provision managed auth.",
+        ),
         Err(err) => DoctorCheck::new(
             "auth.credentials",
             "auth",
@@ -1271,7 +1272,9 @@ fn auth_check(config: &Config) -> DoctorCheck {
             "stored credentials could not be read",
         )
         .detail(err.to_string())
-        .remediation("Fix auth storage access or run codex login again."),
+        .remediation(
+            "Fix auth storage access, then reprovision ChatGPT through app-server OAuth or device-code login.",
+        ),
     }
 }
 
@@ -1332,13 +1335,9 @@ fn provider_specific_auth_check(
 
 fn stored_auth_mode(auth: &codex_login::AuthDotJson) -> &'static str {
     match stored_auth_mode_value(auth) {
-        AuthMode::ApiKey => "api_key",
         AuthMode::Chatgpt => "chatgpt",
-        AuthMode::ChatgptAuthTokens => "chatgpt_auth_tokens",
         AuthMode::Headers => "headers",
         AuthMode::AgentIdentity => "agent_identity",
-        AuthMode::PersonalAccessToken => "personal_access_token",
-        AuthMode::BedrockApiKey => "bedrock_api_key",
     }
 }
 
@@ -1346,12 +1345,12 @@ fn stored_auth_mode_value(auth: &AuthDotJson) -> AuthMode {
     if let Some(mode) = auth.auth_mode {
         return mode;
     }
-    if auth.personal_access_token.is_some() {
-        AuthMode::PersonalAccessToken
-    } else if auth.bedrock_api_key.is_some() {
-        AuthMode::BedrockApiKey
-    } else if auth.openai_api_key.is_some() {
-        AuthMode::ApiKey
+    if auth
+        .agent_identity
+        .as_ref()
+        .is_some_and(codex_login::AgentIdentityStorage::has_auth_material)
+    {
+        AuthMode::AgentIdentity
     } else {
         AuthMode::Chatgpt
     }
@@ -1359,21 +1358,10 @@ fn stored_auth_mode_value(auth: &AuthDotJson) -> AuthMode {
 
 fn stored_auth_issues(
     auth: &AuthDotJson,
-    env_var_present: impl Fn(&str) -> bool,
+    _env_var_present: impl Fn(&str) -> bool,
 ) -> Vec<&'static str> {
     let mut issues = Vec::new();
     match stored_auth_mode_value(auth) {
-        AuthMode::ApiKey => {
-            let stored_key_present = auth
-                .openai_api_key
-                .as_deref()
-                .is_some_and(|key| !key.trim().is_empty());
-            let env_key_present =
-                env_var_present(OPENAI_API_KEY_ENV_VAR) || env_var_present(CODEX_API_KEY_ENV_VAR);
-            if !stored_key_present && !env_key_present {
-                issues.push("API key auth is missing an API key");
-            }
-        }
         AuthMode::Chatgpt => {
             match auth.tokens.as_ref() {
                 Some(tokens) => {
@@ -1390,22 +1378,6 @@ fn stored_auth_issues(
                 issues.push("ChatGPT auth is missing refresh metadata");
             }
         }
-        AuthMode::ChatgptAuthTokens => {
-            match auth.tokens.as_ref() {
-                Some(tokens) => {
-                    if tokens.access_token.trim().is_empty() {
-                        issues.push("external ChatGPT auth is missing an access token");
-                    }
-                    if tokens.account_id.is_none() && tokens.id_token.chatgpt_account_id.is_none() {
-                        issues.push("external ChatGPT auth is missing a ChatGPT account id");
-                    }
-                }
-                None => issues.push("external ChatGPT auth is missing token data"),
-            }
-            if auth.last_refresh.is_none() {
-                issues.push("external ChatGPT auth is missing refresh metadata");
-            }
-        }
         AuthMode::Headers => {
             issues.push("header auth cannot be loaded from auth storage");
         }
@@ -1416,20 +1388,6 @@ fn stored_auth_issues(
                 .is_none_or(|agent_identity| !agent_identity.has_auth_material())
             {
                 issues.push("agent identity auth is missing an agent identity token");
-            }
-        }
-        AuthMode::PersonalAccessToken => {
-            if auth
-                .personal_access_token
-                .as_deref()
-                .is_none_or(|token| token.trim().is_empty())
-            {
-                issues.push("personal access token auth is missing a personal access token");
-            }
-        }
-        AuthMode::BedrockApiKey => {
-            if auth.bedrock_api_key.is_none() {
-                issues.push("Bedrock API key auth is missing a Bedrock API key");
             }
         }
     }
@@ -2477,13 +2435,9 @@ fn websocket_error_detail(err: &ApiError) -> String {
 
 fn auth_mode_name(auth: &CodexAuth) -> &'static str {
     match auth.auth_mode() {
-        AuthMode::ApiKey => "api_key",
         AuthMode::Chatgpt => "chatgpt",
-        AuthMode::ChatgptAuthTokens => "chatgpt_auth_tokens",
         AuthMode::Headers => "headers",
         AuthMode::AgentIdentity => "agent_identity",
-        AuthMode::PersonalAccessToken => "personal_access_token",
-        AuthMode::BedrockApiKey => "bedrock_api_key",
     }
 }
 
@@ -2551,7 +2505,6 @@ struct ReachabilityEndpoint {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProviderAuthReachabilityMode {
     NotRequired,
-    ApiKey,
     Chatgpt,
 }
 
@@ -2559,7 +2512,6 @@ impl ProviderAuthReachabilityMode {
     fn description(self) -> &'static str {
         match self {
             Self::NotRequired => "provider auth",
-            Self::ApiKey => "API key auth",
             Self::Chatgpt => "ChatGPT auth",
         }
     }
@@ -2603,29 +2555,13 @@ fn default_reachability_plan() -> ReachabilityPlan {
 
 fn provider_auth_reachability_mode_from_auth(
     requires_openai_auth: bool,
-    env_var_present: impl Fn(&str) -> bool,
-    stored_auth: Option<&AuthDotJson>,
+    _env_var_present: impl Fn(&str) -> bool,
+    _stored_auth: Option<&AuthDotJson>,
 ) -> ProviderAuthReachabilityMode {
     if !requires_openai_auth {
         return ProviderAuthReachabilityMode::NotRequired;
     }
-    if env_var_present(OPENAI_API_KEY_ENV_VAR) || env_var_present(CODEX_API_KEY_ENV_VAR) {
-        return ProviderAuthReachabilityMode::ApiKey;
-    }
-    if env_var_present(CODEX_ACCESS_TOKEN_ENV_VAR) {
-        return ProviderAuthReachabilityMode::Chatgpt;
-    }
-    match stored_auth.map(stored_auth_mode_value) {
-        Some(AuthMode::ApiKey | AuthMode::BedrockApiKey) => ProviderAuthReachabilityMode::ApiKey,
-        Some(
-            AuthMode::Chatgpt
-            | AuthMode::ChatgptAuthTokens
-            | AuthMode::Headers
-            | AuthMode::AgentIdentity
-            | AuthMode::PersonalAccessToken,
-        )
-        | None => ProviderAuthReachabilityMode::Chatgpt,
-    }
+    ProviderAuthReachabilityMode::Chatgpt
 }
 
 fn provider_reachability_plan_from_parts(
@@ -2637,23 +2573,11 @@ fn provider_reachability_plan_from_parts(
     is_amazon_bedrock: bool,
     chatgpt_base_url: &str,
 ) -> ReachabilityPlan {
-    let provider_route_probe_url = provider_base_url
-        .or_else(|| {
-            (mode == ProviderAuthReachabilityMode::ApiKey).then_some("https://api.openai.com/v1")
-        })
-        .and_then(|url| {
-            should_probe_models_route(provider_name, url, is_amazon_bedrock)
-                .then(|| provider_url_for_path(url, "models", provider_query_params))
-        });
+    let provider_route_probe_url = provider_base_url.and_then(|url| {
+        should_probe_models_route(provider_name, url, is_amazon_bedrock)
+            .then(|| provider_url_for_path(url, "models", provider_query_params))
+    });
     let endpoints = match mode {
-        ProviderAuthReachabilityMode::ApiKey => vec![ReachabilityEndpoint {
-            label: format!("{provider_id} API"),
-            url: provider_base_url
-                .unwrap_or("https://api.openai.com/v1")
-                .to_string(),
-            required: true,
-            route_probe_url: provider_route_probe_url,
-        }],
         ProviderAuthReachabilityMode::Chatgpt => vec![ReachabilityEndpoint {
             label: "ChatGPT".to_string(),
             url: chatgpt_base_url.to_string(),
@@ -3534,34 +3458,13 @@ mod tests {
     }
 
     #[test]
-    fn stored_auth_validation_rejects_missing_api_key() {
-        let auth = AuthDotJson {
-            auth_mode: Some(AuthMode::ApiKey),
-            openai_api_key: None,
-            tokens: None,
-            last_refresh: None,
-            agent_identity: None,
-            personal_access_token: None,
-            bedrock_api_key: None,
-        };
-
-        assert_eq!(
-            stored_auth_issues(&auth, |_| false),
-            vec!["API key auth is missing an API key"]
-        );
-        assert!(stored_auth_issues(&auth, |name| name == OPENAI_API_KEY_ENV_VAR).is_empty());
-    }
-
-    #[test]
     fn stored_auth_validation_rejects_missing_chatgpt_tokens() {
         let auth = AuthDotJson {
-            auth_mode: None,
-            openai_api_key: None,
+            auth_mode: Some(AuthMode::Chatgpt),
             tokens: None,
+            pool_account_id: None,
             last_refresh: None,
             agent_identity: None,
-            personal_access_token: None,
-            bedrock_api_key: None,
         };
 
         assert_eq!(
@@ -3574,47 +3477,44 @@ mod tests {
     }
 
     #[test]
-    fn stored_auth_validation_handles_personal_access_token() {
+    fn stored_auth_validation_handles_agent_identity() {
         let mut auth = AuthDotJson {
-            auth_mode: None,
-            openai_api_key: None,
+            auth_mode: Some(AuthMode::AgentIdentity),
             tokens: None,
+            pool_account_id: None,
             last_refresh: None,
             agent_identity: None,
-            personal_access_token: Some("at-test".to_string()),
-            bedrock_api_key: None,
         };
 
-        assert_eq!(stored_auth_mode(&auth), "personal_access_token");
-        assert!(stored_auth_issues(&auth, |_| false).is_empty());
-
-        auth.auth_mode = Some(AuthMode::PersonalAccessToken);
-        auth.personal_access_token = None;
+        assert_eq!(stored_auth_mode(&auth), "agent_identity");
         assert_eq!(
             stored_auth_issues(&auth, |_| false),
-            vec!["personal access token auth is missing a personal access token"]
+            vec!["agent identity auth is missing an agent identity token"]
         );
+
+        auth.agent_identity = Some(codex_login::AgentIdentityStorage::Jwt(
+            "dummy-agent-identity".to_string(),
+        ));
+        assert!(stored_auth_issues(&auth, |_| false).is_empty());
     }
 
     #[test]
-    fn provider_reachability_mode_uses_api_key_auth() {
-        let api_key_auth = AuthDotJson {
-            auth_mode: Some(AuthMode::ApiKey),
-            openai_api_key: Some("sk-test".to_string()),
+    fn provider_reachability_mode_uses_chatgpt_auth() {
+        let chatgpt_auth = AuthDotJson {
+            auth_mode: Some(AuthMode::Chatgpt),
             tokens: None,
+            pool_account_id: None,
             last_refresh: None,
             agent_identity: None,
-            personal_access_token: None,
-            bedrock_api_key: None,
         };
 
         assert_eq!(
             provider_auth_reachability_mode_from_auth(
                 /*requires_openai_auth*/ true,
                 |_| false,
-                Some(&api_key_auth),
+                Some(&chatgpt_auth),
             ),
-            ProviderAuthReachabilityMode::ApiKey
+            ProviderAuthReachabilityMode::Chatgpt
         );
         assert_eq!(
             provider_auth_reachability_mode_from_auth(
@@ -3622,7 +3522,7 @@ mod tests {
                 |name| name == OPENAI_API_KEY_ENV_VAR,
                 /*stored_auth*/ None,
             ),
-            ProviderAuthReachabilityMode::ApiKey
+            ProviderAuthReachabilityMode::Chatgpt
         );
     }
 
@@ -3694,9 +3594,9 @@ mod tests {
     }
 
     #[test]
-    fn provider_reachability_api_key_does_not_require_chatgpt() {
+    fn provider_reachability_chatgpt_mode_uses_chatgpt_endpoint() {
         let plan = provider_reachability_plan_from_parts(
-            ProviderAuthReachabilityMode::ApiKey,
+            ProviderAuthReachabilityMode::Chatgpt,
             "openai",
             "OpenAI",
             /*provider_base_url*/ None,
@@ -3708,10 +3608,10 @@ mod tests {
         assert_eq!(
             plan.endpoints,
             vec![ReachabilityEndpoint {
-                label: "openai API".to_string(),
-                url: "https://api.openai.com/v1".to_string(),
+                label: "ChatGPT".to_string(),
+                url: "https://chatgpt.com/backend-api/".to_string(),
                 required: true,
-                route_probe_url: Some("https://api.openai.com/v1/models".to_string()),
+                route_probe_url: None,
             }]
         );
     }
@@ -3749,7 +3649,7 @@ mod tests {
             );
         });
         let plan = provider_reachability_plan_from_parts(
-            ProviderAuthReachabilityMode::ApiKey,
+            ProviderAuthReachabilityMode::NotRequired,
             "openai",
             "OpenAI",
             Some(&format!("http://{addr}/xxxx")),
@@ -3790,7 +3690,7 @@ mod tests {
             );
         });
         let plan = provider_reachability_plan_from_parts(
-            ProviderAuthReachabilityMode::ApiKey,
+            ProviderAuthReachabilityMode::NotRequired,
             "openai",
             "OpenAI",
             Some(&format!("http://{addr}/v1")),

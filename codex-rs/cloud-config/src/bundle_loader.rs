@@ -55,7 +55,6 @@ pub fn cloud_config_bundle_loader(
 
 pub async fn cloud_config_bundle_loader_for_storage(
     codex_home: PathBuf,
-    enable_codex_api_key_env: bool,
     credentials_store_mode: AuthCredentialsStoreMode,
     keyring_backend_kind: AuthKeyringBackendKind,
     chatgpt_base_url: String,
@@ -63,7 +62,6 @@ pub async fn cloud_config_bundle_loader_for_storage(
 ) -> CloudConfigBundleLoader {
     let auth_manager = AuthManager::shared(
         codex_home.clone(),
-        enable_codex_api_key_env,
         credentials_store_mode,
         /*forced_chatgpt_workspace_id*/ None,
         Some(chatgpt_base_url.clone()),

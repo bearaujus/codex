@@ -47,7 +47,6 @@ pub async fn load_auth_manager(chatgpt_base_url: Option<String>) -> Option<AuthM
     Some(
         AuthManager::new(
             config.codex_home.to_path_buf(),
-            /*enable_codex_api_key_env*/ false,
             config.cli_auth_credentials_store_mode,
             config.forced_chatgpt_workspace_id.clone(),
             chatgpt_base_url.or(Some(config.chatgpt_base_url.clone())),

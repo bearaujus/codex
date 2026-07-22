@@ -110,7 +110,8 @@ fn ev_completed_with_usage(id: &str, input_tokens: i64, output_tokens: i64) -> V
 }
 
 fn python_hook_command(script_path: &Path) -> String {
-    format!("python3 \"{}\"", script_path.display())
+    let interpreter = if cfg!(windows) { "python" } else { "python3" };
+    format!("{interpreter} \"{}\"", script_path.display())
 }
 
 fn write_token_budget_compact_hooks(home: &Path) {

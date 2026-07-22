@@ -270,6 +270,7 @@ impl OutgoingMessageSender {
         self.request_contexts.lock().await.len()
     }
 
+    #[cfg(test)]
     pub(crate) async fn send_request(
         &self,
         request: ServerRequestPayload,
@@ -827,7 +828,7 @@ mod tests {
     fn verify_account_rate_limits_notification_serialization() {
         let notification =
             ServerNotification::AccountRateLimitsUpdated(AccountRateLimitsUpdatedNotification {
-                rate_limits: RateLimitSnapshot {
+                rate_limits: Some(RateLimitSnapshot {
                     limit_id: Some("codex".to_string()),
                     limit_name: None,
                     primary: Some(RateLimitWindow {
@@ -841,7 +842,7 @@ mod tests {
                     spend_control_reached: None,
                     plan_type: Some(PlanType::Plus),
                     rate_limit_reached_type: None,
-                },
+                }),
             });
 
         assert_eq!(
@@ -874,16 +875,18 @@ mod tests {
     #[test]
     fn verify_account_updated_notification_serialization() {
         let notification = ServerNotification::AccountUpdated(AccountUpdatedNotification {
-            auth_mode: Some(AuthMode::ApiKey),
+            auth_mode: Some(AuthMode::Chatgpt),
             plan_type: None,
+            account_email: Some("user@example.com".to_string()),
         });
 
         assert_eq!(
             json!({
                 "method": "account/updated",
                 "params": {
-                    "authMode": "apikey",
-                    "planType": null
+                    "authMode": "chatgpt",
+                    "planType": null,
+                    "accountEmail": "user@example.com"
                 },
             }),
             serde_json::to_value(notification)

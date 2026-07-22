@@ -111,17 +111,15 @@ fn remote_control_auth_dot_json(account_id: Option<&str>) -> AuthDotJson {
 
     AuthDotJson {
         auth_mode: Some(AuthMode::Chatgpt),
-        openai_api_key: None,
         tokens: Some(TokenData {
             id_token: parse_chatgpt_jwt_claims(&fake_jwt).expect("fake jwt should parse"),
             access_token: "Access Token".to_string(),
             refresh_token: "refresh-token".to_string(),
             account_id: account_id.map(str::to_string),
         }),
+        pool_account_id: account_id.map(str::to_string),
         last_refresh: Some(chrono::Utc::now()),
         agent_identity: None,
-        personal_access_token: None,
-        bedrock_api_key: None,
     }
 }
 
@@ -1040,7 +1038,6 @@ async fn remote_control_start_allows_missing_auth_when_enabled() {
     let codex_home = TempDir::new().expect("temp dir should create");
     let auth_manager = AuthManager::shared(
         codex_home.path().to_path_buf(),
-        /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
         /*forced_chatgpt_workspace_id*/ None,
         /*chatgpt_base_url*/ None,
@@ -1890,7 +1887,6 @@ async fn remote_control_waits_for_account_id_before_enrolling() {
     let state_db = remote_control_state_runtime(&codex_home).await;
     let auth_manager = AuthManager::shared(
         codex_home.path().to_path_buf(),
-        /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
         /*forced_chatgpt_workspace_id*/ None,
         /*chatgpt_base_url*/ None,
@@ -1988,7 +1984,6 @@ async fn persisted_enable_does_not_follow_auth_to_an_account_without_a_preferenc
     let state_db = remote_control_state_runtime(&codex_home).await;
     let auth_manager = AuthManager::shared(
         codex_home.path().to_path_buf(),
-        /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
         /*forced_chatgpt_workspace_id*/ None,
         /*chatgpt_base_url*/ None,

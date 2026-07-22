@@ -2,9 +2,10 @@ start: begin_patch hunk+ end_patch
 begin_patch: "*** Begin Patch" LF
 end_patch: "*** End Patch" LF?
 
-hunk: add_hunk | delete_hunk | update_hunk
+hunk: add_hunk | delete_hunk | replace_hunk | update_hunk
 add_hunk: "*** Add File: " filename LF add_line+
 delete_hunk: "*** Delete File: " filename LF
+replace_hunk: "*** Replace File: " filename LF add_line*
 update_hunk: "*** Update File: " filename LF change_move? change?
 
 filename: /(.+)/

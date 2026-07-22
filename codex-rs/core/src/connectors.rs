@@ -117,8 +117,7 @@ pub(crate) async fn list_tool_suggest_discoverable_tools_with_auth(
 pub async fn list_cached_accessible_connectors_from_mcp_tools(
     config: &Config,
 ) -> Option<Vec<AppInfo>> {
-    let auth_manager =
-        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await;
+    let auth_manager = AuthManager::shared_from_config(config).await;
     let auth = auth_manager.auth().await;
     if !config
         .features
@@ -199,8 +198,7 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
     environment_manager: Arc<EnvironmentManager>,
     mcp_manager: Arc<McpManager>,
 ) -> anyhow::Result<AccessibleConnectorsStatus> {
-    let auth_manager =
-        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await;
+    let auth_manager = AuthManager::shared_from_config(config).await;
     let auth = auth_manager.auth().await;
     if !config
         .features
@@ -427,8 +425,7 @@ async fn cached_directory_connectors_for_tool_suggest_with_auth(
     let auth = if let Some(auth) = auth {
         Some(auth)
     } else {
-        let auth_manager =
-            AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await;
+        let auth_manager = AuthManager::shared_from_config(config).await;
         loaded_auth = auth_manager.auth().await;
         loaded_auth.as_ref()
     };

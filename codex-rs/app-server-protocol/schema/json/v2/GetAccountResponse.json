@@ -5,22 +5,6 @@
       "oneOf": [
         {
           "properties": {
-            "type": {
-              "enum": [
-                "apiKey"
-              ],
-              "title": "ApiKeyAccountType",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type"
-          ],
-          "title": "ApiKeyAccount",
-          "type": "object"
-        },
-        {
-          "properties": {
             "email": {
               "type": [
                 "string",
@@ -44,26 +28,6 @@
             "type"
           ],
           "title": "ChatgptAccount",
-          "type": "object"
-        },
-        {
-          "properties": {
-            "type": {
-              "enum": [
-                "amazonBedrock"
-              ],
-              "title": "AmazonBedrockAccountType",
-              "type": "string"
-            },
-            "usesCodexManagedCredentials": {
-              "default": false,
-              "type": "boolean"
-            }
-          },
-          "required": [
-            "type"
-          ],
-          "title": "AmazonBedrockAccount",
           "type": "object"
         }
       ]

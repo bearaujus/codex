@@ -157,7 +157,6 @@ async fn device_code_login_integration_succeeds() -> anyhow::Result<()> {
     )
     .context("auth.json should load after login succeeds")?
     .context("auth.json written")?;
-    // assert_eq!(auth.openai_api_key.as_deref(), Some("api-key-321"));
     let tokens = auth.tokens.expect("tokens persisted");
     assert_eq!(tokens.access_token, "access-token-123");
     assert_eq!(tokens.refresh_token, "refresh-token-123");
@@ -294,7 +293,6 @@ async fn device_code_login_integration_persists_without_api_key_on_exchange_fail
     )
     .context("auth.json should load after login succeeds")?
     .context("auth.json written")?;
-    assert!(auth.openai_api_key.is_none());
     let tokens = auth.tokens.expect("tokens persisted");
     assert_eq!(tokens.access_token, "access-token-123");
     assert_eq!(tokens.refresh_token, "refresh-token-123");

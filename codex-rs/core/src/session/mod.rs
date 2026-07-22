@@ -201,6 +201,8 @@ use codex_protocol::error::Result as CodexResult;
 #[cfg(test)]
 use codex_protocol::exec_output::StreamOutput;
 
+mod account_pool_activity;
+pub(crate) use account_pool_activity::AccountPoolActivityHeartbeat;
 mod code_mode_warning;
 mod config_lock;
 pub(crate) mod context_window;
@@ -1213,12 +1215,20 @@ impl Session {
         state.token_info()
     }
 
-    pub(crate) async fn get_estimated_token_count(
-        &self,
-        turn_context: &TurnContext,
-    ) -> Option<i64> {
+    pub(crate) async fn get_estimated_token_count(&self) -> Option<i64> {
         let state = self.state.lock().await;
-        state.history.estimate_token_count(turn_context)
+        // Estimate against the session's resolved base instructions (the text
+        // the real prompt sends), mirroring `recompute_token_usage`. Recomputing
+        // from `model_info` instead would both skew the estimate and emit a
+        // per-turn "personality requested but model_messages is missing" warning
+        // whenever the resolved base instructions caused `model_messages` to be
+        // stripped during model overrides.
+        let base_instructions = BaseInstructions {
+            text: state.session_configuration.base_instructions.clone(),
+        };
+        state
+            .history
+            .estimate_token_count_with_base_instructions(&base_instructions)
     }
 
     pub(crate) async fn get_base_instructions(&self) -> BaseInstructions {
@@ -3729,6 +3739,14 @@ impl Session {
         new_rate_limits: RateLimitSnapshot,
     ) {
         self.record_rate_limits_info(new_rate_limits).await;
+        self.send_token_count_event(turn_context).await;
+    }
+
+    pub(crate) async fn clear_rate_limits(&self, turn_context: &TurnContext) {
+        {
+            let mut state = self.state.lock().await;
+            state.clear_rate_limits();
+        }
         self.send_token_count_event(turn_context).await;
     }
 

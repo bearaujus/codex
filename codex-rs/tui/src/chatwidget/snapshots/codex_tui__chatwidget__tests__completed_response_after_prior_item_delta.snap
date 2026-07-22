@@ -1,0 +1,7 @@
+---
+source: tui/src/chatwidget/tests/status_and_layout.rs
+expression: rendered
+---
+• Partial response before retry.
+
+• Completed response after retry.

@@ -179,7 +179,7 @@ fn remote_realtime_test_codex_builder(
 ) -> TestCodexBuilder {
     let realtime_base_url = realtime_server.uri().to_string();
     test_codex()
-        .with_auth(CodexAuth::from_api_key("dummy"))
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_config(move |config| {
             config.experimental_realtime_ws_base_url = Some(realtime_base_url);
         })
@@ -844,23 +844,6 @@ async fn assert_remote_manual_compact_request_parity(
             &ContextSnapshotOptions::default(),
         )
     );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn remote_manual_compact_api_auth_omits_service_tier_and_reuses_prompt_cache_key()
--> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    assert_remote_manual_compact_request_parity(
-        CodexAuth::from_api_key("dummy"),
-        Some(ServiceTier::Fast),
-        /*expected_service_tier*/ None,
-        "remote_manual_compact_api_auth_prompt_cache_key_request_diff",
-        "After five varied API-key-auth turns, remote manual compaction omits service_tier, reuses prompt_cache_key, and still omits responses-only fields.",
-    )
-    .await?;
 
     Ok(())
 }

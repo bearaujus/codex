@@ -178,7 +178,8 @@ fn read_hook_inputs(path: &Path) -> Vec<Value> {
 }
 
 fn python_hook_command(script_path: &Path) -> String {
-    format!("python3 \"{}\"", script_path.display())
+    let interpreter = if cfg!(windows) { "python" } else { "python3" };
+    format!("{interpreter} \"{}\"", script_path.display())
 }
 
 fn write_unsupported_blocking_pre_compact_hook(home: &Path) {
@@ -2795,7 +2796,7 @@ async fn pre_sampling_legacy_remote_compact_falls_back_after_previous_model_inva
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pre_sampling_compact_keeps_unknown_previous_model_for_api_key_auth_and_custom_provider() {
+async fn pre_sampling_compact_keeps_unknown_previous_model_for_custom_provider() {
     skip_if_no_network!();
 
     let server = MockServer::start().await;
@@ -2832,7 +2833,7 @@ async fn pre_sampling_compact_keeps_unknown_previous_model_for_api_key_auth_and_
 
     let model_provider = non_openai_model_provider(&server);
     let mut builder = test_codex()
-        .with_auth(CodexAuth::from_api_key("Test API Key"))
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_model(previous_model)
         .with_config(move |config| {
             config.model_provider = model_provider;

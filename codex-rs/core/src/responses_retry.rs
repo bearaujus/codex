@@ -41,6 +41,8 @@ pub(crate) async fn handle_retryable_response_stream_error(
             }),
         )
         .await;
+        // Reset the retry counter for the new transport so it receives its full
+        // reconnect budget.
         *retries = 0;
         return Ok(());
     }
@@ -48,20 +50,27 @@ pub(crate) async fn handle_retryable_response_stream_error(
     if *retries < max_retries {
         *retries += 1;
         let retry_count = *retries;
-        let delay = match &err {
-            CodexErr::Stream(_, requested_delay) => {
-                requested_delay.unwrap_or_else(|| backoff(retry_count))
+        let delay = if retry_count == 1 {
+            // First attempt: retry immediately — these errors are usually transient and
+            // resolving on the first reconnect is common enough that adding latency here
+            // hurts more than it helps.
+            match &err {
+                CodexErr::Stream(_, Some(requested_delay)) => *requested_delay,
+                _ => Duration::ZERO,
             }
-            _ => backoff(retry_count),
+        } else {
+            match &err {
+                CodexErr::Stream(_, requested_delay) => {
+                    requested_delay.unwrap_or_else(|| backoff(retry_count))
+                }
+                _ => backoff(retry_count),
+            }
         };
         log_retry(request, turn_context, &err, retry_count, max_retries, delay);
 
-        // In release builds, hide the first websocket retry notification to reduce noisy
-        // transient reconnect messages. In debug builds, keep full visibility for diagnosis.
-        let report_error = retry_count > 1
-            || cfg!(debug_assertions)
-            || !sess.services.model_client.responses_websocket_enabled();
-        if report_error {
+        // Hide the first retry — it is silent and instant, so surfacing it would only
+        // flash a spurious error for what is almost always a self-healing blip.
+        if retry_count > 1 {
             // Surface retry information to any UI/front-end so the user understands what is
             // happening instead of staring at a seemingly frozen screen.
             sess.notify_stream_error(

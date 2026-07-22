@@ -16,7 +16,9 @@ pub use analytics_server::start_analytics_events_server;
 pub use auth_fixtures::ChatGptAuthFixture;
 pub use auth_fixtures::ChatGptIdTokenClaims;
 pub use auth_fixtures::encode_id_token;
+pub use auth_fixtures::mark_pool_auth_failed;
 pub use auth_fixtures::write_chatgpt_auth;
+pub use auth_fixtures::write_chatgpt_auth_to_pool;
 use codex_app_server_protocol::JSONRPCResponse;
 pub use config::write_mock_responses_config_toml;
 pub use config::write_mock_responses_config_toml_with_chatgpt_base_url;
@@ -53,6 +55,7 @@ pub use test_app_server::DEFAULT_CLIENT_NAME;
 pub use test_app_server::DISABLE_PLUGIN_STARTUP_TASKS_ARG;
 pub use test_app_server::TestAppServer;
 pub use test_app_server::TestAppServerBuilder;
+pub use test_app_server::seed_chatgpt_auth;
 
 pub fn to_response<T: DeserializeOwned>(response: JSONRPCResponse) -> anyhow::Result<T> {
     let value = serde_json::to_value(response.result)?;

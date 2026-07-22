@@ -9,6 +9,7 @@ use super::X_CODEX_PARENT_THREAD_ID_HEADER;
 use super::X_CODEX_TURN_METADATA_HEADER;
 use super::X_CODEX_WINDOW_ID_HEADER;
 use super::X_OPENAI_SUBAGENT_HEADER;
+use super::websocket_auth_key;
 use crate::AttestationContext;
 use crate::AttestationProvider;
 use crate::GenerateAttestationFuture;
@@ -325,7 +326,6 @@ async fn chatgpt_auth_manager(
     write_chatgpt_auth_json(codex_home.path());
     let auth_manager = AuthManager::shared(
         codex_home.path().to_path_buf(),
-        /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
         /*forced_chatgpt_workspace_id*/ None,
         /*chatgpt_base_url*/ None,
@@ -777,6 +777,20 @@ fn auth_request_telemetry_context_tracks_agent_identity_ids() {
             task_id: "task-run-context".to_string(),
         })
     );
+}
+
+#[test]
+fn websocket_auth_key_changes_with_request_credentials() {
+    let first = websocket_auth_key(
+        /*auth*/ None,
+        &BearerAuthProvider::for_test(Some("access-token-1"), Some("workspace-123")),
+    );
+    let second = websocket_auth_key(
+        /*auth*/ None,
+        &BearerAuthProvider::for_test(Some("access-token-2"), Some("workspace-123")),
+    );
+
+    assert_ne!(first, second);
 }
 
 fn model_client_with_counting_attestation(

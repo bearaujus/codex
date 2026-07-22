@@ -54,15 +54,63 @@ async fn deliver_rolling_rate_limit_snapshot(
     app_server: &AppServerSession,
     snapshot: RateLimitSnapshot,
 ) {
+    deliver_rolling_rate_limit_update(app, app_server, Some(snapshot)).await;
+}
+
+async fn deliver_rolling_rate_limit_update(
+    app: &mut App,
+    app_server: &AppServerSession,
+    rate_limits: Option<RateLimitSnapshot>,
+) {
     app.handle_app_server_event(
         app_server,
         codex_app_server_client::AppServerEvent::ServerNotification(
             ServerNotification::AccountRateLimitsUpdated(AccountRateLimitsUpdatedNotification {
-                rate_limits: snapshot,
+                rate_limits,
             }),
         ),
     )
     .await;
+}
+
+#[tokio::test]
+async fn rolling_rate_limit_clear_removes_previous_account_status() -> Result<()> {
+    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    let app_server = crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref())
+        .await
+        .expect("embedded app server");
+
+    deliver_rolling_rate_limit_snapshot(
+        &mut app,
+        &app_server,
+        rate_limit_snapshot(
+            /*used_percent*/ 95,
+            Some(RateLimitReachedType::WorkspaceMemberUsageLimitReached),
+            Some(true),
+        ),
+    )
+    .await;
+    let before_clear = render_status_output(&mut app, &mut app_event_rx);
+    assert!(
+        before_clear.contains("5% left"),
+        "unexpected status: {before_clear}"
+    );
+
+    deliver_rolling_rate_limit_update(&mut app, &app_server, /*rate_limits*/ None).await;
+
+    let after_clear = render_status_output(&mut app, &mut app_event_rx);
+    assert!(
+        !after_clear.contains("5% left"),
+        "cleared limits remained visible: {after_clear}"
+    );
+    insta::with_settings!({snapshot_path => "../snapshots"}, {
+        insta::assert_snapshot!(
+            "rolling_rate_limit_clear_removes_previous_account_status",
+            format!("Before clear:\n{before_clear}\n\nAfter clear:\n{after_clear}")
+        );
+    });
+    app_server.shutdown().await?;
+    Ok(())
 }
 
 fn render_status_output(
@@ -101,40 +149,36 @@ fn deliver_usage_limit_error(app: &mut App) {
 }
 
 #[tokio::test]
-async fn rolling_workspace_hard_stops_invalidate_older_rate_limit_reads() -> Result<()> {
+async fn every_rolling_rate_limit_update_invalidates_older_reads() -> Result<()> {
     let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
     let app_server = crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref())
         .await
         .expect("embedded app server");
 
     let cases = [
-        (None, None, false),
-        (Some(RateLimitReachedType::RateLimitReached), None, false),
-        (None, Some(false), false),
-        (None, Some(true), true),
+        (None, None),
+        (Some(RateLimitReachedType::RateLimitReached), None),
+        (None, Some(false)),
+        (None, Some(true)),
         (
             Some(RateLimitReachedType::WorkspaceOwnerCreditsDepleted),
             None,
-            true,
         ),
         (
             Some(RateLimitReachedType::WorkspaceMemberCreditsDepleted),
             None,
-            true,
         ),
         (
             Some(RateLimitReachedType::WorkspaceOwnerUsageLimitReached),
             None,
-            true,
         ),
         (
             Some(RateLimitReachedType::WorkspaceMemberUsageLimitReached),
             None,
-            true,
         ),
     ];
     let mut expected_generation = 0;
-    for (reached_type, spend_control_reached, invalidates) in cases {
+    for (reached_type, spend_control_reached) in cases {
         deliver_rolling_rate_limit_snapshot(
             &mut app,
             &app_server,
@@ -145,14 +189,15 @@ async fn rolling_workspace_hard_stops_invalidate_older_rate_limit_reads() -> Res
             ),
         )
         .await;
-        if invalidates {
-            expected_generation += 1;
-        }
+        expected_generation += 1;
         assert_eq!(
-            app.rate_limit_hard_stop_generation, expected_generation,
+            app.rate_limit_update_generation, expected_generation,
             "reached_type={reached_type:?}, spend_control_reached={spend_control_reached:?}"
         );
     }
+
+    deliver_rolling_rate_limit_update(&mut app, &app_server, /*rate_limits*/ None).await;
+    assert_eq!(app.rate_limit_update_generation, expected_generation + 1);
 
     app_server.shutdown().await?;
     Ok(())
@@ -217,7 +262,7 @@ async fn stale_rate_limit_reads_preserve_newer_workspace_hard_stop_for_every_ori
             },
             _ => unreachable!("unknown refresh origin"),
         };
-        let read_generation = app.rate_limit_hard_stop_generation;
+        let read_generation = app.rate_limit_update_generation;
         let mut rolling_snapshot = rate_limit_snapshot(
             /*used_percent*/ 95,
             Some(RateLimitReachedType::WorkspaceMemberUsageLimitReached),
@@ -227,14 +272,14 @@ async fn stale_rate_limit_reads_preserve_newer_workspace_hard_stop_for_every_ori
             rolling_snapshot.limit_id = Some("codex_other".to_string());
         }
         deliver_rolling_rate_limit_snapshot(&mut app, &app_server, rolling_snapshot).await;
-        assert_ne!(read_generation, app.rate_limit_hard_stop_generation);
+        assert_ne!(read_generation, app.rate_limit_update_generation);
 
         let control = Box::pin(app.handle_event(
             &mut tui,
             &mut app_server,
             AppEvent::RateLimitsLoaded {
                 origin,
-                hard_stop_generation: read_generation,
+                update_generation: read_generation,
                 result: Ok(account_rate_limits_response(rate_limit_snapshot(
                     /*used_percent*/ 0,
                     /*rate_limit_reached_type*/ None,
@@ -277,6 +322,56 @@ async fn stale_rate_limit_reads_preserve_newer_workspace_hard_stop_for_every_ori
 }
 
 #[tokio::test]
+async fn stale_rate_limit_read_preserves_newer_ordinary_usage_update() -> Result<()> {
+    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    set_chatgpt_auth(&mut app.chat_widget);
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(
+        app.chat_widget.config_ref(),
+    ))
+    .await?;
+    let request_id = 7;
+    app.chat_widget
+        .add_status_output(/*refreshing_rate_limits*/ true, Some(request_id));
+    let read_generation = app.rate_limit_update_generation;
+
+    deliver_rolling_rate_limit_snapshot(
+        &mut app,
+        &app_server,
+        rate_limit_snapshot(
+            /*used_percent*/ 80,
+            /*rate_limit_reached_type*/ None,
+            Some(false),
+        ),
+    )
+    .await;
+
+    Box::pin(app.handle_event(
+        &mut tui,
+        &mut app_server,
+        AppEvent::RateLimitsLoaded {
+            origin: RateLimitRefreshOrigin::StatusCommand { request_id },
+            update_generation: read_generation,
+            result: Ok(account_rate_limits_response(rate_limit_snapshot(
+                /*used_percent*/ 10,
+                /*rate_limit_reached_type*/ None,
+                Some(false),
+            ))),
+        },
+    ))
+    .await?;
+
+    let status = render_status_output(&mut app, &mut app_event_rx);
+    assert!(
+        status.contains("20% left"),
+        "expected newer rolling usage to win, got: {status}"
+    );
+
+    app_server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn stale_rate_limit_read_does_not_dismiss_visible_workspace_advisory() -> Result<()> {
     let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
     set_chatgpt_auth(&mut app.chat_widget);
@@ -288,7 +383,7 @@ async fn stale_rate_limit_read_does_not_dismiss_visible_workspace_advisory() -> 
     let request_id = 7;
     app.chat_widget
         .add_status_output(/*refreshing_rate_limits*/ true, Some(request_id));
-    let read_generation = app.rate_limit_hard_stop_generation;
+    let read_generation = app.rate_limit_update_generation;
 
     deliver_rolling_rate_limit_snapshot(
         &mut app,
@@ -313,7 +408,7 @@ async fn stale_rate_limit_read_does_not_dismiss_visible_workspace_advisory() -> 
         &mut app_server,
         AppEvent::RateLimitsLoaded {
             origin: RateLimitRefreshOrigin::StatusCommand { request_id },
-            hard_stop_generation: read_generation,
+            update_generation: read_generation,
             result: Ok(account_rate_limits_response(rate_limit_snapshot(
                 /*used_percent*/ 0,
                 /*rate_limit_reached_type*/ None,
@@ -349,7 +444,7 @@ async fn post_hard_stop_rate_limit_read_clears_recovered_workspace_limit() -> Re
         ),
     )
     .await;
-    let read_generation = app.rate_limit_hard_stop_generation;
+    let read_generation = app.rate_limit_update_generation;
     let request_id = 7;
     app.chat_widget
         .add_status_output(/*refreshing_rate_limits*/ true, Some(request_id));
@@ -359,7 +454,7 @@ async fn post_hard_stop_rate_limit_read_clears_recovered_workspace_limit() -> Re
         &mut app_server,
         AppEvent::RateLimitsLoaded {
             origin: RateLimitRefreshOrigin::StatusCommand { request_id },
-            hard_stop_generation: read_generation,
+            update_generation: read_generation,
             result: Ok(account_rate_limits_response(rate_limit_snapshot(
                 /*used_percent*/ 0,
                 /*rate_limit_reached_type*/ None,

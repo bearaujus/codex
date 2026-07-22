@@ -15,7 +15,7 @@
 //! - Permissions profile
 //! - Approval mode
 //! - Context usage (remaining %, used %, window size)
-//! - Usage limits (primary, secondary)
+//! - Account status with remaining usage limits
 //! - Session info (thread title, thread ID, tokens used)
 //! - Application version
 
@@ -103,11 +103,13 @@ pub(crate) enum StatusLineItem {
     #[strum(to_string = "context-used", serialize = "context-usage")]
     ContextUsed,
 
-    /// Remaining usage on the primary rate limit.
-    FiveHourLimit,
-
-    /// Remaining usage on the secondary rate limit.
-    WeeklyLimit,
+    /// Account email plus any currently available usage-limit summaries.
+    #[strum(
+        to_string = "account-status",
+        serialize = "five-hour-limit",
+        serialize = "weekly-limit"
+    )]
+    AccountStatus,
 
     /// Codex application version.
     CodexVersion,
@@ -169,11 +171,8 @@ impl StatusLineItem {
             StatusLineItem::ContextUsed => {
                 "Percentage of context window used (omitted when unknown)"
             }
-            StatusLineItem::FiveHourLimit => {
-                "Remaining usage on the primary usage limit (omitted when unavailable)"
-            }
-            StatusLineItem::WeeklyLimit => {
-                "Remaining usage on the secondary usage limit (omitted when unavailable)"
+            StatusLineItem::AccountStatus => {
+                "Account email with 5h and weekly usage remaining (omitted when unavailable)"
             }
             StatusLineItem::CodexVersion => "Codex application version",
             StatusLineItem::ContextWindowSize => {
@@ -212,8 +211,7 @@ impl StatusLineItem {
             StatusLineItem::ApprovalMode => StatusSurfacePreviewItem::ApprovalMode,
             StatusLineItem::ContextRemaining => StatusSurfacePreviewItem::ContextRemaining,
             StatusLineItem::ContextUsed => StatusSurfacePreviewItem::ContextUsed,
-            StatusLineItem::FiveHourLimit => StatusSurfacePreviewItem::FiveHourLimit,
-            StatusLineItem::WeeklyLimit => StatusSurfacePreviewItem::WeeklyLimit,
+            StatusLineItem::AccountStatus => StatusSurfacePreviewItem::AccountStatus,
             StatusLineItem::CodexVersion => StatusSurfacePreviewItem::CodexVersion,
             StatusLineItem::ContextWindowSize => StatusSurfacePreviewItem::ContextWindowSize,
             StatusLineItem::UsedTokens => StatusSurfacePreviewItem::UsedTokens,
@@ -347,22 +345,15 @@ impl StatusLineSetupView {
     fn status_line_select_item(
         item: StatusLineItem,
         enabled: bool,
-        preview_data: &StatusSurfacePreviewData,
+        _preview_data: &StatusSurfacePreviewData,
     ) -> MultiSelectItem {
         let default_name = item.to_string();
         let default_description = item.description();
-        let (name, description) = match item {
-            StatusLineItem::FiveHourLimit | StatusLineItem::WeeklyLimit => (
-                preview_data.rate_limit_item_name(item.preview_item(), &default_name),
-                preview_data.rate_limit_item_description(item.preview_item(), default_description),
-            ),
-            _ => (default_name, default_description.to_string()),
-        };
 
         MultiSelectItem {
             id: item.to_string(),
-            name,
-            description: Some(description),
+            name: default_name,
+            description: Some(default_description.to_string()),
             enabled,
             orderable: true,
             section_break_after: false,
@@ -485,6 +476,23 @@ mod tests {
     }
 
     #[test]
+    fn account_status_is_canonical_and_accepts_legacy_limit_ids() {
+        assert_eq!(StatusLineItem::AccountStatus.to_string(), "account-status");
+        assert_eq!(
+            "account-status".parse::<StatusLineItem>(),
+            Ok(StatusLineItem::AccountStatus)
+        );
+        assert_eq!(
+            "five-hour-limit".parse::<StatusLineItem>(),
+            Ok(StatusLineItem::AccountStatus)
+        );
+        assert_eq!(
+            "weekly-limit".parse::<StatusLineItem>(),
+            Ok(StatusLineItem::AccountStatus)
+        );
+    }
+
+    #[test]
     fn git_summary_items_are_selectable_ids() {
         assert_eq!(
             "pull-request-number".parse::<StatusLineItem>(),
@@ -548,7 +556,7 @@ mod tests {
                     /*use_theme_colors*/ true,
                 )
             ),
-            Some("gpt-5 · /repo".to_string())
+            Some("gpt-5  │  /repo".to_string())
         );
     }
 
@@ -586,7 +594,7 @@ mod tests {
                     /*use_theme_colors*/ true,
                 )
             ),
-            Some("gpt-5 · feat/awesome-feature".to_string())
+            Some("gpt-5  │  feat/awesome-feature".to_string())
         );
     }
 
@@ -630,7 +638,7 @@ mod tests {
                     /*use_theme_colors*/ true,
                 )
             ),
-            Some("gpt-5 · Roadmap cleanup".to_string())
+            Some("gpt-5  │  Roadmap cleanup".to_string())
         );
     }
 
@@ -658,8 +666,8 @@ mod tests {
                     "jif/statusline-preview".to_string(),
                 ),
                 (
-                    StatusLineItem::WeeklyLimit.preview_item(),
-                    "weekly 82% left".to_string(),
+                    StatusLineItem::AccountStatus.preview_item(),
+                    "user@example.com (5h 60% left, weekly 82% left)".to_string(),
                 ),
             ]),
             AppEventSender::new(tx_raw),

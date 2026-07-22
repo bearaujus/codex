@@ -210,7 +210,8 @@ mod tests {
             )
             .await?;
 
-        let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy"));
+        let auth_manager =
+            AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
         let state_db = init_state_db(&good_config)
             .await
             .expect("refresh tests require state db");

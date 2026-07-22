@@ -74,11 +74,11 @@ pub(crate) fn compose_agents_summary(config: &Config, paths: &[PathUri]) -> Stri
                 } else if let Ok(stripped) = p.strip_prefix(&config.cwd) {
                     normalize_agents_display_path(stripped)
                 } else {
-                    normalize_agents_display_path(p)
+                    format_directory_display(p, /*max_width*/ None)
                 }
             }
         } else {
-            normalize_agents_display_path(p)
+            format_directory_display(p, /*max_width*/ None)
         };
         rels.push(display);
     }

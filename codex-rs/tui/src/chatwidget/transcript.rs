@@ -13,6 +13,9 @@ pub(super) struct TranscriptState {
     pub(super) latest_proposed_plan_markdown: Option<String>,
     /// Whether this turn already produced a copyable response.
     pub(super) saw_copy_source_this_turn: bool,
+    /// Item ID of the assistant message whose deltas are currently being streamed.
+    /// Used to prevent only that item's completed fallback from duplicating content.
+    pub(super) agent_message_delta_item_id: Option<String>,
     /// Whether the next streamed assistant content should be preceded by a final message separator.
     pub(super) needs_final_message_separator: bool,
     /// Whether the current turn performed "work" (exec commands, MCP tool calls, patch applications).
@@ -56,6 +59,7 @@ impl TranscriptState {
 
     pub(super) fn reset_turn_flags(&mut self) {
         self.saw_copy_source_this_turn = false;
+        self.agent_message_delta_item_id = None;
         self.saw_plan_update_this_turn = false;
         self.saw_plan_item_this_turn = false;
         self.had_work_activity = false;

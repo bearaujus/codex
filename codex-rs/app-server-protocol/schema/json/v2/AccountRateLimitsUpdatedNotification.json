@@ -188,12 +188,17 @@
   "description": "Sparse rolling rate-limit update.\n\nClients should merge available values into the most recent `account/rateLimits/read` response or refetch that snapshot. Nullable account metadata may be unavailable in a rolling update and does not clear a previously observed value.",
   "properties": {
     "rateLimits": {
-      "$ref": "#/definitions/RateLimitSnapshot"
+      "anyOf": [
+        {
+          "$ref": "#/definitions/RateLimitSnapshot"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "`null` clears previously cached rate-limit data after the active account changes."
     }
   },
-  "required": [
-    "rateLimits"
-  ],
   "title": "AccountRateLimitsUpdatedNotification",
   "type": "object"
 }

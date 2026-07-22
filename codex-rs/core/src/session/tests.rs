@@ -1885,7 +1885,7 @@ async fn record_inter_agent_communication_sets_turn_id_in_rollout_and_resume() {
 #[tokio::test]
 async fn record_inter_agent_communication_preserves_item_id_in_rollout_and_resume() {
     let (mut session, turn_context, _rx) = make_session_and_context_with_auth_and_config_and_rx(
-        CodexAuth::from_api_key("Test API Key"),
+        CodexAuth::create_dummy_chatgpt_auth_for_testing(),
         Vec::new(),
         |config| {
             let _ = config.features.enable(Feature::ItemIds);
@@ -1934,7 +1934,7 @@ async fn record_inter_agent_communication_preserves_item_id_in_rollout_and_resum
 
     let (resumed_session, _resumed_turn_context, _rx) =
         make_session_and_context_with_auth_and_config_and_rx(
-            CodexAuth::from_api_key("Test API Key"),
+            CodexAuth::create_dummy_chatgpt_auth_for_testing(),
             Vec::new(),
             |config| {
                 let _ = config.features.enable(Feature::ItemIds);
@@ -1957,7 +1957,7 @@ async fn record_inter_agent_communication_preserves_item_id_in_rollout_and_resum
 #[tokio::test]
 async fn prepares_image_failures_before_history_insertion() {
     let (session, turn_context, _rx) = make_session_and_context_with_auth_and_config_and_rx(
-        CodexAuth::from_api_key("Test API Key"),
+        CodexAuth::create_dummy_chatgpt_auth_for_testing(),
         Vec::new(),
         |config| {
             let _ = config.features.enable(Feature::ItemIds);
@@ -2805,7 +2805,7 @@ async fn record_initial_history_reconstructs_forked_transcript() {
 #[tokio::test]
 async fn start_new_context_window_assigns_and_persists_item_ids() {
     let (mut session, turn_context, _rx) = make_session_and_context_with_auth_and_config_and_rx(
-        CodexAuth::from_api_key("Test API Key"),
+        CodexAuth::create_dummy_chatgpt_auth_for_testing(),
         Vec::new(),
         |config| {
             let _ = config.features.enable(Feature::ItemIds);
@@ -2856,7 +2856,7 @@ async fn start_new_context_window_assigns_and_persists_item_ids() {
 #[tokio::test]
 async fn record_initial_history_assigns_and_persists_id_for_forked_response_item() {
     let (mut session, _turn_context, _rx) = make_session_and_context_with_auth_and_config_and_rx(
-        CodexAuth::from_api_key("Test API Key"),
+        CodexAuth::create_dummy_chatgpt_auth_for_testing(),
         Vec::new(),
         |config| {
             let _ = config.features.enable(Feature::ItemIds);
@@ -5088,7 +5088,8 @@ async fn session_new_fails_when_zsh_fork_enabled_without_packaged_zsh() {
     config.zsh_path = None;
     let config = Arc::new(config);
 
-    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
+    let auth_manager =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
     let models_manager = models_manager_with_provider(
         config.codex_home.to_path_buf(),
         auth_manager.clone(),
@@ -5214,7 +5215,8 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
     let config = build_test_config(codex_home.path()).await;
     let config = Arc::new(config);
     let thread_id = ThreadId::default();
-    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
+    let auth_manager =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
     let models_manager = models_manager_with_provider(
         config.codex_home.to_path_buf(),
         auth_manager.clone(),
@@ -5474,7 +5476,8 @@ async fn make_session_with_config_and_rx(
     let mut config = build_test_config(codex_home.path()).await;
     mutator(&mut config);
     let config = Arc::new(config);
-    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
+    let auth_manager =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
     let models_manager = models_manager_with_provider(
         config.codex_home.to_path_buf(),
         auth_manager.clone(),
@@ -5581,7 +5584,8 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
     let mut config = build_test_config(codex_home.path()).await;
     config.ephemeral = true;
     let config = Arc::new(config);
-    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
+    let auth_manager =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
     let models_manager = models_manager_with_provider(
         config.codex_home.to_path_buf(),
         auth_manager.clone(),
@@ -7616,7 +7620,7 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
     async_channel::Receiver<Event>,
 ) {
     make_session_and_context_with_auth_and_config_and_rx(
-        CodexAuth::from_api_key("Test API Key"),
+        CodexAuth::create_dummy_chatgpt_auth_for_testing(),
         dynamic_tools,
         |_config| {},
     )
@@ -8247,7 +8251,7 @@ async fn make_multi_agent_v2_usage_hint_test_session(
     enable_multi_agent_v2: bool,
 ) -> (Arc<Session>, Arc<TurnContext>) {
     let (session, turn_context, _rx_event) = make_session_and_context_with_auth_and_config_and_rx(
-        CodexAuth::from_api_key("Test API Key"),
+        CodexAuth::create_dummy_chatgpt_auth_for_testing(),
         Vec::new(),
         |config| {
             if enable_multi_agent_v2 {
@@ -8513,7 +8517,7 @@ async fn build_initial_context_omits_multi_agent_v2_usage_hints_when_feature_dis
 #[tokio::test]
 async fn build_initial_context_omits_multi_agent_v2_usage_hints_when_hint_is_empty() {
     let (session, turn_context, _rx_event) = make_session_and_context_with_auth_and_config_and_rx(
-        CodexAuth::from_api_key("Test API Key"),
+        CodexAuth::create_dummy_chatgpt_auth_for_testing(),
         Vec::new(),
         |config| {
             let _ = config.features.enable(Feature::MultiAgentV2);

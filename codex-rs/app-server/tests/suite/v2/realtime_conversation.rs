@@ -10,7 +10,6 @@ use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::ItemStartedNotification;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCResponse;
-use codex_app_server_protocol::LoginAccountResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadRealtimeAppendAudioParams;
@@ -301,13 +300,13 @@ impl RealtimeE2eHarness {
             realtime_version,
             sandbox,
         )?;
+        app_test_support::seed_chatgpt_auth(codex_home.path())?;
 
         let mut mcp = TestAppServer::builder()
             .with_codex_home(codex_home.path())
             .build()
             .await?;
         timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
-        login_with_api_key(&mut mcp, "sk-test-key").await?;
 
         let thread_start_request_id = mcp
             .send_thread_start_request_with_auto_env(ThreadStartParams::default())
@@ -644,587 +643,6 @@ fn v2_background_agent_tool_call(call_id: &str, prompt: &str) -> Value {
 }
 
 #[tokio::test]
-async fn realtime_conversation_streams_v2_notifications() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let responses_server = create_mock_responses_server_sequence_unchecked(vec![
-        create_final_assistant_message_sse_response("delegated")?,
-    ])
-    .await;
-    let realtime_server = start_websocket_server(vec![vec![
-        vec![json!({
-            "type": "session.updated",
-            "session": { "id": "sess_backend", "instructions": "backend prompt" }
-        })],
-        vec![],
-        vec![],
-        vec![
-            json!({
-                "type": "response.output_audio.delta",
-                "delta": "AQID",
-                "sample_rate": 24_000,
-                "channels": 1,
-                "samples_per_channel": 512
-            }),
-            json!({
-                "type": "conversation.item.added",
-                "item": {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{ "type": "text", "text": "hi" }]
-                }
-            }),
-            json!({
-                "type": "conversation.item.input_audio_transcription.delta",
-                "delta": "delegate now"
-            }),
-            json!({
-                "type": "response.output_text.delta",
-                "delta": "working"
-            }),
-            json!({
-                "type": "response.output_text.done",
-                "text": "working on it"
-            }),
-            json!({
-                "type": "conversation.item.done",
-                "item": {
-                    "id": "item_assistant_1",
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{ "type": "output_text", "text": "working on it" }]
-                }
-            }),
-            json!({
-                "type": "conversation.item.done",
-                "item": {
-                    "id": "item_2",
-                    "type": "function_call",
-                    "name": "background_agent",
-                    "call_id": "handoff_1",
-                    "arguments": "{\"input_transcript\":\"delegate now\"}"
-                }
-            }),
-            json!({
-                "type": "error",
-                "message": "upstream boom"
-            }),
-        ],
-    ]])
-    .await;
-
-    let codex_home = TempDir::new()?;
-    create_config_toml(
-        codex_home.path(),
-        &responses_server.uri(),
-        realtime_server.uri(),
-        /*realtime_enabled*/ true,
-        StartupContextConfig::Generated,
-    )?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .build()
-        .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
-    login_with_api_key(&mut mcp, "sk-test-key").await?;
-
-    let thread_start_request_id = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams::default())
-        .await?;
-    let thread_start_response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(thread_start_request_id)),
-    )
-    .await??;
-    let thread_start: ThreadStartResponse = to_response(thread_start_response)?;
-
-    let start_request_id = mcp
-        .send_thread_realtime_start_request(ThreadRealtimeStartParams {
-            client_managed_handoffs: None,
-            flush_transcript_tail_on_session_end: None,
-            codex_responses_as_items: None,
-            codex_response_item_prefix: None,
-            codex_response_handoff_mode: None,
-            thread_id: thread_start.thread.id.clone(),
-            model: Some("realtime-treatment-model".to_string()),
-            output_modality: RealtimeOutputModality::Audio,
-            include_startup_context: None,
-            initial_items: None,
-            prompt: None,
-            realtime_session_id: None,
-            transport: None,
-            version: None,
-            voice: Some(RealtimeVoice::Cedar),
-        })
-        .await?;
-    let start_response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(start_request_id)),
-    )
-    .await??;
-    let _: ThreadRealtimeStartResponse = to_response(start_response)?;
-
-    let started =
-        read_notification::<ThreadRealtimeStartedNotification>(&mut mcp, "thread/realtime/started")
-            .await?;
-    assert_eq!(started.thread_id, thread_start.thread.id);
-    assert!(started.realtime_session_id.is_some());
-    assert_eq!(started.version, RealtimeConversationVersion::V2);
-
-    let startup_context_request = realtime_server
-        .wait_for_request(/*connection_index*/ 0, /*request_index*/ 0)
-        .await;
-    assert_eq!(
-        startup_context_request.body_json()["type"].as_str(),
-        Some("session.update")
-    );
-    assert_eq!(
-        startup_context_request.body_json()["session"]["audio"]["output"]["voice"],
-        "cedar"
-    );
-    assert_eq!(
-        realtime_server.single_handshake().uri(),
-        "/v1/realtime?model=realtime-treatment-model"
-    );
-    assert_eq!(
-        startup_context_request.body_json()["session"]["output_modalities"],
-        json!(["audio"])
-    );
-    let startup_context_instructions =
-        startup_context_request.body_json()["session"]["instructions"]
-            .as_str()
-            .context("expected startup context instructions")?
-            .to_string();
-    assert!(startup_context_instructions.starts_with("backend prompt"));
-    assert!(startup_context_instructions.contains(STARTUP_CONTEXT_HEADER));
-
-    let audio_append_request_id = mcp
-        .send_thread_realtime_append_audio_request(ThreadRealtimeAppendAudioParams {
-            thread_id: started.thread_id.clone(),
-            audio: ThreadRealtimeAudioChunk {
-                data: "BQYH".to_string(),
-                sample_rate: 24_000,
-                num_channels: 1,
-                samples_per_channel: Some(480),
-                item_id: None,
-            },
-        })
-        .await?;
-    let audio_append_response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(audio_append_request_id)),
-    )
-    .await??;
-    let _: ThreadRealtimeAppendAudioResponse = to_response(audio_append_response)?;
-
-    let text_append_request_id = mcp
-        .send_thread_realtime_append_text_request(ThreadRealtimeAppendTextParams {
-            thread_id: started.thread_id.clone(),
-            text: "hello".to_string(),
-            role: ConversationTextRole::Developer,
-        })
-        .await?;
-    let text_append_response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(text_append_request_id)),
-    )
-    .await??;
-    let _: ThreadRealtimeAppendTextResponse = to_response(text_append_response)?;
-
-    let assistant_append_request_id = mcp
-        .send_thread_realtime_append_text_request(ThreadRealtimeAppendTextParams {
-            thread_id: started.thread_id.clone(),
-            text: "welcome back".to_string(),
-            role: ConversationTextRole::Assistant,
-        })
-        .await?;
-    let assistant_append_response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(assistant_append_request_id)),
-    )
-    .await??;
-    let _: ThreadRealtimeAppendTextResponse = to_response(assistant_append_response)?;
-
-    let output_audio = read_notification::<ThreadRealtimeOutputAudioDeltaNotification>(
-        &mut mcp,
-        "thread/realtime/outputAudio/delta",
-    )
-    .await?;
-    assert_eq!(output_audio.audio.data, "AQID");
-    assert_eq!(output_audio.audio.sample_rate, 24_000);
-    assert_eq!(output_audio.audio.num_channels, 1);
-    assert_eq!(output_audio.audio.samples_per_channel, Some(512));
-
-    let item_added = read_notification::<ThreadRealtimeItemAddedNotification>(
-        &mut mcp,
-        "thread/realtime/itemAdded",
-    )
-    .await?;
-    assert_eq!(item_added.thread_id, output_audio.thread_id);
-    assert_eq!(item_added.item["type"], json!("message"));
-
-    let first_transcript_delta = read_notification::<ThreadRealtimeTranscriptDeltaNotification>(
-        &mut mcp,
-        "thread/realtime/transcript/delta",
-    )
-    .await?;
-    assert_eq!(first_transcript_delta.thread_id, output_audio.thread_id);
-    assert_eq!(first_transcript_delta.role, "user");
-    assert_eq!(first_transcript_delta.delta, "delegate now");
-
-    let second_transcript_delta = read_notification::<ThreadRealtimeTranscriptDeltaNotification>(
-        &mut mcp,
-        "thread/realtime/transcript/delta",
-    )
-    .await?;
-    assert_eq!(second_transcript_delta.thread_id, output_audio.thread_id);
-    assert_eq!(second_transcript_delta.role, "assistant");
-    assert_eq!(second_transcript_delta.delta, "working");
-
-    let final_transcript_done = read_notification::<ThreadRealtimeTranscriptDoneNotification>(
-        &mut mcp,
-        "thread/realtime/transcript/done",
-    )
-    .await?;
-    assert_eq!(final_transcript_done.thread_id, output_audio.thread_id);
-    assert_eq!(final_transcript_done.role, "assistant");
-    assert_eq!(final_transcript_done.text, "working on it");
-
-    let handoff_item_added = read_notification::<ThreadRealtimeItemAddedNotification>(
-        &mut mcp,
-        "thread/realtime/itemAdded",
-    )
-    .await?;
-    assert_eq!(handoff_item_added.thread_id, output_audio.thread_id);
-    assert_eq!(handoff_item_added.item["type"], json!("handoff_request"));
-    assert_eq!(handoff_item_added.item["handoff_id"], json!("handoff_1"));
-    assert_eq!(handoff_item_added.item["item_id"], json!("item_2"));
-    assert_eq!(
-        handoff_item_added.item["input_transcript"],
-        json!("delegate now")
-    );
-    assert_eq!(
-        handoff_item_added.item["active_transcript"],
-        json!([
-            {"role": "user", "text": "delegate now"},
-            {"role": "assistant", "text": "working on it"}
-        ])
-    );
-
-    let realtime_error =
-        read_notification::<ThreadRealtimeErrorNotification>(&mut mcp, "thread/realtime/error")
-            .await?;
-    assert_eq!(realtime_error.thread_id, output_audio.thread_id);
-    assert_eq!(realtime_error.message, "upstream boom");
-
-    let closed =
-        read_notification::<ThreadRealtimeClosedNotification>(&mut mcp, "thread/realtime/closed")
-            .await?;
-    assert_eq!(closed.thread_id, output_audio.thread_id);
-    assert_eq!(closed.reason.as_deref(), Some("error"));
-
-    let connections = realtime_server.connections();
-    assert_eq!(connections.len(), 1);
-    let connection = &connections[0];
-    assert_eq!(connection.len(), 4);
-    assert_eq!(
-        connection[0].body_json()["type"].as_str(),
-        Some("session.update")
-    );
-    assert_eq!(
-        connection[0].body_json()["session"]["instructions"].as_str(),
-        Some(startup_context_instructions.as_str()),
-    );
-    let text_requests = connection
-        .iter()
-        .map(WebSocketRequest::body_json)
-        .filter(|request| request["type"] == "conversation.item.create")
-        .collect::<Vec<_>>();
-    assert_eq!(text_requests.len(), 2);
-    assert_eq!(
-        text_requests[0],
-        json!({
-            "type": "conversation.item.create",
-            "item": {
-                "type": "message",
-                "role": "developer",
-                "content": [{
-                    "type": "input_text",
-                    "text": "hello",
-                }],
-            },
-        })
-    );
-    assert_eq!(
-        text_requests[1],
-        json!({
-            "type": "conversation.item.create",
-            "item": {
-                "type": "message",
-                "role": "assistant",
-                "content": [{
-                    "type": "output_text",
-                    "text": "welcome back",
-                }],
-            },
-        })
-    );
-    let mut request_types = [
-        connection[1].body_json()["type"]
-            .as_str()
-            .context("expected websocket request type")?
-            .to_string(),
-        connection[2].body_json()["type"]
-            .as_str()
-            .context("expected websocket request type")?
-            .to_string(),
-        connection[3].body_json()["type"]
-            .as_str()
-            .context("expected websocket request type")?
-            .to_string(),
-    ];
-    request_types.sort();
-    assert_eq!(
-        request_types,
-        [
-            "conversation.item.create".to_string(),
-            "conversation.item.create".to_string(),
-            "input_audio_buffer.append".to_string(),
-        ]
-    );
-
-    realtime_server.shutdown().await;
-    Ok(())
-}
-
-#[tokio::test]
-async fn realtime_start_can_skip_startup_context() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let responses_server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
-    let realtime_server = start_websocket_server(vec![vec![vec![json!({
-        "type": "session.updated",
-        "session": { "id": "sess_backend", "instructions": "backend prompt" }
-    })]]])
-    .await;
-
-    let codex_home = TempDir::new()?;
-    create_config_toml(
-        codex_home.path(),
-        &responses_server.uri(),
-        realtime_server.uri(),
-        /*realtime_enabled*/ true,
-        StartupContextConfig::Generated,
-    )?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .build()
-        .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
-    login_with_api_key(&mut mcp, "sk-test-key").await?;
-
-    let thread_start_request_id = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams::default())
-        .await?;
-    let thread_start_response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(thread_start_request_id)),
-    )
-    .await??;
-    let thread_start: ThreadStartResponse = to_response(thread_start_response)?;
-
-    let start_request_id = mcp
-        .send_thread_realtime_start_request(ThreadRealtimeStartParams {
-            client_managed_handoffs: None,
-            flush_transcript_tail_on_session_end: None,
-            codex_responses_as_items: None,
-            codex_response_item_prefix: None,
-            codex_response_handoff_mode: None,
-            thread_id: thread_start.thread.id.clone(),
-            model: None,
-            output_modality: RealtimeOutputModality::Audio,
-            include_startup_context: Some(false),
-            initial_items: None,
-            prompt: None,
-            realtime_session_id: None,
-            transport: None,
-            version: None,
-            voice: None,
-        })
-        .await?;
-    let start_response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(start_request_id)),
-    )
-    .await??;
-    let _: ThreadRealtimeStartResponse = to_response(start_response)?;
-
-    read_notification::<ThreadRealtimeStartedNotification>(&mut mcp, "thread/realtime/started")
-        .await?;
-
-    let startup_context_request = realtime_server
-        .wait_for_request(/*connection_index*/ 0, /*request_index*/ 0)
-        .await;
-    let startup_context_body = startup_context_request.body_json();
-    let instructions = startup_context_body["session"]["instructions"]
-        .as_str()
-        .context("expected realtime instructions")?;
-    assert_eq!(instructions, "backend prompt");
-    assert!(!instructions.contains(STARTUP_CONTEXT_HEADER));
-
-    realtime_server.shutdown().await;
-    Ok(())
-}
-
-#[tokio::test]
-async fn realtime_text_output_modality_requests_text_output_and_final_transcript() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let responses_server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
-    let realtime_server = start_websocket_server(vec![vec![vec![
-        json!({
-            "type": "session.updated",
-            "session": { "id": "sess_text", "instructions": "backend prompt" }
-        }),
-        json!({
-            "type": "response.output_text.delta",
-            "delta": "hello "
-        }),
-        json!({
-            "type": "response.output_text.delta",
-            "delta": "world"
-        }),
-        json!({
-            "type": "response.output_audio_transcript.done",
-            "transcript": "hello world"
-        }),
-        json!({
-            "type": "conversation.item.done",
-            "item": {
-                "id": "item_output_1",
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": "hello world"}]
-            }
-        }),
-    ]]])
-    .await;
-
-    let codex_home = TempDir::new()?;
-    create_config_toml(
-        codex_home.path(),
-        &responses_server.uri(),
-        realtime_server.uri(),
-        /*realtime_enabled*/ true,
-        StartupContextConfig::Generated,
-    )?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .build()
-        .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
-    login_with_api_key(&mut mcp, "sk-test-key").await?;
-
-    let thread_start_request_id = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams::default())
-        .await?;
-    let thread_start_response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(thread_start_request_id)),
-    )
-    .await??;
-    let thread_start: ThreadStartResponse = to_response(thread_start_response)?;
-
-    let start_request_id = mcp
-        .send_thread_realtime_start_request(ThreadRealtimeStartParams {
-            client_managed_handoffs: None,
-            flush_transcript_tail_on_session_end: None,
-            codex_responses_as_items: None,
-            codex_response_item_prefix: None,
-            codex_response_handoff_mode: None,
-            thread_id: thread_start.thread.id.clone(),
-            model: None,
-            output_modality: RealtimeOutputModality::Text,
-            include_startup_context: None,
-            initial_items: None,
-            prompt: None,
-            realtime_session_id: None,
-            transport: None,
-            version: None,
-            voice: None,
-        })
-        .await?;
-    let start_response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(start_request_id)),
-    )
-    .await??;
-    let _: ThreadRealtimeStartResponse = to_response(start_response)?;
-
-    let session_update = realtime_server
-        .wait_for_request(/*connection_index*/ 0, /*request_index*/ 0)
-        .await;
-    assert_eq!(
-        session_update.body_json()["session"]["output_modalities"],
-        json!(["text"])
-    );
-
-    let first_delta = read_notification::<ThreadRealtimeTranscriptDeltaNotification>(
-        &mut mcp,
-        "thread/realtime/transcript/delta",
-    )
-    .await?;
-    let second_delta = read_notification::<ThreadRealtimeTranscriptDeltaNotification>(
-        &mut mcp,
-        "thread/realtime/transcript/delta",
-    )
-    .await?;
-    let done = read_notification::<ThreadRealtimeTranscriptDoneNotification>(
-        &mut mcp,
-        "thread/realtime/transcript/done",
-    )
-    .await?;
-    assert_eq!(
-        vec![first_delta, second_delta],
-        vec![
-            ThreadRealtimeTranscriptDeltaNotification {
-                thread_id: thread_start.thread.id.clone(),
-                role: "assistant".to_string(),
-                delta: "hello ".to_string(),
-            },
-            ThreadRealtimeTranscriptDeltaNotification {
-                thread_id: thread_start.thread.id.clone(),
-                role: "assistant".to_string(),
-                delta: "world".to_string(),
-            },
-        ]
-    );
-    assert_eq!(
-        done,
-        ThreadRealtimeTranscriptDoneNotification {
-            thread_id: thread_start.thread.id,
-            role: "assistant".to_string(),
-            text: "hello world".to_string(),
-        }
-    );
-    assert!(
-        timeout(
-            Duration::from_millis(200),
-            mcp.read_stream_until_notification_message("thread/realtime/transcript/done"),
-        )
-        .await
-        .is_err(),
-        "should not emit duplicate transcript done from audio transcript done"
-    );
-
-    realtime_server.shutdown().await;
-    Ok(())
-}
-
-#[tokio::test]
 async fn realtime_list_voices_returns_supported_names() -> Result<()> {
     let codex_home = TempDir::new()?;
     create_config_toml(
@@ -1284,278 +702,6 @@ async fn realtime_list_voices_returns_supported_names() -> Result<()> {
         }
     );
 
-    Ok(())
-}
-
-#[tokio::test]
-async fn realtime_conversation_stop_emits_closed_notification() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let responses_server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
-    let realtime_server = start_websocket_server(vec![vec![
-        vec![json!({
-            "type": "session.updated",
-            "session": { "id": "sess_backend", "instructions": "backend prompt" }
-        })],
-        vec![],
-    ]])
-    .await;
-
-    let codex_home = TempDir::new()?;
-    create_config_toml(
-        codex_home.path(),
-        &responses_server.uri(),
-        realtime_server.uri(),
-        /*realtime_enabled*/ true,
-        StartupContextConfig::Generated,
-    )?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .build()
-        .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
-    login_with_api_key(&mut mcp, "sk-test-key").await?;
-
-    let thread_start_request_id = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams::default())
-        .await?;
-    let thread_start_response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(thread_start_request_id)),
-    )
-    .await??;
-    let thread_start: ThreadStartResponse = to_response(thread_start_response)?;
-
-    let start_request_id = mcp
-        .send_thread_realtime_start_request(ThreadRealtimeStartParams {
-            client_managed_handoffs: None,
-            flush_transcript_tail_on_session_end: None,
-            codex_responses_as_items: None,
-            codex_response_item_prefix: None,
-            codex_response_handoff_mode: None,
-            thread_id: thread_start.thread.id.clone(),
-            model: None,
-            output_modality: RealtimeOutputModality::Audio,
-            include_startup_context: None,
-            initial_items: None,
-            prompt: Some(Some("backend prompt".to_string())),
-            realtime_session_id: None,
-            transport: None,
-            version: None,
-            voice: None,
-        })
-        .await?;
-    let start_response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(start_request_id)),
-    )
-    .await??;
-    let _: ThreadRealtimeStartResponse = to_response(start_response)?;
-
-    let started =
-        read_notification::<ThreadRealtimeStartedNotification>(&mut mcp, "thread/realtime/started")
-            .await?;
-
-    let stop_request_id = mcp
-        .send_thread_realtime_stop_request(ThreadRealtimeStopParams {
-            thread_id: started.thread_id.clone(),
-        })
-        .await?;
-    let stop_response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(stop_request_id)),
-    )
-    .await??;
-    let _: ThreadRealtimeStopResponse = to_response(stop_response)?;
-
-    let closed =
-        read_notification::<ThreadRealtimeClosedNotification>(&mut mcp, "thread/realtime/closed")
-            .await?;
-    assert_eq!(closed.thread_id, started.thread_id);
-    assert!(matches!(
-        closed.reason.as_deref(),
-        Some("requested" | "transport_closed")
-    ));
-
-    realtime_server.shutdown().await;
-    Ok(())
-}
-
-#[tokio::test]
-async fn realtime_webrtc_start_emits_sdp_notification() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let responses_server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
-    let call_capture = RealtimeCallRequestCapture::new();
-    Mock::given(method("POST"))
-        .and(path("/v1/realtime/calls"))
-        .and(call_capture.clone())
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("Location", "/v1/realtime/calls/rtc_app_test")
-                .set_body_string("v=answer\r\n"),
-        )
-        .mount(&responses_server)
-        .await;
-    let realtime_server = start_websocket_server_with_headers(vec![WebSocketConnectionConfig {
-        requests: vec![vec![json!({
-            "type": "session.updated",
-            "session": { "id": "sess_webrtc", "instructions": "backend prompt" }
-        })]],
-        response_headers: Vec::new(),
-        accept_delay: None,
-        close_after_requests: false,
-    }])
-    .await;
-
-    let codex_home = TempDir::new()?;
-    create_config_toml(
-        codex_home.path(),
-        &responses_server.uri(),
-        realtime_server.uri(),
-        /*realtime_enabled*/ true,
-        StartupContextConfig::Override("startup context"),
-    )?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .build()
-        .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
-    login_with_api_key(&mut mcp, "sk-test-key").await?;
-
-    let thread_start_request_id = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams::default())
-        .await?;
-    let thread_start_response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(thread_start_request_id)),
-    )
-    .await??;
-    let thread_start: ThreadStartResponse = to_response(thread_start_response)?;
-
-    let thread_id = thread_start.thread.id;
-    let start_request_id = mcp
-        .send_thread_realtime_start_request(ThreadRealtimeStartParams {
-            client_managed_handoffs: None,
-            flush_transcript_tail_on_session_end: None,
-            codex_responses_as_items: None,
-            codex_response_item_prefix: None,
-            codex_response_handoff_mode: None,
-            thread_id: thread_id.clone(),
-            model: None,
-            output_modality: RealtimeOutputModality::Audio,
-            include_startup_context: None,
-            initial_items: None,
-            prompt: Some(Some("backend prompt".to_string())),
-            realtime_session_id: None,
-            transport: Some(ThreadRealtimeStartTransport::Webrtc {
-                sdp: "v=offer\r\n".to_string(),
-            }),
-            version: Some(RealtimeConversationVersion::V1),
-            voice: None,
-        })
-        .await?;
-    let start_response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(start_request_id)),
-    )
-    .await??;
-    let _: ThreadRealtimeStartResponse = to_response(start_response)?;
-
-    let started =
-        read_notification::<ThreadRealtimeStartedNotification>(&mut mcp, "thread/realtime/started")
-            .await?;
-    assert_eq!(started.thread_id, thread_id);
-    assert_eq!(started.version, RealtimeConversationVersion::V1);
-
-    let sdp_notification =
-        read_notification::<ThreadRealtimeSdpNotification>(&mut mcp, "thread/realtime/sdp").await?;
-    assert_eq!(
-        sdp_notification,
-        ThreadRealtimeSdpNotification {
-            thread_id: thread_id.clone(),
-            sdp: "v=answer\r\n".to_string()
-        }
-    );
-
-    let session_update = realtime_server
-        .wait_for_request(/*connection_index*/ 0, /*request_index*/ 0)
-        .await;
-    assert_eq!(
-        session_update.body_json()["type"].as_str(),
-        Some("session.update")
-    );
-    assert!(
-        session_update.body_json()["session"]["instructions"]
-            .as_str()
-            .context("expected session.update instructions")?
-            .contains("startup context")
-    );
-    assert_eq!(
-        realtime_server.single_handshake().uri(),
-        "/v1/realtime?intent=quicksilver&call_id=rtc_app_test"
-    );
-
-    let stop_request_id = mcp
-        .send_thread_realtime_stop_request(ThreadRealtimeStopParams {
-            thread_id: thread_id.clone(),
-        })
-        .await?;
-    let stop_response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(stop_request_id)),
-    )
-    .await??;
-    let _: ThreadRealtimeStopResponse = to_response(stop_response)?;
-
-    let closed_notification =
-        read_notification::<ThreadRealtimeClosedNotification>(&mut mcp, "thread/realtime/closed")
-            .await?;
-    assert_eq!(closed_notification.thread_id, thread_id);
-    assert!(
-        matches!(
-            closed_notification.reason.as_deref(),
-            Some("requested" | "transport_closed")
-        ),
-        "unexpected close reason: {closed_notification:?}"
-    );
-
-    let request = call_capture.single_request();
-    assert_eq!(request.url.path(), "/v1/realtime/calls");
-    assert_eq!(
-        request.url.query(),
-        Some("intent=quicksilver&architecture=avas")
-    );
-    assert_eq!(
-        request
-            .headers
-            .get("content-type")
-            .and_then(|value| value.to_str().ok()),
-        Some("multipart/form-data; boundary=codex-realtime-call-boundary")
-    );
-    let body = String::from_utf8(request.body).context("multipart body should be utf-8")?;
-    let session = normalized_json_string(v1_session_create_json())?;
-    assert_eq!(
-        body,
-        format!(
-            "--codex-realtime-call-boundary\r\n\
-             Content-Disposition: form-data; name=\"sdp\"\r\n\
-             Content-Type: application/sdp\r\n\
-             \r\n\
-             v=offer\r\n\
-             \r\n\
-             --codex-realtime-call-boundary\r\n\
-             Content-Disposition: form-data; name=\"session\"\r\n\
-             Content-Type: application/json\r\n\
-             \r\n\
-             {session}\r\n\
-             --codex-realtime-call-boundary--\r\n"
-        )
-    );
-
-    realtime_server.shutdown().await;
     Ok(())
 }
 
@@ -3024,85 +2170,6 @@ async fn websocket_v2_tool_call_does_not_block_sideband_audio() -> Result<()> {
 }
 
 #[tokio::test]
-async fn realtime_webrtc_start_surfaces_backend_error() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    // Phase 1: make call creation fail before any sideband connection can matter.
-    let responses_server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
-    Mock::given(method("POST"))
-        .and(path("/v1/realtime/calls"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
-        .mount(&responses_server)
-        .await;
-    let realtime_server = start_websocket_server(vec![vec![]]).await;
-
-    let codex_home = TempDir::new()?;
-    create_config_toml(
-        codex_home.path(),
-        &responses_server.uri(),
-        realtime_server.uri(),
-        /*realtime_enabled*/ true,
-        StartupContextConfig::Override("startup context"),
-    )?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .build()
-        .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
-    login_with_api_key(&mut mcp, "sk-test-key").await?;
-
-    // Phase 2: start a normal app-server thread and request realtime over WebRTC.
-    let thread_start_request_id = mcp
-        .send_thread_start_request_with_auto_env(ThreadStartParams::default())
-        .await?;
-    let thread_start_response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(thread_start_request_id)),
-    )
-    .await??;
-    let thread_start: ThreadStartResponse = to_response(thread_start_response)?;
-
-    let start_request_id = mcp
-        .send_thread_realtime_start_request(ThreadRealtimeStartParams {
-            client_managed_handoffs: None,
-            flush_transcript_tail_on_session_end: None,
-            codex_responses_as_items: None,
-            codex_response_item_prefix: None,
-            codex_response_handoff_mode: None,
-            thread_id: thread_start.thread.id,
-            model: None,
-            output_modality: RealtimeOutputModality::Audio,
-            include_startup_context: None,
-            initial_items: None,
-            prompt: Some(Some("backend prompt".to_string())),
-            realtime_session_id: None,
-            transport: Some(ThreadRealtimeStartTransport::Webrtc {
-                sdp: "v=offer\r\n".to_string(),
-            }),
-            version: Some(RealtimeConversationVersion::V1),
-            voice: None,
-        })
-        .await?;
-    let start_response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(start_request_id)),
-    )
-    .await??;
-    let _: ThreadRealtimeStartResponse = to_response(start_response)?;
-
-    // Phase 3: the JSON-RPC start request returns, and the realtime failure is delivered as the
-    // typed realtime error notification.
-    let error =
-        read_notification::<ThreadRealtimeErrorNotification>(&mut mcp, "thread/realtime/error")
-            .await?;
-    assert!(error.message.contains("currently experiencing high demand"));
-
-    realtime_server.shutdown().await;
-    Ok(())
-}
-
-#[tokio::test]
 async fn realtime_conversation_requires_feature_flag() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -3170,6 +2237,944 @@ async fn realtime_conversation_requires_feature_flag() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn realtime_conversation_streams_v2_notifications() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let responses_server = create_mock_responses_server_sequence_unchecked(vec![
+        create_final_assistant_message_sse_response("delegated")?,
+    ])
+    .await;
+    let realtime_server = start_websocket_server(vec![vec![
+        vec![json!({
+            "type": "session.updated",
+            "session": { "id": "sess_backend", "instructions": "backend prompt" }
+        })],
+        vec![],
+        vec![],
+        vec![
+            json!({
+                "type": "response.output_audio.delta",
+                "delta": "AQID",
+                "sample_rate": 24_000,
+                "channels": 1,
+                "samples_per_channel": 512
+            }),
+            json!({
+                "type": "conversation.item.added",
+                "item": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "text", "text": "hi" }]
+                }
+            }),
+            json!({
+                "type": "conversation.item.input_audio_transcription.delta",
+                "delta": "delegate now"
+            }),
+            json!({
+                "type": "response.output_text.delta",
+                "delta": "working"
+            }),
+            json!({
+                "type": "response.output_text.done",
+                "text": "working on it"
+            }),
+            json!({
+                "type": "conversation.item.done",
+                "item": {
+                    "id": "item_assistant_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "working on it" }]
+                }
+            }),
+            json!({
+                "type": "conversation.item.done",
+                "item": {
+                    "id": "item_2",
+                    "type": "function_call",
+                    "name": "background_agent",
+                    "call_id": "handoff_1",
+                    "arguments": "{\"input_transcript\":\"delegate now\"}"
+                }
+            }),
+            json!({
+                "type": "error",
+                "message": "upstream boom"
+            }),
+        ],
+    ]])
+    .await;
+
+    let codex_home = TempDir::new()?;
+    create_config_toml(
+        codex_home.path(),
+        &responses_server.uri(),
+        realtime_server.uri(),
+        /*realtime_enabled*/ true,
+        StartupContextConfig::Generated,
+    )?;
+
+    app_test_support::seed_chatgpt_auth(codex_home.path())?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+
+    let thread_start_request_id = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams::default())
+        .await?;
+    let thread_start_response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(thread_start_request_id)),
+    )
+    .await??;
+    let thread_start: ThreadStartResponse = to_response(thread_start_response)?;
+
+    let start_request_id = mcp
+        .send_thread_realtime_start_request(ThreadRealtimeStartParams {
+            client_managed_handoffs: None,
+            flush_transcript_tail_on_session_end: None,
+            codex_responses_as_items: None,
+            codex_response_item_prefix: None,
+            codex_response_handoff_mode: None,
+            thread_id: thread_start.thread.id.clone(),
+            model: Some("realtime-treatment-model".to_string()),
+            output_modality: RealtimeOutputModality::Audio,
+            include_startup_context: None,
+            initial_items: None,
+            prompt: None,
+            realtime_session_id: None,
+            transport: None,
+            version: None,
+            voice: Some(RealtimeVoice::Cedar),
+        })
+        .await?;
+    let start_response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start_request_id)),
+    )
+    .await??;
+    let _: ThreadRealtimeStartResponse = to_response(start_response)?;
+
+    let started =
+        read_notification::<ThreadRealtimeStartedNotification>(&mut mcp, "thread/realtime/started")
+            .await?;
+    assert_eq!(started.thread_id, thread_start.thread.id);
+    assert!(started.realtime_session_id.is_some());
+    assert_eq!(started.version, RealtimeConversationVersion::V2);
+
+    let startup_context_request = realtime_server
+        .wait_for_request(/*connection_index*/ 0, /*request_index*/ 0)
+        .await;
+    assert_eq!(
+        startup_context_request.body_json()["type"].as_str(),
+        Some("session.update")
+    );
+    assert_eq!(
+        startup_context_request.body_json()["session"]["audio"]["output"]["voice"],
+        "cedar"
+    );
+    assert_eq!(
+        realtime_server.single_handshake().uri(),
+        "/v1/realtime?model=realtime-treatment-model"
+    );
+    assert_eq!(
+        startup_context_request.body_json()["session"]["output_modalities"],
+        json!(["audio"])
+    );
+    let startup_context_instructions =
+        startup_context_request.body_json()["session"]["instructions"]
+            .as_str()
+            .context("expected startup context instructions")?
+            .to_string();
+    assert!(startup_context_instructions.starts_with("backend prompt"));
+    assert!(startup_context_instructions.contains(STARTUP_CONTEXT_HEADER));
+
+    let audio_append_request_id = mcp
+        .send_thread_realtime_append_audio_request(ThreadRealtimeAppendAudioParams {
+            thread_id: started.thread_id.clone(),
+            audio: ThreadRealtimeAudioChunk {
+                data: "BQYH".to_string(),
+                sample_rate: 24_000,
+                num_channels: 1,
+                samples_per_channel: Some(480),
+                item_id: None,
+            },
+        })
+        .await?;
+    let audio_append_response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(audio_append_request_id)),
+    )
+    .await??;
+    let _: ThreadRealtimeAppendAudioResponse = to_response(audio_append_response)?;
+
+    let text_append_request_id = mcp
+        .send_thread_realtime_append_text_request(ThreadRealtimeAppendTextParams {
+            thread_id: started.thread_id.clone(),
+            text: "hello".to_string(),
+            role: ConversationTextRole::Developer,
+        })
+        .await?;
+    let text_append_response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(text_append_request_id)),
+    )
+    .await??;
+    let _: ThreadRealtimeAppendTextResponse = to_response(text_append_response)?;
+
+    let assistant_append_request_id = mcp
+        .send_thread_realtime_append_text_request(ThreadRealtimeAppendTextParams {
+            thread_id: started.thread_id.clone(),
+            text: "welcome back".to_string(),
+            role: ConversationTextRole::Assistant,
+        })
+        .await?;
+    let assistant_append_response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(assistant_append_request_id)),
+    )
+    .await??;
+    let _: ThreadRealtimeAppendTextResponse = to_response(assistant_append_response)?;
+
+    let output_audio = read_notification::<ThreadRealtimeOutputAudioDeltaNotification>(
+        &mut mcp,
+        "thread/realtime/outputAudio/delta",
+    )
+    .await?;
+    assert_eq!(output_audio.audio.data, "AQID");
+    assert_eq!(output_audio.audio.sample_rate, 24_000);
+    assert_eq!(output_audio.audio.num_channels, 1);
+    assert_eq!(output_audio.audio.samples_per_channel, Some(512));
+
+    let item_added = read_notification::<ThreadRealtimeItemAddedNotification>(
+        &mut mcp,
+        "thread/realtime/itemAdded",
+    )
+    .await?;
+    assert_eq!(item_added.thread_id, output_audio.thread_id);
+    assert_eq!(item_added.item["type"], json!("message"));
+
+    let first_transcript_delta = read_notification::<ThreadRealtimeTranscriptDeltaNotification>(
+        &mut mcp,
+        "thread/realtime/transcript/delta",
+    )
+    .await?;
+    assert_eq!(first_transcript_delta.thread_id, output_audio.thread_id);
+    assert_eq!(first_transcript_delta.role, "user");
+    assert_eq!(first_transcript_delta.delta, "delegate now");
+
+    let second_transcript_delta = read_notification::<ThreadRealtimeTranscriptDeltaNotification>(
+        &mut mcp,
+        "thread/realtime/transcript/delta",
+    )
+    .await?;
+    assert_eq!(second_transcript_delta.thread_id, output_audio.thread_id);
+    assert_eq!(second_transcript_delta.role, "assistant");
+    assert_eq!(second_transcript_delta.delta, "working");
+
+    let final_transcript_done = read_notification::<ThreadRealtimeTranscriptDoneNotification>(
+        &mut mcp,
+        "thread/realtime/transcript/done",
+    )
+    .await?;
+    assert_eq!(final_transcript_done.thread_id, output_audio.thread_id);
+    assert_eq!(final_transcript_done.role, "assistant");
+    assert_eq!(final_transcript_done.text, "working on it");
+
+    let handoff_item_added = read_notification::<ThreadRealtimeItemAddedNotification>(
+        &mut mcp,
+        "thread/realtime/itemAdded",
+    )
+    .await?;
+    assert_eq!(handoff_item_added.thread_id, output_audio.thread_id);
+    assert_eq!(handoff_item_added.item["type"], json!("handoff_request"));
+    assert_eq!(handoff_item_added.item["handoff_id"], json!("handoff_1"));
+    assert_eq!(handoff_item_added.item["item_id"], json!("item_2"));
+    assert_eq!(
+        handoff_item_added.item["input_transcript"],
+        json!("delegate now")
+    );
+    assert_eq!(
+        handoff_item_added.item["active_transcript"],
+        json!([
+            {"role": "user", "text": "delegate now"},
+            {"role": "assistant", "text": "working on it"}
+        ])
+    );
+
+    let realtime_error =
+        read_notification::<ThreadRealtimeErrorNotification>(&mut mcp, "thread/realtime/error")
+            .await?;
+    assert_eq!(realtime_error.thread_id, output_audio.thread_id);
+    assert_eq!(realtime_error.message, "upstream boom");
+
+    let closed =
+        read_notification::<ThreadRealtimeClosedNotification>(&mut mcp, "thread/realtime/closed")
+            .await?;
+    assert_eq!(closed.thread_id, output_audio.thread_id);
+    assert_eq!(closed.reason.as_deref(), Some("error"));
+
+    let connections = realtime_server.connections();
+    assert_eq!(connections.len(), 1);
+    let connection = &connections[0];
+    assert_eq!(connection.len(), 4);
+    assert_eq!(
+        connection[0].body_json()["type"].as_str(),
+        Some("session.update")
+    );
+    assert_eq!(
+        connection[0].body_json()["session"]["instructions"].as_str(),
+        Some(startup_context_instructions.as_str()),
+    );
+    let text_requests = connection
+        .iter()
+        .map(WebSocketRequest::body_json)
+        .filter(|request| request["type"] == "conversation.item.create")
+        .collect::<Vec<_>>();
+    assert_eq!(text_requests.len(), 2);
+    assert_eq!(
+        text_requests[0],
+        json!({
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "developer",
+                "content": [{
+                    "type": "input_text",
+                    "text": "hello",
+                }],
+            },
+        })
+    );
+    assert_eq!(
+        text_requests[1],
+        json!({
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": "welcome back",
+                }],
+            },
+        })
+    );
+    let mut request_types = [
+        connection[1].body_json()["type"]
+            .as_str()
+            .context("expected websocket request type")?
+            .to_string(),
+        connection[2].body_json()["type"]
+            .as_str()
+            .context("expected websocket request type")?
+            .to_string(),
+        connection[3].body_json()["type"]
+            .as_str()
+            .context("expected websocket request type")?
+            .to_string(),
+    ];
+    request_types.sort();
+    assert_eq!(
+        request_types,
+        [
+            "conversation.item.create".to_string(),
+            "conversation.item.create".to_string(),
+            "input_audio_buffer.append".to_string(),
+        ]
+    );
+
+    realtime_server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn realtime_start_can_skip_startup_context() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let responses_server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let realtime_server = start_websocket_server(vec![vec![vec![json!({
+        "type": "session.updated",
+        "session": { "id": "sess_backend", "instructions": "backend prompt" }
+    })]]])
+    .await;
+
+    let codex_home = TempDir::new()?;
+    create_config_toml(
+        codex_home.path(),
+        &responses_server.uri(),
+        realtime_server.uri(),
+        /*realtime_enabled*/ true,
+        StartupContextConfig::Generated,
+    )?;
+
+    app_test_support::seed_chatgpt_auth(codex_home.path())?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+
+    let thread_start_request_id = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams::default())
+        .await?;
+    let thread_start_response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(thread_start_request_id)),
+    )
+    .await??;
+    let thread_start: ThreadStartResponse = to_response(thread_start_response)?;
+
+    let start_request_id = mcp
+        .send_thread_realtime_start_request(ThreadRealtimeStartParams {
+            client_managed_handoffs: None,
+            flush_transcript_tail_on_session_end: None,
+            codex_responses_as_items: None,
+            codex_response_item_prefix: None,
+            codex_response_handoff_mode: None,
+            thread_id: thread_start.thread.id.clone(),
+            model: None,
+            output_modality: RealtimeOutputModality::Audio,
+            include_startup_context: Some(false),
+            initial_items: None,
+            prompt: None,
+            realtime_session_id: None,
+            transport: None,
+            version: None,
+            voice: None,
+        })
+        .await?;
+    let start_response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start_request_id)),
+    )
+    .await??;
+    let _: ThreadRealtimeStartResponse = to_response(start_response)?;
+
+    read_notification::<ThreadRealtimeStartedNotification>(&mut mcp, "thread/realtime/started")
+        .await?;
+
+    let startup_context_request = realtime_server
+        .wait_for_request(/*connection_index*/ 0, /*request_index*/ 0)
+        .await;
+    let startup_context_body = startup_context_request.body_json();
+    let instructions = startup_context_body["session"]["instructions"]
+        .as_str()
+        .context("expected realtime instructions")?;
+    assert_eq!(instructions, "backend prompt");
+    assert!(!instructions.contains(STARTUP_CONTEXT_HEADER));
+
+    realtime_server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn realtime_text_output_modality_requests_text_output_and_final_transcript() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let responses_server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let realtime_server = start_websocket_server(vec![vec![vec![
+        json!({
+            "type": "session.updated",
+            "session": { "id": "sess_text", "instructions": "backend prompt" }
+        }),
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "hello "
+        }),
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "world"
+        }),
+        json!({
+            "type": "response.output_audio_transcript.done",
+            "transcript": "hello world"
+        }),
+        json!({
+            "type": "conversation.item.done",
+            "item": {
+                "id": "item_output_1",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "hello world"}]
+            }
+        }),
+    ]]])
+    .await;
+
+    let codex_home = TempDir::new()?;
+    create_config_toml(
+        codex_home.path(),
+        &responses_server.uri(),
+        realtime_server.uri(),
+        /*realtime_enabled*/ true,
+        StartupContextConfig::Generated,
+    )?;
+
+    app_test_support::seed_chatgpt_auth(codex_home.path())?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+
+    let thread_start_request_id = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams::default())
+        .await?;
+    let thread_start_response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(thread_start_request_id)),
+    )
+    .await??;
+    let thread_start: ThreadStartResponse = to_response(thread_start_response)?;
+
+    let start_request_id = mcp
+        .send_thread_realtime_start_request(ThreadRealtimeStartParams {
+            client_managed_handoffs: None,
+            flush_transcript_tail_on_session_end: None,
+            codex_responses_as_items: None,
+            codex_response_item_prefix: None,
+            codex_response_handoff_mode: None,
+            thread_id: thread_start.thread.id.clone(),
+            model: None,
+            output_modality: RealtimeOutputModality::Text,
+            include_startup_context: None,
+            initial_items: None,
+            prompt: None,
+            realtime_session_id: None,
+            transport: None,
+            version: None,
+            voice: None,
+        })
+        .await?;
+    let start_response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start_request_id)),
+    )
+    .await??;
+    let _: ThreadRealtimeStartResponse = to_response(start_response)?;
+
+    let session_update = realtime_server
+        .wait_for_request(/*connection_index*/ 0, /*request_index*/ 0)
+        .await;
+    assert_eq!(
+        session_update.body_json()["session"]["output_modalities"],
+        json!(["text"])
+    );
+
+    let first_delta = read_notification::<ThreadRealtimeTranscriptDeltaNotification>(
+        &mut mcp,
+        "thread/realtime/transcript/delta",
+    )
+    .await?;
+    let second_delta = read_notification::<ThreadRealtimeTranscriptDeltaNotification>(
+        &mut mcp,
+        "thread/realtime/transcript/delta",
+    )
+    .await?;
+    let done = read_notification::<ThreadRealtimeTranscriptDoneNotification>(
+        &mut mcp,
+        "thread/realtime/transcript/done",
+    )
+    .await?;
+    assert_eq!(
+        vec![first_delta, second_delta],
+        vec![
+            ThreadRealtimeTranscriptDeltaNotification {
+                thread_id: thread_start.thread.id.clone(),
+                role: "assistant".to_string(),
+                delta: "hello ".to_string(),
+            },
+            ThreadRealtimeTranscriptDeltaNotification {
+                thread_id: thread_start.thread.id.clone(),
+                role: "assistant".to_string(),
+                delta: "world".to_string(),
+            },
+        ]
+    );
+    assert_eq!(
+        done,
+        ThreadRealtimeTranscriptDoneNotification {
+            thread_id: thread_start.thread.id,
+            role: "assistant".to_string(),
+            text: "hello world".to_string(),
+        }
+    );
+    assert!(
+        timeout(
+            Duration::from_millis(200),
+            mcp.read_stream_until_notification_message("thread/realtime/transcript/done"),
+        )
+        .await
+        .is_err(),
+        "should not emit duplicate transcript done from audio transcript done"
+    );
+
+    realtime_server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn realtime_conversation_stop_emits_closed_notification() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let responses_server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let realtime_server = start_websocket_server(vec![vec![
+        vec![json!({
+            "type": "session.updated",
+            "session": { "id": "sess_backend", "instructions": "backend prompt" }
+        })],
+        vec![],
+    ]])
+    .await;
+
+    let codex_home = TempDir::new()?;
+    create_config_toml(
+        codex_home.path(),
+        &responses_server.uri(),
+        realtime_server.uri(),
+        /*realtime_enabled*/ true,
+        StartupContextConfig::Generated,
+    )?;
+
+    app_test_support::seed_chatgpt_auth(codex_home.path())?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+
+    let thread_start_request_id = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams::default())
+        .await?;
+    let thread_start_response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(thread_start_request_id)),
+    )
+    .await??;
+    let thread_start: ThreadStartResponse = to_response(thread_start_response)?;
+
+    let start_request_id = mcp
+        .send_thread_realtime_start_request(ThreadRealtimeStartParams {
+            client_managed_handoffs: None,
+            flush_transcript_tail_on_session_end: None,
+            codex_responses_as_items: None,
+            codex_response_item_prefix: None,
+            codex_response_handoff_mode: None,
+            thread_id: thread_start.thread.id.clone(),
+            model: None,
+            output_modality: RealtimeOutputModality::Audio,
+            include_startup_context: None,
+            initial_items: None,
+            prompt: Some(Some("backend prompt".to_string())),
+            realtime_session_id: None,
+            transport: None,
+            version: None,
+            voice: None,
+        })
+        .await?;
+    let start_response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start_request_id)),
+    )
+    .await??;
+    let _: ThreadRealtimeStartResponse = to_response(start_response)?;
+
+    let started =
+        read_notification::<ThreadRealtimeStartedNotification>(&mut mcp, "thread/realtime/started")
+            .await?;
+
+    let stop_request_id = mcp
+        .send_thread_realtime_stop_request(ThreadRealtimeStopParams {
+            thread_id: started.thread_id.clone(),
+        })
+        .await?;
+    let stop_response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(stop_request_id)),
+    )
+    .await??;
+    let _: ThreadRealtimeStopResponse = to_response(stop_response)?;
+
+    let closed =
+        read_notification::<ThreadRealtimeClosedNotification>(&mut mcp, "thread/realtime/closed")
+            .await?;
+    assert_eq!(closed.thread_id, started.thread_id);
+    assert!(matches!(
+        closed.reason.as_deref(),
+        Some("requested" | "transport_closed")
+    ));
+
+    realtime_server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn realtime_webrtc_start_emits_sdp_notification() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let responses_server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let call_capture = RealtimeCallRequestCapture::new();
+    Mock::given(method("POST"))
+        .and(path("/v1/realtime/calls"))
+        .and(call_capture.clone())
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Location", "/v1/realtime/calls/rtc_app_test")
+                .set_body_string("v=answer\r\n"),
+        )
+        .mount(&responses_server)
+        .await;
+    let realtime_server = start_websocket_server_with_headers(vec![WebSocketConnectionConfig {
+        requests: vec![vec![json!({
+            "type": "session.updated",
+            "session": { "id": "sess_webrtc", "instructions": "backend prompt" }
+        })]],
+        response_headers: Vec::new(),
+        accept_delay: None,
+        close_after_requests: false,
+    }])
+    .await;
+
+    let codex_home = TempDir::new()?;
+    create_config_toml(
+        codex_home.path(),
+        &responses_server.uri(),
+        realtime_server.uri(),
+        /*realtime_enabled*/ true,
+        StartupContextConfig::Override("startup context"),
+    )?;
+
+    app_test_support::seed_chatgpt_auth(codex_home.path())?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+
+    let thread_start_request_id = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams::default())
+        .await?;
+    let thread_start_response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(thread_start_request_id)),
+    )
+    .await??;
+    let thread_start: ThreadStartResponse = to_response(thread_start_response)?;
+
+    let thread_id = thread_start.thread.id;
+    let start_request_id = mcp
+        .send_thread_realtime_start_request(ThreadRealtimeStartParams {
+            client_managed_handoffs: None,
+            flush_transcript_tail_on_session_end: None,
+            codex_responses_as_items: None,
+            codex_response_item_prefix: None,
+            codex_response_handoff_mode: None,
+            thread_id: thread_id.clone(),
+            model: None,
+            output_modality: RealtimeOutputModality::Audio,
+            include_startup_context: None,
+            initial_items: None,
+            prompt: Some(Some("backend prompt".to_string())),
+            realtime_session_id: None,
+            transport: Some(ThreadRealtimeStartTransport::Webrtc {
+                sdp: "v=offer\r\n".to_string(),
+            }),
+            version: Some(RealtimeConversationVersion::V1),
+            voice: None,
+        })
+        .await?;
+    let start_response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start_request_id)),
+    )
+    .await??;
+    let _: ThreadRealtimeStartResponse = to_response(start_response)?;
+
+    let started =
+        read_notification::<ThreadRealtimeStartedNotification>(&mut mcp, "thread/realtime/started")
+            .await?;
+    assert_eq!(started.thread_id, thread_id);
+    assert_eq!(started.version, RealtimeConversationVersion::V1);
+
+    let sdp_notification =
+        read_notification::<ThreadRealtimeSdpNotification>(&mut mcp, "thread/realtime/sdp").await?;
+    assert_eq!(
+        sdp_notification,
+        ThreadRealtimeSdpNotification {
+            thread_id: thread_id.clone(),
+            sdp: "v=answer\r\n".to_string()
+        }
+    );
+
+    let session_update = realtime_server
+        .wait_for_request(/*connection_index*/ 0, /*request_index*/ 0)
+        .await;
+    assert_eq!(
+        session_update.body_json()["type"].as_str(),
+        Some("session.update")
+    );
+    assert!(
+        session_update.body_json()["session"]["instructions"]
+            .as_str()
+            .context("expected session.update instructions")?
+            .contains("startup context")
+    );
+    assert_eq!(
+        realtime_server.single_handshake().uri(),
+        "/v1/realtime?intent=quicksilver&call_id=rtc_app_test"
+    );
+
+    let stop_request_id = mcp
+        .send_thread_realtime_stop_request(ThreadRealtimeStopParams {
+            thread_id: thread_id.clone(),
+        })
+        .await?;
+    let stop_response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(stop_request_id)),
+    )
+    .await??;
+    let _: ThreadRealtimeStopResponse = to_response(stop_response)?;
+
+    let closed_notification =
+        read_notification::<ThreadRealtimeClosedNotification>(&mut mcp, "thread/realtime/closed")
+            .await?;
+    assert_eq!(closed_notification.thread_id, thread_id);
+    assert!(
+        matches!(
+            closed_notification.reason.as_deref(),
+            Some("requested" | "transport_closed")
+        ),
+        "unexpected close reason: {closed_notification:?}"
+    );
+
+    let request = call_capture.single_request();
+    assert_eq!(request.url.path(), "/v1/realtime/calls");
+    assert_eq!(
+        request.url.query(),
+        Some("intent=quicksilver&architecture=avas")
+    );
+    assert_eq!(
+        request
+            .headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("multipart/form-data; boundary=codex-realtime-call-boundary")
+    );
+    let body = String::from_utf8(request.body).context("multipart body should be utf-8")?;
+    let session = normalized_json_string(v1_session_create_json())?;
+    assert_eq!(
+        body,
+        format!(
+            "--codex-realtime-call-boundary\r\n\
+             Content-Disposition: form-data; name=\"sdp\"\r\n\
+             Content-Type: application/sdp\r\n\
+             \r\n\
+             v=offer\r\n\
+             \r\n\
+             --codex-realtime-call-boundary\r\n\
+             Content-Disposition: form-data; name=\"session\"\r\n\
+             Content-Type: application/json\r\n\
+             \r\n\
+             {session}\r\n\
+             --codex-realtime-call-boundary--\r\n"
+        )
+    );
+
+    realtime_server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn realtime_webrtc_start_surfaces_backend_error() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    // Phase 1: make call creation fail before any sideband connection can matter.
+    let responses_server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/realtime/calls"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+        .mount(&responses_server)
+        .await;
+    let realtime_server = start_websocket_server(vec![vec![]]).await;
+
+    let codex_home = TempDir::new()?;
+    create_config_toml(
+        codex_home.path(),
+        &responses_server.uri(),
+        realtime_server.uri(),
+        /*realtime_enabled*/ true,
+        StartupContextConfig::Override("startup context"),
+    )?;
+
+    app_test_support::seed_chatgpt_auth(codex_home.path())?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+
+    // Phase 2: start a normal app-server thread and request realtime over WebRTC.
+    let thread_start_request_id = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams::default())
+        .await?;
+    let thread_start_response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(thread_start_request_id)),
+    )
+    .await??;
+    let thread_start: ThreadStartResponse = to_response(thread_start_response)?;
+
+    let start_request_id = mcp
+        .send_thread_realtime_start_request(ThreadRealtimeStartParams {
+            client_managed_handoffs: None,
+            flush_transcript_tail_on_session_end: None,
+            codex_responses_as_items: None,
+            codex_response_item_prefix: None,
+            codex_response_handoff_mode: None,
+            thread_id: thread_start.thread.id,
+            model: None,
+            output_modality: RealtimeOutputModality::Audio,
+            include_startup_context: None,
+            initial_items: None,
+            prompt: Some(Some("backend prompt".to_string())),
+            realtime_session_id: None,
+            transport: Some(ThreadRealtimeStartTransport::Webrtc {
+                sdp: "v=offer\r\n".to_string(),
+            }),
+            version: Some(RealtimeConversationVersion::V1),
+            voice: None,
+        })
+        .await?;
+    let start_response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(start_request_id)),
+    )
+    .await??;
+    let _: ThreadRealtimeStartResponse = to_response(start_response)?;
+
+    // Phase 3: the JSON-RPC start request returns, and the realtime failure is delivered as the
+    // typed realtime error notification.
+    let error =
+        read_notification::<ThreadRealtimeErrorNotification>(&mut mcp, "thread/realtime/error")
+            .await?;
+    assert!(error.message.contains("currently experiencing high demand"));
+
+    realtime_server.shutdown().await;
+    Ok(())
+}
+
 async fn read_notification<T: DeserializeOwned>(
     mcp: &mut TestAppServer,
     method: &str,
@@ -3191,19 +3196,6 @@ async fn read_notification_with_timeout<T: DeserializeOwned>(
         .params
         .context("expected notification params to be present")?;
     Ok(serde_json::from_value(params)?)
-}
-
-async fn login_with_api_key(mcp: &mut TestAppServer, api_key: &str) -> Result<()> {
-    let request_id = mcp.send_login_account_api_key_request(api_key).await?;
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let login: LoginAccountResponse = to_response(response)?;
-    assert_eq!(login, LoginAccountResponse::ApiKey {});
-
-    Ok(())
 }
 
 async fn wait_for_started_command_execution(

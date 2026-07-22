@@ -141,6 +141,13 @@ use tracing::warn;
 /// - If the model sends only an assistant message, we record it in the
 ///   conversation history and consider the turn complete.
 ///
+#[derive(Debug, Default)]
+pub(crate) struct RunTurnResult {
+    pub(crate) last_agent_message: Option<String>,
+    pub(crate) completed_successfully: bool,
+    pub(crate) serving_account_id: Option<String>,
+}
+
 pub(crate) async fn run_turn(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
@@ -148,22 +155,83 @@ pub(crate) async fn run_turn(
     input: Vec<TurnInput>,
     prewarmed_client_session: Option<ModelClientSession>,
     cancellation_token: CancellationToken,
-) -> CodexResult<Option<String>> {
+) -> CodexResult<RunTurnResult> {
     let mut client_session =
         prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
     // TODO(ccunningham): Pre-turn compaction runs before context updates and the
     // new user message are recorded. Estimate pending incoming items (context
     // diffs/full reinjection + user input) and trigger compaction preemptively
     // when they would push the thread over the compaction threshold.
-    if let Err(err) = run_pre_sampling_compact(&sess, &turn_context, &mut client_session).await {
+    loop {
+        let pre_compact_account_id = sess
+            .services
+            .auth_manager
+            .auth_cached()
+            .and_then(|auth| auth.get_pool_account_id());
+        let Err(err) = run_pre_sampling_compact(&sess, &turn_context, &mut client_session).await
+        else {
+            break;
+        };
         if matches!(err, CodexErr::TurnAborted) {
             return Err(err);
+        }
+        let should_retry = match &err {
+            CodexErr::UsageLimitReached(e) => {
+                match sess
+                    .services
+                    .auth_manager
+                    .handle_chatgpt_account_pool_usage_limit(
+                        pre_compact_account_id.as_deref(),
+                        /*safe_to_retry=*/ true,
+                        e.rate_limits.as_deref(),
+                        e.resets_at,
+                    )
+                    .await
+                {
+                    Ok(should_retry) => should_retry,
+                    Err(pool_err) => {
+                        warn!(
+                            "failed to process ChatGPT account-pool failover after compaction usage limit: {pool_err}"
+                        );
+                        false
+                    }
+                }
+            }
+            CodexErr::RefreshTokenFailed(e) => {
+                match sess
+                    .services
+                    .auth_manager
+                    .handle_chatgpt_account_pool_auth_failure(
+                        pre_compact_account_id.as_deref(),
+                        /*safe_to_retry=*/ true,
+                        e,
+                    )
+                    .await
+                {
+                    Ok(should_retry) => should_retry,
+                    Err(pool_err) => {
+                        warn!(
+                            "failed to process ChatGPT account-pool auth failover after compaction auth failure: {pool_err}"
+                        );
+                        false
+                    }
+                }
+            }
+            _ => false,
+        };
+        if should_retry {
+            sess.services
+                .auth_manager
+                .record_account_pool_activity()
+                .await;
+            client_session = sess.services.model_client.new_session();
+            continue;
         }
         let error = err.to_codex_protocol_error();
         sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
             .await;
         error!("Failed to run pre-sampling compact");
-        return Ok(None);
+        return Ok(RunTurnResult::default());
     }
 
     // run_turn owns the step used to seed context and make the first sampling request.
@@ -182,15 +250,15 @@ pub(crate) async fn run_turn(
     )
     .await
     else {
-        return Ok(None);
+        return Ok(RunTurnResult::default());
     };
 
     if run_pending_session_start_hooks(&sess, &turn_context).await {
-        return Ok(None);
+        return Ok(RunTurnResult::default());
     }
     let mut can_drain_pending_input = input.is_empty();
     if run_hooks_and_record_inputs(&sess, &turn_context, &input).await {
-        return Ok(None);
+        return Ok(RunTurnResult::default());
     }
 
     sess.merge_connector_selection(explicitly_enabled_connectors.clone())
@@ -209,6 +277,8 @@ pub(crate) async fn run_turn(
     track_turn_resolved_config_analytics(&sess, &turn_context, &input).await;
 
     let mut last_agent_message: Option<String> = None;
+    let mut serving_account_id = None;
+    let mut turn_completed_successfully = false;
     let mut stop_hook_active = false;
     // Although from the perspective of codex.rs, TurnDiffTracker has the lifecycle of a Task which contains
     // many turns, from the perspective of the user, it is a single turn.
@@ -295,7 +365,9 @@ pub(crate) async fn run_turn(
                 let SamplingRequestResult {
                     needs_follow_up: model_needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
+                    serving_account_id: sampling_request_account_id,
                 } = sampling_request_output;
+                serving_account_id = sampling_request_account_id;
                 if model_needs_follow_up {
                     sess.input_queue
                         .accept_mailbox_delivery_for_current_turn(
@@ -313,8 +385,7 @@ pub(crate) async fn run_turn(
                         turn_context.as_ref(),
                     )
                     .await;
-                    let estimated_token_count =
-                        sess.get_estimated_token_count(turn_context.as_ref()).await;
+                    let estimated_token_count = sess.get_estimated_token_count().await;
                     (has_pending_input, token_status, estimated_token_count)
                 }
                 .instrument(trace_span!("run_turn.collect_post_sampling_state"))
@@ -369,7 +440,7 @@ pub(crate) async fn run_turn(
                         let error = err.to_codex_protocol_error();
                         sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
                             .await;
-                        return Ok(None);
+                        return Ok(RunTurnResult::default());
                     }
                     can_drain_pending_input = !model_needs_follow_up;
                     continue;
@@ -412,6 +483,7 @@ pub(crate) async fn run_turn(
                         }
                     }
                     if stop_outcome.should_stop {
+                        turn_completed_successfully = true;
                         break;
                     }
                     if run_legacy_after_agent_hook(
@@ -422,8 +494,9 @@ pub(crate) async fn run_turn(
                     )
                     .await
                     {
-                        return Ok(None);
+                        return Ok(RunTurnResult::default());
                     }
+                    turn_completed_successfully = true;
                     break;
                 }
                 continue;
@@ -468,7 +541,11 @@ pub(crate) async fn run_turn(
         }
     }
 
-    Ok(last_agent_message)
+    Ok(RunTurnResult {
+        last_agent_message,
+        completed_successfully: turn_completed_successfully,
+        serving_account_id,
+    })
 }
 
 #[instrument(level = "trace", skip_all)]
@@ -1152,6 +1229,15 @@ async fn run_sampling_request(
     let mut initial_input = Some(input);
     let mut original_input = None;
     loop {
+        // Capture the active pool account ID before this sampling attempt so that
+        // if a concurrent post-turn probe switches auth_cached() during the request,
+        // error handlers below still mark the account that actually produced the
+        // error rather than the newly activated (innocent) one.
+        let sampling_account_id = sess
+            .services
+            .auth_manager
+            .auth_cached()
+            .and_then(|auth| auth.get_pool_account_id());
         let prompt_input = if let Some(input) = initial_input.take() {
             input
         } else {
@@ -1174,6 +1260,7 @@ async fn run_sampling_request(
             responses_metadata,
             Arc::clone(&turn_diff_tracker),
             &prompt,
+            sampling_account_id.as_deref(),
             cancellation_token.child_token(),
         )
         .await
@@ -1181,18 +1268,104 @@ async fn run_sampling_request(
             Ok(output) => {
                 return Ok((output, original_input.unwrap_or(prompt.input)));
             }
-            Err(CodexErr::ContextWindowExceeded) => {
+            Err(SamplingRequestError {
+                error: CodexErr::ContextWindowExceeded,
+                ..
+            }) => {
                 sess.set_total_tokens_full(&turn_context).await;
                 return Err(CodexErr::ContextWindowExceeded);
             }
-            Err(CodexErr::UsageLimitReached(e)) => {
+            Err(SamplingRequestError {
+                error: CodexErr::UsageLimitReached(e),
+                replay_blocked,
+                tool_execution_seen,
+            }) => {
+                let safe_to_retry = !replay_blocked && !tool_execution_seen;
                 let rate_limits = e.rate_limits.clone();
                 if let Some(rate_limits) = rate_limits {
                     sess.update_rate_limits(&turn_context, *rate_limits).await;
                 }
+                let failover_result = sess
+                    .services
+                    .auth_manager
+                    .handle_chatgpt_account_pool_usage_limit(
+                        sampling_account_id.as_deref(),
+                        safe_to_retry,
+                        e.rate_limits.as_deref(),
+                        e.resets_at,
+                    )
+                    .await;
+                let active_account_changed = sess
+                    .services
+                    .auth_manager
+                    .auth_cached()
+                    .and_then(|auth| auth.get_pool_account_id())
+                    != sampling_account_id;
+                if active_account_changed {
+                    // The snapshots above belong to the failed account. Do not
+                    // expose them as the newly activated account's limits when
+                    // the retry succeeds without fresh rate-limit headers.
+                    sess.clear_rate_limits(&turn_context).await;
+                }
+                match failover_result {
+                    Ok(true) => {
+                        sess.services
+                            .auth_manager
+                            .record_account_pool_activity()
+                            .await;
+                        *client_session = sess.services.model_client.new_session();
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(err) => {
+                        tracing::warn!("failed to process ChatGPT account-pool failover: {err}");
+                    }
+                }
                 return Err(CodexErr::UsageLimitReached(e));
             }
-            Err(err) => err,
+            Err(SamplingRequestError {
+                error: CodexErr::RefreshTokenFailed(e),
+                replay_blocked,
+                tool_execution_seen,
+            }) => {
+                let safe_to_retry = !replay_blocked && !tool_execution_seen;
+                match sess
+                    .services
+                    .auth_manager
+                    .handle_chatgpt_account_pool_auth_failure(
+                        sampling_account_id.as_deref(),
+                        safe_to_retry,
+                        &e,
+                    )
+                    .await
+                {
+                    Ok(true) => {
+                        sess.services
+                            .auth_manager
+                            .record_account_pool_activity()
+                            .await;
+                        *client_session = sess.services.model_client.new_session();
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(err) => {
+                        tracing::warn!(
+                            "failed to process ChatGPT account-pool auth failover: {err}"
+                        );
+                    }
+                }
+                return Err(CodexErr::RefreshTokenFailed(e));
+            }
+            Err(SamplingRequestError {
+                error,
+                replay_blocked,
+                tool_execution_seen,
+            }) => {
+                if replay_blocked || tool_execution_seen {
+                    return Err(error);
+                }
+                error
+            }
         };
 
         if original_input.is_none() {
@@ -1359,6 +1532,45 @@ pub(crate) async fn built_tools(
 struct SamplingRequestResult {
     needs_follow_up: bool,
     last_agent_message: Option<String>,
+    serving_account_id: Option<String>,
+}
+
+#[derive(Debug)]
+struct SamplingRequestError {
+    error: CodexErr,
+    replay_blocked: bool,
+    tool_execution_seen: bool,
+}
+
+impl SamplingRequestError {
+    fn new(error: CodexErr, replay_blocked: bool, tool_execution_seen: bool) -> Self {
+        Self {
+            error,
+            replay_blocked,
+            tool_execution_seen,
+        }
+    }
+}
+
+fn turn_item_blocks_retry(turn_item: &TurnItem) -> bool {
+    match turn_item {
+        TurnItem::UserMessage(_) | TurnItem::HookPrompt(_) | TurnItem::Reasoning(_) => false,
+        TurnItem::AgentMessage(_)
+        | TurnItem::Plan(_)
+        | TurnItem::CommandExecution(_)
+        | TurnItem::DynamicToolCall(_)
+        | TurnItem::CollabAgentToolCall(_)
+        | TurnItem::SubAgentActivity(_)
+        | TurnItem::WebSearch(_)
+        | TurnItem::ImageView(_)
+        | TurnItem::Extension(_)
+        | TurnItem::ImageGeneration(_)
+        | TurnItem::EnteredReviewMode(_)
+        | TurnItem::ExitedReviewMode(_)
+        | TurnItem::FileChange(_)
+        | TurnItem::McpToolCall(_)
+        | TurnItem::ContextCompaction(_) => true,
+    }
 }
 
 /// Ephemeral per-response state for streaming a single proposed plan.
@@ -1902,19 +2114,28 @@ async fn drain_in_flight(
     in_flight: &mut FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>>,
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
+    record_tool_results: bool,
 ) -> CodexResult<()> {
     while let Some(res) = in_flight.next().await {
         match res {
             Ok(response_input) => {
-                let response_item = response_input.into();
-                sess.record_conversation_items(&turn_context, std::slice::from_ref(&response_item))
+                // Preserve results from any tools that already started. Their matching
+                // calls were accepted before a later stream failure, so dropping the
+                // outputs would make a retry repeat potentially destructive work.
+                if record_tool_results {
+                    let response_item = response_input.into();
+                    sess.record_conversation_items(
+                        &turn_context,
+                        std::slice::from_ref(&response_item),
+                    )
                     .await;
-                mark_thread_memory_mode_polluted_if_external_context(
-                    sess.as_ref(),
-                    turn_context.as_ref(),
-                    &response_item,
-                )
-                .await;
+                    mark_thread_memory_mode_polluted_if_external_context(
+                        sess.as_ref(),
+                        turn_context.as_ref(),
+                        &response_item,
+                    )
+                    .await;
+                }
             }
             Err(err) => {
                 error_or_panic(format!("in-flight tool future failed during drain: {err}"));
@@ -1954,8 +2175,9 @@ async fn try_run_sampling_request(
     responses_metadata: &CodexResponsesMetadata,
     turn_diff_tracker: SharedTurnDiffTracker,
     prompt: &Prompt,
+    sampling_account_id: Option<&str>,
     cancellation_token: CancellationToken,
-) -> CodexResult<SamplingRequestResult> {
+) -> Result<SamplingRequestResult, SamplingRequestError> {
     feedback_tags!(
         model = turn_context.model_info.slug.clone(),
         approval_policy = turn_context.approval_policy.value(),
@@ -1975,7 +2197,7 @@ async fn try_run_sampling_request(
         .features
         .enabled(Feature::ConcurrentReasoningSummaries)
         && turn_context.provider.info().is_openai();
-    let mut stream = client_session
+    let mut stream = match client_session
         .stream(
             prompt,
             &turn_context.model_info,
@@ -1988,11 +2210,24 @@ async fn try_run_sampling_request(
         )
         .instrument(trace_span!("stream_request"))
         .or_cancel(&cancellation_token)
-        .await??;
+        .await
+    {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(err)) => return Err(SamplingRequestError::new(err, false, false)),
+        Err(codex_async_utils::CancelErr::Cancelled) => {
+            return Err(SamplingRequestError::new(
+                CodexErr::TurnAborted,
+                false,
+                false,
+            ));
+        }
+    };
     let mut in_flight: FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>> =
         FuturesOrdered::new();
     let mut needs_follow_up = false;
+    let mut replay_blocked = false;
     let mut last_agent_message: Option<String> = None;
+    let mut tool_execution_seen = false;
     let mut active_item: Option<TurnItem> = None;
     let mut active_tool_argument_diff_consumer: Option<(
         String,
@@ -2008,7 +2243,7 @@ async fn try_run_sampling_request(
         !sess.services.extensions.turn_item_contributors().is_empty();
     let mut active_item_is_streaming_to_client = false;
     let receiving_span = trace_span!("receiving_stream");
-    let outcome: CodexResult<SamplingRequestResult> = loop {
+    let outcome: Result<SamplingRequestResult, SamplingRequestError> = loop {
         let handle_responses = trace_span!(
             parent: &receiving_span,
             "handle_responses",
@@ -2031,16 +2266,29 @@ async fn try_run_sampling_request(
             .await
         {
             Ok(event) => event,
-            Err(codex_async_utils::CancelErr::Cancelled) => break Err(CodexErr::TurnAborted),
+            Err(codex_async_utils::CancelErr::Cancelled) => {
+                break Err(SamplingRequestError::new(
+                    CodexErr::TurnAborted,
+                    replay_blocked,
+                    tool_execution_seen,
+                ));
+            }
         };
 
         let event = match event {
             Some(Ok(event)) => event,
-            Some(Err(err)) => break Err(err),
+            Some(Err(err)) => {
+                break Err(SamplingRequestError::new(
+                    err,
+                    replay_blocked,
+                    tool_execution_seen,
+                ));
+            }
             None => {
-                break Err(CodexErr::Stream(
-                    "stream closed before response.completed".into(),
-                    None,
+                break Err(SamplingRequestError::new(
+                    CodexErr::Stream("stream closed before response.completed".into(), None),
+                    replay_blocked,
+                    tool_execution_seen,
                 ));
             }
         };
@@ -2056,6 +2304,29 @@ async fn try_run_sampling_request(
                 if turn_context.item_ids_enabled() {
                     assign_missing_streamed_response_item_id(&mut item, active_item.as_ref());
                 }
+                // Some transports emit completed output only as `output_item.done`. Assistant
+                // content and image generation must not be replayed because they were already
+                // persisted or produced an external result. Reasoning is safe to continue from
+                // the updated conversation history after a transient disconnect.
+                replay_blocked |= match &item {
+                    ResponseItem::Message { role, .. } => role == "assistant",
+                    ResponseItem::AgentMessage { .. }
+                    | ResponseItem::ImageGenerationCall { .. } => true,
+                    ResponseItem::Reasoning { .. }
+                    | ResponseItem::AdditionalTools { .. }
+                    | ResponseItem::LocalShellCall { .. }
+                    | ResponseItem::FunctionCall { .. }
+                    | ResponseItem::ToolSearchCall { .. }
+                    | ResponseItem::FunctionCallOutput { .. }
+                    | ResponseItem::CustomToolCall { .. }
+                    | ResponseItem::CustomToolCallOutput { .. }
+                    | ResponseItem::ToolSearchOutput { .. }
+                    | ResponseItem::WebSearchCall { .. }
+                    | ResponseItem::Compaction { .. }
+                    | ResponseItem::CompactionTrigger { .. }
+                    | ResponseItem::ContextCompaction { .. }
+                    | ResponseItem::Other => false,
+                };
                 if let Some((_, mut consumer)) = active_tool_argument_diff_consumer.take()
                     && let Ok(Some(event)) = consumer.finish()
                 {
@@ -2132,9 +2403,16 @@ async fn try_run_sampling_request(
                         .await
                     {
                         Ok(output_result) => output_result,
-                        Err(err) => break Err(err),
+                        Err(err) => {
+                            break Err(SamplingRequestError::new(
+                                err,
+                                replay_blocked,
+                                tool_execution_seen,
+                            ));
+                        }
                     };
                 if let Some(tool_future) = output_result.tool_future {
+                    tool_execution_seen = true;
                     in_flight.push_back(tool_future);
                 }
                 if let Some(agent_message) = output_result.last_agent_message {
@@ -2146,6 +2424,7 @@ async fn try_run_sampling_request(
                     break Ok(SamplingRequestResult {
                         needs_follow_up: true,
                         last_agent_message,
+                        serving_account_id: sampling_account_id.map(str::to_string),
                     });
                 }
             }
@@ -2177,6 +2456,9 @@ async fn try_run_sampling_request(
                 {
                     let mut turn_item = turn_item;
                     let stream_item_to_client = !defer_streamed_turn_items_for_contributors;
+                    // Contributors can defer delivery until `OutputItemDone`, but output with
+                    // external effects or completed assistant content still blocks replay.
+                    replay_blocked |= turn_item_blocks_retry(&turn_item);
                     let mut seeded_parsed: Option<ParsedAssistantTextDelta> = None;
                     let mut seeded_item_id: Option<String> = None;
                     if stream_item_to_client
@@ -2272,6 +2554,12 @@ async fn try_run_sampling_request(
                 sess.set_server_reasoning_included(included).await;
             }
             ResponseEvent::RateLimits(snapshot) => {
+                if let Some(account_id) = sampling_account_id {
+                    sess.services
+                        .auth_manager
+                        .record_account_pool_rate_limit_snapshot_for(account_id, &snapshot)
+                        .await;
+                }
                 // Update internal state with latest rate limits, but defer sending until
                 // token usage is available to avoid duplicate TokenCount events.
                 sess.record_rate_limits_info(snapshot).await;
@@ -2310,7 +2598,11 @@ async fn try_run_sampling_request(
                 should_emit_token_count = true;
                 should_emit_turn_diff = true;
                 if let Err(err) = budget_result {
-                    break Err(err);
+                    break Err(SamplingRequestError::new(
+                        err,
+                        replay_blocked,
+                        tool_execution_seen,
+                    ));
                 }
                 if let Some(false) = end_turn {
                     needs_follow_up = true;
@@ -2318,6 +2610,7 @@ async fn try_run_sampling_request(
                 break Ok(SamplingRequestResult {
                     needs_follow_up,
                     last_agent_message,
+                    serving_account_id: sampling_account_id.map(str::to_string),
                 });
             }
             ResponseEvent::OutputTextDelta(delta) => {
@@ -2371,13 +2664,24 @@ async fn try_run_sampling_request(
                 }
             }
             ResponseEvent::ReasoningSummaryDelta {
+                item_id: event_item_id,
                 delta,
                 summary_index,
             } => {
                 if uses_sequential_cutoff_reasoning_summaries {
                     continue;
                 }
-                if let Some(active) = active_item.as_ref() {
+                if let Some(item_id) = event_item_id {
+                    let event = ReasoningContentDeltaEvent {
+                        thread_id: sess.thread_id.to_string(),
+                        turn_id: turn_context.sub_id.clone(),
+                        item_id,
+                        delta,
+                        summary_index,
+                    };
+                    sess.send_event(&turn_context, EventMsg::ReasoningContentDelta(event))
+                        .await;
+                } else if let Some(active) = active_item.as_ref() {
                     if !active_item_is_streaming_to_client {
                         continue;
                     }
@@ -2394,11 +2698,21 @@ async fn try_run_sampling_request(
                     error_or_panic("ReasoningSummaryDelta without active item".to_string());
                 }
             }
-            ResponseEvent::ReasoningSummaryPartAdded { summary_index } => {
+            ResponseEvent::ReasoningSummaryPartAdded {
+                item_id: event_item_id,
+                summary_index,
+            } => {
                 if uses_sequential_cutoff_reasoning_summaries {
                     continue;
                 }
-                if let Some(active) = active_item.as_ref() {
+                if let Some(item_id) = event_item_id {
+                    let event =
+                        EventMsg::AgentReasoningSectionBreak(AgentReasoningSectionBreakEvent {
+                            item_id,
+                            summary_index,
+                        });
+                    sess.send_event(&turn_context, event).await;
+                } else if let Some(active) = active_item.as_ref() {
                     if !active_item_is_streaming_to_client {
                         continue;
                     }
@@ -2447,10 +2761,21 @@ async fn try_run_sampling_request(
                     .await;
             }
             ResponseEvent::ReasoningContentDelta {
+                item_id: event_item_id,
                 delta,
                 content_index,
             } => {
-                if let Some(active) = active_item.as_ref() {
+                if let Some(item_id) = event_item_id {
+                    let event = ReasoningRawContentDeltaEvent {
+                        thread_id: sess.thread_id.to_string(),
+                        turn_id: turn_context.sub_id.clone(),
+                        item_id,
+                        delta,
+                        content_index,
+                    };
+                    sess.send_event(&turn_context, EventMsg::ReasoningRawContentDelta(event))
+                        .await;
+                } else if let Some(active) = active_item.as_ref() {
                     if !active_item_is_streaming_to_client {
                         continue;
                     }
@@ -2484,7 +2809,14 @@ async fn try_run_sampling_request(
     } else {
         Some(turn_context.turn_timing_state.begin_tool_blocking())
     };
-    drain_in_flight(&mut in_flight, sess.clone(), turn_context.clone()).await?;
+    drain_in_flight(
+        &mut in_flight,
+        sess.clone(),
+        turn_context.clone(),
+        outcome.is_ok() || tool_execution_seen,
+    )
+    .await
+    .map_err(|err| SamplingRequestError::new(err, replay_blocked, tool_execution_seen))?;
     drop(tool_blocking_timing_guard);
 
     if should_emit_token_count {
@@ -2496,7 +2828,11 @@ async fn try_run_sampling_request(
     }
 
     if cancellation_token.is_cancelled() {
-        return Err(CodexErr::TurnAborted);
+        return Err(SamplingRequestError::new(
+            CodexErr::TurnAborted,
+            replay_blocked,
+            tool_execution_seen,
+        ));
     }
 
     if should_emit_turn_diff {

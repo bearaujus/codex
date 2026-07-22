@@ -9,10 +9,11 @@ Your patch language is a stripped‑down, file‑oriented diff format designed t
 
 Within that envelope, you get a sequence of file operations.
 You MUST include a header to specify the action you are taking.
-Each operation starts with one of three headers:
+Each operation starts with one of four headers:
 
 *** Add File: <path> - create a new file. Every following line is a + line (the initial contents).
 *** Delete File: <path> - remove an existing file. Nothing follows.
+*** Replace File: <path> - replace an existing file with new full contents. Every following line is a + line and may replace the file with an empty body if no + lines follow. The target must already exist; use Add File when creating a new path.
 *** Update File: <path> - patch an existing file in place (optionally with a rename).
 
 May be immediately followed by *** Move to: <new path> if you want to rename the file.
@@ -41,9 +42,10 @@ The full grammar definition is below:
 Patch := Begin { FileOp } End
 Begin := "*** Begin Patch" NEWLINE
 End := "*** End Patch" NEWLINE
-FileOp := AddFile | DeleteFile | UpdateFile
+FileOp := AddFile | DeleteFile | ReplaceFile | UpdateFile
 AddFile := "*** Add File: " path NEWLINE { "+" line NEWLINE }
 DeleteFile := "*** Delete File: " path NEWLINE
+ReplaceFile := "*** Replace File: " path NEWLINE { "+" line NEWLINE }
 UpdateFile := "*** Update File: " path NEWLINE [ MoveTo ] { Hunk }
 MoveTo := "*** Move to: " newPath NEWLINE
 Hunk := "@@" [ header ] NEWLINE { HunkLine } [ "*** End of File" NEWLINE ]
@@ -64,7 +66,9 @@ A full patch can combine several operations:
 
 It is important to remember:
 
-- You must include a header with your intended action (Add/Delete/Update)
+- You must include a header with your intended action (Add/Delete/Replace/Update)
+- `*** Replace File` is the safest option when most of a file is changing or when stale patch context keeps failing. Prefer it over a huge in-place `*** Update File` rewrite.
+- `*** Replace File` requires the target file to already exist. Use `*** Add File` when the path does not exist yet.
 - You must prefix new lines with `+` even when creating a new file
 - File references can only be relative, NEVER ABSOLUTE.
 

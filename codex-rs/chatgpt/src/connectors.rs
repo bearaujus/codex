@@ -33,8 +33,7 @@ const CONNECTOR_METADATA_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_APPS_PRODUCT_SKU: &str = "codex";
 
 async fn apps_enabled(config: &Config) -> bool {
-    let auth_manager =
-        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await;
+    let auth_manager = AuthManager::shared_from_config(config).await;
     let auth = auth_manager.auth().await;
     config
         .features
@@ -42,8 +41,7 @@ async fn apps_enabled(config: &Config) -> bool {
 }
 
 async fn connector_auth(config: &Config) -> anyhow::Result<CodexAuth> {
-    let auth_manager =
-        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await;
+    let auth_manager = AuthManager::shared_from_config(config).await;
     let auth = auth_manager
         .auth()
         .await
@@ -145,7 +143,7 @@ pub async fn read_connector_metadata(
     );
     anyhow::ensure!(
         auth.get_account_id().is_some(),
-        "ChatGPT account ID not available, please re-run codex login"
+        "ChatGPT account ID not available; configure ChatGPT through app-server OAuth or device-code login and retry"
     );
 
     let store = ConnectorMetadataStore::new(

@@ -119,11 +119,11 @@ fn plugins_manager_tracks_auth_mode() {
     let manager = PluginsManager::new(tmp.path().to_path_buf());
 
     assert_eq!(manager.auth_mode(), None);
-    assert!(manager.set_auth_mode(Some(AuthMode::ApiKey)));
-    assert_eq!(manager.auth_mode(), Some(AuthMode::ApiKey));
-    assert!(!manager.set_auth_mode(Some(AuthMode::ApiKey)));
-    assert!(manager.set_auth_mode(Some(AuthMode::ChatgptAuthTokens)));
-    assert_eq!(manager.auth_mode(), Some(AuthMode::ChatgptAuthTokens));
+    assert!(manager.set_auth_mode(Some(AuthMode::Chatgpt)));
+    assert_eq!(manager.auth_mode(), Some(AuthMode::Chatgpt));
+    assert!(!manager.set_auth_mode(Some(AuthMode::Chatgpt)));
+    assert!(manager.set_auth_mode(Some(AuthMode::Chatgpt)));
+    assert_eq!(manager.auth_mode(), Some(AuthMode::Chatgpt));
     assert!(manager.set_auth_mode(/*auth_mode*/ None));
     assert_eq!(manager.auth_mode(), None);
 
@@ -395,7 +395,7 @@ async fn plugin_auth_projection_hides_apps_without_chatgpt_auth() {
     let manager = PluginsManager::new_with_options(
         codex_home.path().to_path_buf(),
         Some(Product::Codex),
-        Some(AuthMode::ApiKey),
+        Some(AuthMode::Chatgpt),
     );
 
     let outcome = manager.plugins_for_config(&config).await;
@@ -640,7 +640,7 @@ async fn plugin_auth_projection_reprojects_cached_plugins_when_auth_changes() {
         ]
     );
 
-    assert!(manager.set_auth_mode(Some(AuthMode::ApiKey)));
+    assert!(manager.set_auth_mode(Some(AuthMode::Chatgpt)));
     let api_key_outcome = manager.plugins_for_config(&config).await;
 
     assert_eq!(
@@ -1363,7 +1363,7 @@ enabled = true
     let manager = PluginsManager::new_with_options(
         codex_home.path().to_path_buf(),
         Some(Product::Codex),
-        Some(AuthMode::ApiKey),
+        Some(AuthMode::Chatgpt),
     );
 
     let outcome = manager.plugins_for_config(&config).await;
@@ -3618,7 +3618,7 @@ plugins = true
     let api_key_outcome = PluginsManager::new_with_options(
         tmp.path().to_path_buf(),
         Some(Product::Codex),
-        Some(AuthMode::ApiKey),
+        Some(AuthMode::Chatgpt),
     )
     .read_plugin_for_config(&config, &request)
     .await
@@ -4362,7 +4362,7 @@ plugins = true
 
     let config = load_config(tmp.path(), tmp.path()).await;
     let manager = PluginsManager::new(tmp.path().to_path_buf());
-    manager.set_auth_mode(Some(AuthMode::ApiKey));
+    manager.set_auth_mode(Some(AuthMode::Chatgpt));
     let marketplaces = manager
         .list_marketplaces_for_config(&config, &[], /*include_openai_curated*/ true)
         .unwrap()
@@ -4425,7 +4425,7 @@ plugins = true
 
     let config = load_config(tmp.path(), tmp.path()).await;
     let manager = PluginsManager::new(tmp.path().to_path_buf());
-    manager.set_auth_mode(Some(AuthMode::BedrockApiKey));
+    manager.set_auth_mode(Some(AuthMode::Headers));
     let outcome = manager
         .list_marketplaces_for_config(&config, &[], /*include_openai_curated*/ true)
         .unwrap();

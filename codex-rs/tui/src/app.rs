@@ -583,7 +583,7 @@ pub(crate) struct App {
     pending_app_server_requests: PendingAppServerRequests,
     pending_startup_thread_start: bool,
     /// Invalidates in-flight full rate-limit reads when a newer rolling hard stop arrives.
-    rate_limit_hard_stop_generation: u64,
+    rate_limit_update_generation: u64,
     // Serialize plugin enablement writes per plugin so stale completions cannot
     // overwrite a newer toggle, even if the plugin is toggled from different
     // cwd contexts.
@@ -1075,7 +1075,7 @@ See the Codex keymap documentation for supported actions and examples."
             pending_primary_events: VecDeque::new(),
             pending_app_server_requests: PendingAppServerRequests::default(),
             pending_startup_thread_start,
-            rate_limit_hard_stop_generation: 0,
+            rate_limit_update_generation: 0,
             pending_plugin_enabled_writes: HashMap::new(),
             pending_hook_enabled_writes: HashMap::new(),
         };

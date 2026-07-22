@@ -1221,7 +1221,7 @@ fn sandbox_outcome_event_records_outcome() {
         "gpt-5.5",
         /*account_id*/ None,
         /*account_email*/ None,
-        Some(TelemetryAuthMode::ApiKey),
+        Some(TelemetryAuthMode::Chatgpt),
         "Codex_Desktop".to_string(),
         /*log_user_prompts*/ false,
         "tty".to_string(),

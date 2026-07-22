@@ -130,24 +130,6 @@ async fn later_extension_can_remove_same_name_registration() -> TestResult {
 }
 
 #[tokio::test]
-async fn hosted_apps_mcp_requires_chatgpt_auth() -> TestResult {
-    let codex_home = tempfile::tempdir()?;
-    let config = ConfigBuilder::default()
-        .codex_home(codex_home.path().to_path_buf())
-        .fallback_cwd(Some(codex_home.path().to_path_buf()))
-        .cli_overrides(vec![("features.apps".to_string(), true.into())])
-        .build()
-        .await?;
-    let auth = CodexAuth::from_api_key("test");
-    let manager = installed_manager(&config);
-
-    let servers = manager.effective_servers(&config, Some(&auth)).await;
-    assert!(!servers.contains_key(CODEX_APPS_MCP_SERVER_NAME));
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn disabled_apps_remove_reserved_server_config_for_all_hosts() -> TestResult {
     let codex_home = tempfile::tempdir()?;
     let config = ConfigBuilder::default()

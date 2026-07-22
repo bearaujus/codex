@@ -308,6 +308,7 @@ use crate::history_cell::HookCell;
 use crate::history_cell::McpInvocation;
 use crate::history_cell::McpToolCallCell;
 use crate::history_cell::PlainHistoryCell;
+use crate::history_cell::ReasoningSummaryCell;
 use crate::history_cell::WebSearchCell;
 use crate::key_hint;
 use crate::key_hint::KeyBinding;
@@ -456,6 +457,7 @@ use crate::streaming::chunking::AdaptiveChunkingPolicy;
 use crate::streaming::commit_tick::CommitTickScope;
 use crate::streaming::commit_tick::run_commit_tick;
 use crate::streaming::controller::PlanStreamController;
+use crate::streaming::controller::ReasoningStreamController;
 use crate::streaming::controller::StreamController;
 use crate::workspace_command::WorkspaceCommandRunner;
 
@@ -557,6 +559,7 @@ pub(crate) struct ChatWidget {
     pub(crate) remote_connection: Option<RemoteConnectionStatus>,
     token_info: Option<TokenUsageInfo>,
     rate_limit_snapshots_by_limit_id: BTreeMap<String, RateLimitSnapshotDisplay>,
+    rate_limit_full_refresh_pending: bool,
     refreshing_status_outputs: Vec<(u64, StatusHistoryHandle)>,
     next_status_refresh_request_id: u64,
     refreshing_token_activity_output: Option<tokens::PendingTokenActivityOutput>,
@@ -582,6 +585,10 @@ pub(crate) struct ChatWidget {
     stream_controller: Option<StreamController>,
     // Stream lifecycle controller for proposed plan output.
     plan_stream_controller: Option<PlanStreamController>,
+    // Stream lifecycle controller for live reasoning summaries. Like the agent
+    // and plan controllers, it commits completed reasoning lines to scrollback
+    // while keeping only the in-progress tail in the active cell.
+    reasoning_stream_controller: Option<ReasoningStreamController>,
     pending_stream_consolidations: usize,
     /// Holds the platform clipboard lease so copied text remains available while supported.
     clipboard_lease: Option<crate::clipboard_copy::ClipboardLease>,
@@ -630,6 +637,14 @@ pub(crate) struct ChatWidget {
     interrupts: InterruptManager,
     // Accumulates the current reasoning block text to extract a header
     reasoning_buffer: String,
+    // Accumulates full reasoning content for transcript-only recording
+    full_reasoning_buffer: String,
+    // Tracks whether the active cell is rendering live reasoning content.
+    live_reasoning_active: bool,
+    // When set, `pre_draw_tick` recomputes the status surfaces at or after this
+    // instant so the rate-limit countdown stays live while the UI is otherwise
+    // idle. Cleared once no visible window still has a reset timestamp.
+    rate_limit_countdown_refresh_due: Option<Instant>,
     // Caches the first completed bold header so later deltas do not rescan the whole block.
     reasoning_header: Option<String>,
     // Preserves reasoning-summary part boundaries for transcript-only recording.
@@ -1139,6 +1154,12 @@ impl ChatWidget {
                 self.token_info = None;
             }
         }
+        // The configurable status line derives several items (context
+        // remaining/used, context window size, used/input/output tokens) from
+        // `token_info`. Refresh the surfaces here so those values track token
+        // updates instead of only refreshing when some unrelated event happens
+        // to trigger a refresh.
+        self.refresh_status_surfaces();
     }
 
     fn apply_token_info(&mut self, info: TokenUsageInfo) {
@@ -1173,6 +1194,7 @@ impl ChatWidget {
                     self.token_info = None;
                 }
             }
+            self.refresh_status_surfaces();
         }
     }
 
@@ -1183,6 +1205,7 @@ impl ChatWidget {
     pub(crate) fn pre_draw_tick(&mut self) {
         self.update_due_hook_visibility();
         self.schedule_hook_timer_if_needed();
+        self.tick_rate_limit_countdown();
         self.bottom_pane.pre_draw_tick();
         if let Some(pet) = self.ambient_pet.as_ref() {
             pet.schedule_next_frame();
@@ -1201,10 +1224,34 @@ impl ChatWidget {
     }
 
     fn flush_active_cell(&mut self) {
+        if self.live_reasoning_active {
+            // Commit buffered reasoning to history before clearing the live cell so
+            // content the user already saw is not silently dropped from the transcript.
+            self.commit_pending_reasoning_to_history();
+            // clear_live_reasoning only nulls active_cell when it holds a ReasoningSummaryCell.
+            // If the invariant was violated and a non-reasoning cell is present, it is preserved
+            // in active_cell with live_reasoning_active set to false. Flush it below so it is
+            // not silently overwritten by the next active_cell assignment.
+            self.clear_live_reasoning();
+            self.transcript.needs_final_message_separator = true;
+            if let Some(active) = self.transcript.active_cell.take() {
+                self.app_event_tx.send(AppEvent::InsertHistoryCell(active));
+            }
+            return;
+        }
         if let Some(active) = self.transcript.active_cell.take() {
             self.transcript.needs_final_message_separator = true;
             self.app_event_tx.send(AppEvent::InsertHistoryCell(active));
             self.request_pending_usage_output_insertion();
+        }
+        // If a non-reasoning cell was just flushed (e.g., a tool spinner completing)
+        // and reasoning content accumulated in the buffers while it was active,
+        // recreate the live reasoning cell so that content becomes visible again.
+        // Guard on agent_turn_running: during teardown the turn is no longer active,
+        // so recreating here would leave an orphaned cell in active_cell that never
+        // gets committed to history.
+        if self.config.stream_reasoning_live && self.turn_lifecycle.agent_turn_running {
+            self.update_live_reasoning("");
         }
     }
 
@@ -1224,7 +1271,15 @@ impl ChatWidget {
 
         if !keep_placeholder_header_active && !cell.display_lines(u16::MAX).is_empty() {
             // Only break exec grouping if the cell renders visible lines.
-            if !self.has_active_stream_tail() {
+            //
+            // Guard on the controller, not on a materialized tail cell: a stream's live
+            // tail is empty whenever all rendered lines are queued for commit (the common
+            // case between deltas). Checking `has_active_stream_tail()` here would then see
+            // "no tail" during a commit tick and flush — which finalizes the in-progress
+            // reasoning/agent/plan stream mid-commit, reordering its lines (the freshly
+            // committed line is sent after the finalized remainder) and tearing down the
+            // controller. `has_active_stream_controller()` stays true across that window.
+            if !self.has_active_stream_controller() {
                 self.flush_active_cell();
             }
             self.transcript.needs_final_message_separator = true;
@@ -1330,7 +1385,7 @@ impl ChatWidget {
 
     /// Request a shutdown-first quit.
     ///
-    /// This is used for explicit quit commands (`/quit`, `/exit`, `/logout`) and for
+    /// This is used for explicit quit commands (`/quit`, `/exit`) and for
     /// the double-press Ctrl+C/Ctrl+D quit shortcut.
     fn request_quit_without_confirmation(&self) {
         self.app_event_tx
@@ -1594,6 +1649,9 @@ impl ChatWidget {
         if let Some(controller) = self.plan_stream_controller.as_mut() {
             controller.set_render_mode(render_mode);
         }
+        if let Some(controller) = self.reasoning_stream_controller.as_mut() {
+            controller.set_render_mode(render_mode);
+        }
         self.refresh_status_surfaces();
     }
 
@@ -1633,6 +1691,9 @@ impl ChatWidget {
         }
         if let Some(controller) = self.plan_stream_controller.as_mut() {
             controller.set_width(plan_stream_width);
+        }
+        if let Some(controller) = self.reasoning_stream_controller.as_mut() {
+            controller.set_width(stream_width);
         }
         self.sync_active_stream_tail();
         if !had_rendered_width {
@@ -1776,6 +1837,9 @@ impl ChatWidget {
                 controller.clear_queue();
             }
             if let Some(controller) = self.plan_stream_controller.as_mut() {
+                controller.clear_queue();
+            }
+            if let Some(controller) = self.reasoning_stream_controller.as_mut() {
                 controller.clear_queue();
             }
             self.clear_active_stream_tail();
