@@ -210,6 +210,24 @@ async fn try_verify_apply_patch_args(
                 })?;
                 changes.insert(path, ApplyPatchFileChange::Delete { content });
             }
+            Hunk::ReplaceFile { contents, .. } => {
+                let ApplyPatchFileUpdate {
+                    unified_diff,
+                    content: new_content,
+                    ..
+                } = crate::full_file_update_from_replacement(
+                    &path, &contents, /*context*/ 1, fs, sandbox,
+                )
+                .await?;
+                changes.insert(
+                    path,
+                    ApplyPatchFileChange::Update {
+                        unified_diff,
+                        move_path: None,
+                        new_content,
+                    },
+                );
+            }
             Hunk::UpdateFile {
                 move_path, chunks, ..
             } => {

@@ -823,7 +823,7 @@ async fn resume_conversation(
     path: std::path::PathBuf,
 ) -> Arc<CodexThread> {
     let auth_manager = codex_core::test_support::auth_manager_from_auth(
-        codex_login::CodexAuth::from_api_key("dummy"),
+        codex_login::CodexAuth::create_dummy_chatgpt_auth_for_testing(),
     );
     Box::pin(manager.resume_thread_from_rollout(
         config.clone(),

@@ -1,0 +1,9 @@
+---
+source: tui/src/history_cell/tests.rs
+expression: rendered
+---
+• Ran AAAAAAAAAAAAAAAAAA
+  │ AAAAAAAAAAAAAAAAAA
+  │ AAAAAAAAAAAAAAAAAA
+  │ … +225 command lines
+  └ (no output)

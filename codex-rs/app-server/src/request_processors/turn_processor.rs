@@ -2,6 +2,7 @@ use super::*;
 use codex_agent_extension::AgentInvocation;
 use codex_agent_extension::AgentRun;
 use codex_agent_extension::AgentRunner;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::PermissionProfile;
@@ -226,9 +227,11 @@ impl TurnRequestProcessor {
         request_id: &ConnectionRequestId,
         params: TurnInterruptParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        self.turn_interrupt_inner(request_id, params)
-            .await
-            .map(|response| response.map(Into::into))
+        let result = self.turn_interrupt_inner(request_id, params).await;
+        if let Err(error) = &result {
+            self.track_error_response(request_id, error, /*error_type*/ None);
+        }
+        result.map(|response| response.map(Into::into))
     }
 
     pub(crate) async fn thread_realtime_start(
@@ -890,9 +893,9 @@ impl TurnRequestProcessor {
         thread
             .inject_response_items(items)
             .await
-            .map_err(|err| match err {
-                CodexErr::InvalidRequest(message) => invalid_request(message),
-                err => internal_error(format!("failed to inject response items: {err}")),
+            .map_err(|err| match err.details() {
+                CodexErrorDetails::InvalidRequest(message) => invalid_request(message.clone()),
+                _ => internal_error(format!("failed to inject response items: {err}")),
             })?;
         Ok(ThreadInjectItemsResponse {})
     }
@@ -1072,12 +1075,15 @@ impl TurnRequestProcessor {
             thread.as_ref(),
             Op::RealtimeConversationStart(ConversationStartParams {
                 client_managed_handoffs: params.client_managed_handoffs.unwrap_or(false),
+                delegation_ack_filler: params.delegation_ack_filler,
                 flush_transcript_tail_on_session_end: params
                     .flush_transcript_tail_on_session_end
                     .unwrap_or(false),
                 codex_responses_as_items: params.codex_responses_as_items.unwrap_or(false),
                 codex_response_item_prefix: params.codex_response_item_prefix,
                 codex_response_handoff_mode: params.codex_response_handoff_mode.unwrap_or_default(),
+                codex_response_handoff_channel_prefixes: params
+                    .codex_response_handoff_channel_prefixes,
                 model: params.model,
                 output_modality: params.output_modality,
                 include_startup_context: params.include_startup_context.unwrap_or(true),
@@ -1090,6 +1096,8 @@ impl TurnRequestProcessor {
                         role: item.role,
                     })
                     .collect(),
+                realtime_start_instructions: params.realtime_start_instructions,
+                realtime_end_instructions: params.realtime_end_instructions,
                 prompt: params.prompt,
                 realtime_session_id: params.realtime_session_id,
                 transport: params.transport.map(|transport| match transport {
@@ -1332,7 +1340,7 @@ impl TurnRequestProcessor {
         if let Some(mut thread) = stored_thread {
             thread.session_id = review_thread.session_configured().session_id.to_string();
             self.thread_watch_manager
-                .upsert_thread_silently(thread.clone())
+                .upsert_thread_silently(&thread.id)
                 .await;
             thread.status = resolve_thread_status(
                 self.thread_watch_manager

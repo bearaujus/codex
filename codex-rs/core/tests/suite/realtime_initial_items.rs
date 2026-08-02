@@ -1,5 +1,6 @@
 use anyhow::Result;
 use codex_config::config_toml::RealtimeWsVersion;
+use codex_login::CodexAuth;
 use codex_protocol::protocol::CodexResponseHandoffMode;
 use codex_protocol::protocol::ConversationStartParams;
 use codex_protocol::protocol::ConversationTextParams;
@@ -13,13 +14,18 @@ use codex_protocol::protocol::RealtimeOutputModality;
 use core_test_support::responses::start_mock_server;
 use core_test_support::responses::start_websocket_server;
 use core_test_support::skip_if_no_network;
-use core_test_support::test_codex::test_codex;
+use core_test_support::test_codex::TestCodexBuilder;
+use core_test_support::test_codex::test_codex as base_test_codex;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::time::Duration;
 use tokio::time::timeout;
+
+fn test_codex() -> TestCodexBuilder {
+    base_test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn frameless_v3_sends_initial_items_in_session_bootstrap() -> Result<()> {
@@ -150,6 +156,32 @@ async fn initial_items_enforce_aggregate_token_limit() -> Result<()> {
     .await
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn realtime_start_instructions_enforce_token_limit() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let mut params = start_params(RealtimeConversationVersion::V3);
+    params.realtime_start_instructions = Some("x".repeat(8_192 * 4 + 1));
+    assert_start_error(
+        params,
+        "realtime start instructions must not exceed 8192 estimated tokens",
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn realtime_end_instructions_enforce_token_limit() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let mut params = start_params(RealtimeConversationVersion::V3);
+    params.realtime_end_instructions = Some("x".repeat(8_192 * 4 + 1));
+    assert_start_error(
+        params,
+        "realtime end instructions must not exceed 8192 estimated tokens",
+    )
+    .await
+}
+
 async fn assert_start_error(params: ConversationStartParams, expected_error: &str) -> Result<()> {
     let api_server = start_mock_server().await;
     let test = test_codex().build_with_auto_env(&api_server).await?;
@@ -173,10 +205,12 @@ async fn assert_start_error(params: ConversationStartParams, expected_error: &st
 fn start_params(version: RealtimeConversationVersion) -> ConversationStartParams {
     ConversationStartParams {
         client_managed_handoffs: false,
+        delegation_ack_filler: None,
         flush_transcript_tail_on_session_end: false,
         codex_responses_as_items: false,
         codex_response_item_prefix: None,
         codex_response_handoff_mode: CodexResponseHandoffMode::Thinking,
+        codex_response_handoff_channel_prefixes: None,
         model: None,
         output_modality: RealtimeOutputModality::Audio,
         include_startup_context: true,
@@ -194,6 +228,8 @@ fn start_params(version: RealtimeConversationVersion) -> ConversationStartParams
                 role: ConversationTextRole::Assistant,
             },
         ],
+        realtime_start_instructions: None,
+        realtime_end_instructions: None,
         prompt: Some(Some("backend prompt".to_string())),
         realtime_session_id: None,
         transport: None,

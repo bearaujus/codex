@@ -30,6 +30,7 @@ use codex_app_server_protocol::PluginReadParams;
 use codex_app_server_protocol::PluginReadResponse;
 use codex_app_server_protocol::PluginUninstallResponse;
 use codex_app_server_protocol::SkillsListResponse;
+use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadGoalStatus;
 use codex_connectors::AppInfo;
 use codex_file_search::FileMatch;
@@ -38,6 +39,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::openai_models::ModelPreset;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_approval_presets::ApprovalPreset;
+use uuid::Uuid;
 
 use crate::app_command::AppCommand;
 use crate::app_server_session::AppServerStartedThread;
@@ -174,11 +176,24 @@ pub(crate) enum KeymapEditIntent {
     ReplaceOne { old_key: String },
 }
 
+/// Number of key strokes recorded by one `/keymap` capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeymapCaptureMode {
+    SingleKey,
+    Chord,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub(crate) enum AppEvent {
     /// Open the agent picker for switching active threads.
     OpenAgentPicker,
+    /// Merge a completed root-scoped agent-picker refresh without blocking terminal input.
+    AgentPickerThreadsLoaded {
+        primary_thread_id: ThreadId,
+        request_id: Uuid,
+        result: Result<Vec<Thread>, String>,
+    },
     /// Switch the active thread to the selected agent.
     SelectAgentThread(ThreadId),
 
@@ -235,8 +250,10 @@ pub(crate) enum AppEvent {
         log_id: u64,
     },
 
-    /// Start a new session.
-    NewSession,
+    /// Start a new session, optionally assigning it a name.
+    NewSession {
+        name: Option<String>,
+    },
 
     /// Result of the fresh startup thread that is attached after the input UI is live.
     StartupThreadStarted {
@@ -245,7 +262,9 @@ pub(crate) enum AppEvent {
 
     /// Clear the terminal UI (screen + scrollback), start a fresh session, and keep the
     /// previous chat resumable.
-    ClearUi,
+    ClearUi {
+        name: Option<String>,
+    },
 
     /// Re-render the transcript using the selected scrollback rendering mode.
     RawOutputModeChanged {
@@ -275,8 +294,10 @@ pub(crate) enum AppEvent {
     /// Permanently delete the current active main thread and exit after it succeeds.
     DeleteCurrentThread,
 
-    /// Fork the current session into a new thread.
-    ForkCurrentSession,
+    /// Fork the current session into a new thread, optionally assigning it a name.
+    ForkCurrentSession {
+        name: Option<String>,
+    },
 
     /// Branch before a selected prompt and reopen it in the new thread's composer.
     ForkSessionForPromptEdit {
@@ -292,9 +313,6 @@ pub(crate) enum AppEvent {
     /// escape hatch that skips shutdown and may drop in-flight work (e.g.,
     /// background tasks, rollout flush, or child process cleanup).
     Exit(ExitMode),
-
-    /// Request app-server account logout, then exit after it succeeds.
-    Logout,
 
     /// Request to exit the application due to a fatal error.
     #[allow(dead_code)]
@@ -359,7 +377,7 @@ pub(crate) enum AppEvent {
     /// Result of refreshing rate limits.
     RateLimitsLoaded {
         origin: RateLimitRefreshOrigin,
-        hard_stop_generation: u64,
+        update_generation: u64,
         result: Result<GetAccountRateLimitsResponse, String>,
     },
 
@@ -747,6 +765,12 @@ pub(crate) enum AppEvent {
     /// finalization.
     ConsolidateProposedPlan(String),
 
+    /// Replace the contiguous run of streaming `ReasoningStreamCell`s at the end
+    /// of the transcript with a single source-backed `ReasoningMarkdownCell` so
+    /// finalized live reasoning re-wraps on resize. Carries the full reasoning
+    /// markdown source. Emitted by `ChatWidget::finalize_reasoning_stream`.
+    ConsolidateReasoning(String),
+
     StartCommitAnimation,
     StopCommitAnimation,
     CommitTick,
@@ -1102,6 +1126,7 @@ pub(crate) enum AppEvent {
         context: String,
         action: String,
         intent: KeymapEditIntent,
+        capture_mode: KeymapCaptureMode,
     },
 
     /// Open the keymap keypress inspector.

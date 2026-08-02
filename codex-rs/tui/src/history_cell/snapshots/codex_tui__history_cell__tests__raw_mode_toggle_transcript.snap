@@ -7,13 +7,13 @@ rich before:
 › Please format this
   for copying
 
-• - first item
+› - first item
   - second item
-  
+
    Col     Value
   ━━━━━━  ━━━━━━━
    code    x = 1
-  
+
   copy me
 • Called
   └ workspace.inspect({"path":"README.md
@@ -34,22 +34,23 @@ for copying
 ```text
 copy me
 ```
-Called workspace.inspect({"path":"README.md"})
+$ workspace.inspect({"path":"README.md"})
 structured output
 second line
+✓ · 5ms
 
 rich after:
 
 › Please format this
   for copying
 
-• - first item
+› - first item
   - second item
-  
+
    Col     Value
   ━━━━━━  ━━━━━━━
    code    x = 1
-  
+
   copy me
 • Called
   └ workspace.inspect({"path":"README.md

@@ -1,0 +1,9 @@
+---
+source: tui/src/history_cell/tests.rs
+expression: "rendered.join(\"\\n\")"
+---
+• Ran rg account_status tui/src
+  │ tui/src/status.rs:42
+  └ 2 matches
+
+› The startup status now uses the cached percentage immediately.

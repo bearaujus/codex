@@ -240,6 +240,8 @@ impl ChatWidget {
         self.plan_type = plan_type;
         self.has_chatgpt_account = has_chatgpt_account;
         self.has_codex_backend_auth = has_codex_backend_auth;
+        self.rate_limit_snapshots_by_limit_id.clear();
+        self.rate_limit_full_refresh_pending = has_chatgpt_account;
         self.bottom_pane
             .set_connectors_enabled(self.connectors_enabled());
         self.bottom_pane
@@ -470,6 +472,9 @@ impl ChatWidget {
         self.sync_image_paste_enabled();
         self.sync_service_tier_commands();
         self.refresh_terminal_title();
+        let effort = self.effective_reasoning_effort();
+        self.bottom_pane
+            .set_active_reasoning_effort(effort.as_ref());
     }
 
     /// Refresh every UI surface that depends on the effective model, reasoning

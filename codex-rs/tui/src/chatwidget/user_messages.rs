@@ -10,6 +10,7 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::ops::Deref;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use crate::bottom_pane::LocalImageAttachment;
 use crate::bottom_pane::MentionBinding;
@@ -120,6 +121,28 @@ impl ThreadComposerState {
     }
 }
 
+/// A composer submission held locally during the Undo Send grace window.
+///
+/// The dispatch payload is normalized for the protocol, while
+/// `restore_composer` retains the exact editable draft representation.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum StagedInputRoute {
+    Dispatch,
+    Queue {
+        action: QueuedInputAction,
+        pending_pastes: Vec<(String, String)>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct StagedUserMessage {
+    pub(super) user_message: UserMessage,
+    pub(super) route: StagedInputRoute,
+    pub(super) restore_composer: ThreadComposerState,
+    pub(super) local_history_entry_id: Option<u64>,
+    pub(super) send_at: Instant,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ThreadInputState {
     pub(super) composer: Option<ThreadComposerState>,
@@ -131,6 +154,7 @@ pub(crate) struct ThreadInputState {
     pub(super) rejected_steer_history_records: VecDeque<UserMessageHistoryRecord>,
     pub(super) queued_user_messages: VecDeque<QueuedUserMessage>,
     pub(super) queued_user_message_history_records: VecDeque<UserMessageHistoryRecord>,
+    pub(super) staged_user_messages: VecDeque<StagedUserMessage>,
     pub(super) user_turn_pending_start: bool,
     pub(super) submit_pending_steers_after_interrupt: bool,
     pub(super) current_collaboration_mode: CollaborationMode,

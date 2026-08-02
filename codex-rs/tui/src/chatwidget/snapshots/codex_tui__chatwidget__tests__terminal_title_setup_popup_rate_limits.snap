@@ -1,5 +1,6 @@
 ---
 source: tui/src/chatwidget/tests/status_surface_previews.rs
+assertion_line: 355
 expression: terminal_title_popup_snapshot(&mut chat)
 ---
   Configure Terminal Title

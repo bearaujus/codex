@@ -15,55 +15,6 @@ use codex_keyring_store::tests::MockKeyringStore;
 use keyring::Error as KeyringError;
 
 #[tokio::test]
-async fn file_storage_load_returns_auth_dot_json() -> anyhow::Result<()> {
-    let codex_home = tempdir()?;
-    let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
-    let auth_dot_json = AuthDotJson {
-        auth_mode: Some(AuthMode::ApiKey),
-        openai_api_key: Some("test-key".to_string()),
-        tokens: None,
-        last_refresh: Some(Utc::now()),
-        agent_identity: None,
-        personal_access_token: None,
-        bedrock_api_key: None,
-    };
-
-    storage
-        .save(&auth_dot_json)
-        .context("failed to save auth file")?;
-
-    let loaded = storage.load().context("failed to load auth file")?;
-    assert_eq!(Some(auth_dot_json), loaded);
-    Ok(())
-}
-
-#[tokio::test]
-async fn file_storage_save_persists_auth_dot_json() -> anyhow::Result<()> {
-    let codex_home = tempdir()?;
-    let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
-    let auth_dot_json = AuthDotJson {
-        auth_mode: Some(AuthMode::ApiKey),
-        openai_api_key: Some("test-key".to_string()),
-        tokens: None,
-        last_refresh: Some(Utc::now()),
-        agent_identity: None,
-        personal_access_token: None,
-        bedrock_api_key: None,
-    };
-
-    let file = get_auth_file(codex_home.path());
-    storage
-        .save(&auth_dot_json)
-        .context("failed to save auth file")?;
-
-    let same_auth_dot_json = storage
-        .try_read_auth_json(&file)
-        .context("failed to read auth file after save")?;
-    assert_eq!(auth_dot_json, same_auth_dot_json);
-    Ok(())
-}
-
-#[tokio::test]
 async fn file_storage_round_trips_agent_identity_auth() -> anyhow::Result<()> {
     let codex_home = tempdir()?;
     let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
@@ -78,12 +29,10 @@ async fn file_storage_round_trips_agent_identity_auth() -> anyhow::Result<()> {
     }));
     let auth_dot_json = AuthDotJson {
         auth_mode: Some(AuthMode::AgentIdentity),
-        openai_api_key: None,
         tokens: None,
+        pool_account_id: None,
         last_refresh: None,
         agent_identity: Some(AgentIdentityStorage::Jwt(agent_identity)),
-        personal_access_token: None,
-        bedrock_api_key: None,
     };
 
     storage.save(&auth_dot_json)?;
@@ -109,12 +58,10 @@ async fn file_storage_round_trips_registered_agent_identity_auth() -> anyhow::Re
     };
     let auth_dot_json = AuthDotJson {
         auth_mode: Some(AuthMode::Chatgpt),
-        openai_api_key: None,
         tokens: None,
         last_refresh: None,
         agent_identity: Some(AgentIdentityStorage::Record(record)),
-        personal_access_token: None,
-        bedrock_api_key: None,
+        pool_account_id: None,
     };
 
     storage.save(&auth_dot_json)?;
@@ -151,7 +98,6 @@ async fn file_storage_loads_empty_agent_identity_email_as_none() -> anyhow::Resu
         loaded,
         Some(AuthDotJson {
             auth_mode: Some(AuthMode::Chatgpt),
-            openai_api_key: None,
             tokens: None,
             last_refresh: None,
             agent_identity: Some(AgentIdentityStorage::Record(AgentIdentityAuthRecord {
@@ -164,8 +110,7 @@ async fn file_storage_loads_empty_agent_identity_email_as_none() -> anyhow::Resu
                 chatgpt_account_is_fedramp: false,
                 task_id: None,
             })),
-            personal_access_token: None,
-            bedrock_api_key: None,
+            pool_account_id: None,
         })
     );
     Ok(())
@@ -177,7 +122,6 @@ async fn file_storage_writes_missing_agent_identity_email_as_empty_string() -> a
     let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
     let auth_dot_json = AuthDotJson {
         auth_mode: Some(AuthMode::Chatgpt),
-        openai_api_key: None,
         tokens: None,
         last_refresh: None,
         agent_identity: Some(AgentIdentityStorage::Record(AgentIdentityAuthRecord {
@@ -190,8 +134,7 @@ async fn file_storage_writes_missing_agent_identity_email_as_empty_string() -> a
             chatgpt_account_is_fedramp: false,
             task_id: None,
         })),
-        personal_access_token: None,
-        bedrock_api_key: None,
+        pool_account_id: None,
     };
 
     storage.save(&auth_dot_json)?;
@@ -200,27 +143,6 @@ async fn file_storage_writes_missing_agent_identity_email_as_empty_string() -> a
     let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(auth_file)?)?;
     assert_eq!(saved["agent_identity"]["email"], "");
     assert_eq!(storage.load()?, Some(auth_dot_json));
-    Ok(())
-}
-
-#[tokio::test]
-async fn file_storage_round_trips_personal_access_token_auth() -> anyhow::Result<()> {
-    let codex_home = tempdir()?;
-    let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
-    let auth_dot_json = AuthDotJson {
-        auth_mode: Some(AuthMode::PersonalAccessToken),
-        openai_api_key: None,
-        tokens: None,
-        last_refresh: None,
-        agent_identity: None,
-        personal_access_token: Some("at-example".to_string()),
-        bedrock_api_key: None,
-    };
-
-    storage.save(&auth_dot_json)?;
-
-    let loaded = storage.load()?;
-    assert_eq!(Some(auth_dot_json), loaded);
     Ok(())
 }
 
@@ -252,62 +174,6 @@ async fn file_storage_loads_agent_identity_as_jwt() -> anyhow::Result<()> {
         loaded.expect("auth should load").agent_identity,
         Some(AgentIdentityStorage::Jwt(agent_identity_jwt))
     );
-    Ok(())
-}
-
-#[test]
-fn file_storage_delete_removes_auth_file() -> anyhow::Result<()> {
-    let dir = tempdir()?;
-    let auth_dot_json = AuthDotJson {
-        auth_mode: Some(AuthMode::ApiKey),
-        openai_api_key: Some("sk-test-key".to_string()),
-        tokens: None,
-        last_refresh: None,
-        agent_identity: None,
-        personal_access_token: None,
-        bedrock_api_key: None,
-    };
-    let storage = create_auth_storage(
-        dir.path().to_path_buf(),
-        AuthCredentialsStoreMode::File,
-        AuthKeyringBackendKind::default(),
-    );
-    storage.save(&auth_dot_json)?;
-    assert!(dir.path().join("auth.json").exists());
-    let storage = FileAuthStorage::new(dir.path().to_path_buf());
-    let removed = storage.delete()?;
-    assert!(removed);
-    assert!(!dir.path().join("auth.json").exists());
-    Ok(())
-}
-
-#[test]
-fn ephemeral_storage_save_load_delete_is_in_memory_only() -> anyhow::Result<()> {
-    let dir = tempdir()?;
-    let storage = create_auth_storage(
-        dir.path().to_path_buf(),
-        AuthCredentialsStoreMode::Ephemeral,
-        AuthKeyringBackendKind::default(),
-    );
-    let auth_dot_json = AuthDotJson {
-        auth_mode: Some(AuthMode::ApiKey),
-        openai_api_key: Some("sk-ephemeral".to_string()),
-        tokens: None,
-        last_refresh: Some(Utc::now()),
-        agent_identity: None,
-        personal_access_token: None,
-        bedrock_api_key: None,
-    };
-
-    storage.save(&auth_dot_json)?;
-    let loaded = storage.load()?;
-    assert_eq!(Some(auth_dot_json), loaded);
-
-    let removed = storage.delete()?;
-    assert!(removed);
-    let loaded = storage.load()?;
-    assert_eq!(None, loaded);
-    assert!(!get_auth_file(dir.path()).exists());
     Ok(())
 }
 
@@ -418,18 +284,16 @@ fn id_token_with_prefix(prefix: &str) -> IdTokenInfo {
 
 fn auth_with_prefix(prefix: &str) -> AuthDotJson {
     AuthDotJson {
-        auth_mode: Some(AuthMode::ApiKey),
-        openai_api_key: Some(format!("{prefix}-api-key")),
+        auth_mode: Some(AuthMode::Chatgpt),
         tokens: Some(TokenData {
             id_token: id_token_with_prefix(prefix),
             access_token: format!("{prefix}-access"),
             refresh_token: format!("{prefix}-refresh"),
             account_id: Some(format!("{prefix}-account-id")),
         }),
+        pool_account_id: Some(format!("{prefix}-account-id")),
         last_refresh: None,
         agent_identity: None,
-        personal_access_token: None,
-        bedrock_api_key: None,
     }
 }
 
@@ -439,30 +303,6 @@ fn jwt_with_payload(payload: serde_json::Value) -> String {
     let payload_b64 = encode(&serde_json::to_vec(&payload).expect("payload should serialize"));
     let signature_b64 = encode(b"sig");
     format!("{header_b64}.{payload_b64}.{signature_b64}")
-}
-
-#[test]
-fn secrets_keyring_auth_storage_load_returns_deserialized_auth() -> anyhow::Result<()> {
-    let codex_home = tempdir()?;
-    let mock_keyring = MockKeyringStore::default();
-    let storage = SecretsKeyringAuthStorage::new(
-        codex_home.path().to_path_buf(),
-        Arc::new(mock_keyring.clone()),
-    );
-    let expected = AuthDotJson {
-        auth_mode: Some(AuthMode::ApiKey),
-        openai_api_key: Some("sk-test".to_string()),
-        tokens: None,
-        last_refresh: None,
-        agent_identity: None,
-        personal_access_token: None,
-        bedrock_api_key: None,
-    };
-    seed_secrets_backend_with_auth(&mock_keyring, codex_home.path(), &expected)?;
-
-    let loaded = storage.load()?;
-    assert_eq!(Some(expected), loaded);
-    Ok(())
 }
 
 #[test]
@@ -584,17 +424,15 @@ fn secrets_keyring_auth_storage_save_persists_and_removes_fallback_file() -> any
     std::fs::write(&auth_file, "stale")?;
     let auth = AuthDotJson {
         auth_mode: Some(AuthMode::Chatgpt),
-        openai_api_key: None,
         tokens: Some(TokenData {
             id_token: Default::default(),
             access_token: "access".to_string(),
             refresh_token: "refresh".to_string(),
             account_id: Some("account".to_string()),
         }),
+        pool_account_id: Some("account".to_string()),
         last_refresh: Some(Utc::now()),
         agent_identity: None,
-        personal_access_token: None,
-        bedrock_api_key: None,
     };
 
     storage.save(&auth)?;

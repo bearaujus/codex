@@ -9,7 +9,11 @@ use crate::branch_summary;
 use crate::chatwidget::limit_label_for_window;
 use crate::chatwidget::rate_limits::get_limits_duration;
 use crate::legacy_core::config::Config;
+use crate::status::RATE_LIMIT_STALE_THRESHOLD_MINUTES;
 use crate::status::format_tokens_compact;
+use chrono::Duration as ChronoDuration;
+use chrono::Local;
+use chrono::Utc;
 use codex_app_server_protocol::AskForApproval;
 use codex_config::ConfigLayerSource;
 use codex_protocol::config_types::ApprovalsReviewer;
@@ -32,6 +36,11 @@ pub(super) const TERMINAL_TITLE_SPINNER_INTERVAL: Duration = Duration::from_mill
 
 /// Time between action-required blink phases in the terminal title.
 const TERMINAL_TITLE_ACTION_REQUIRED_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How often a rate-limit reset countdown in the terminal title is recomputed
+/// while the UI is idle. The countdown renders minute-scale values, so a short
+/// interval keeps it visibly ticking without waiting up to a full minute.
+const RATE_LIMIT_COUNTDOWN_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Prefix shown in the terminal title when the agent is blocked on user input.
 const TERMINAL_TITLE_ACTION_REQUIRED_PREFIX: &str = "[ ! ] Action Required";
@@ -85,6 +94,77 @@ pub(super) struct CachedProjectRootName {
 }
 
 impl ChatWidget {
+    fn rate_limit_snapshot_is_stale(snapshot: &RateLimitSnapshotDisplay) -> bool {
+        Local::now().signed_duration_since(snapshot.captured_at)
+            > ChronoDuration::minutes(RATE_LIMIT_STALE_THRESHOLD_MINUTES)
+    }
+
+    fn five_hour_limit_status_text(&self) -> Option<String> {
+        let snapshot = self.rate_limit_snapshots_by_limit_id.get("codex")?;
+        let (window, is_secondary) = five_hour_status_window(snapshot)?;
+        let label = limit_label_for_window(window.window_minutes, is_secondary);
+        if Self::rate_limit_snapshot_is_stale(snapshot) {
+            return Some(format!("{label} stale"));
+        }
+        self.status_line_limit_display(Some(window), &label)
+    }
+
+    fn weekly_limit_status_text(&self) -> Option<String> {
+        let snapshot = self.rate_limit_snapshots_by_limit_id.get("codex")?;
+        let (window, is_secondary) = weekly_status_window(snapshot)?;
+        let label = limit_label_for_window(window.window_minutes, is_secondary);
+        if Self::rate_limit_snapshot_is_stale(snapshot) {
+            return Some(format!("{label} stale"));
+        }
+        self.status_line_limit_display(Some(window), &label)
+    }
+
+    fn status_line_account_status(&self) -> Option<String> {
+        let available_snapshots = self
+            .rate_limit_snapshots_by_limit_id
+            .values()
+            .filter(|snapshot| snapshot.primary.is_some() || snapshot.secondary.is_some())
+            .collect::<Vec<_>>();
+        let limits_stale = !available_snapshots.is_empty()
+            && available_snapshots
+                .iter()
+                .all(|snapshot| Self::rate_limit_snapshot_is_stale(snapshot));
+        let remaining = available_snapshots
+            .into_iter()
+            .filter(|snapshot| !Self::rate_limit_snapshot_is_stale(snapshot))
+            .flat_map(|snapshot| [snapshot.primary.as_ref(), snapshot.secondary.as_ref()])
+            .flatten()
+            .map(|window| (100.0f64 - window.used_percent).clamp(0.0f64, 100.0f64))
+            .filter(|remaining| remaining.is_finite())
+            .min_by(f64::total_cmp);
+
+        let base = self
+            .status_account_display
+            .as_ref()
+            .map(|display| match display {
+                StatusAccountDisplay::ChatGpt { email, plan } => email
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .or_else(|| {
+                        plan.as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                    })
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "ChatGPT".to_string()),
+            });
+
+        match (base, remaining, limits_stale) {
+            (Some(base), Some(remaining), _) => Some(format!("{base} ({remaining:.0}%)")),
+            (Some(base), None, true) => Some(format!("{base} (stale)")),
+            (Some(base), None, false) => Some(base),
+            (None, Some(remaining), _) => Some(format!("{remaining:.0}% left")),
+            (None, None, true) => Some("limits stale".to_string()),
+            (None, None, false) => None,
+        }
+    }
+
     fn status_surface_selections(&self) -> StatusSurfaceSelections {
         let (status_line_items, invalid_status_line_items) = self.status_line_items_with_invalids();
         let (terminal_title_items, invalid_terminal_title_items) =
@@ -202,6 +282,66 @@ impl ChatWidget {
         self.set_status_line_hyperlink(hyperlink_url);
     }
 
+    /// Keep selected terminal-title rate-limit countdowns live while the UI is otherwise idle.
+    ///
+    /// Recomputing the surfaces is what actually advances the "↻ 4h59m" text — a
+    /// bare scheduled frame would only re-blit the cached title. So arm
+    /// `rate_limit_countdown_refresh_due` and schedule the wake-up frame that
+    /// drives the tick; `pre_draw_tick` calls back into `refresh_status_surfaces`
+    /// (which re-arms the timer) when it elapses.
+    ///
+    /// The compact account status line deliberately omits reset copy, so only selected 5h/weekly
+    /// terminal-title items can require this timer.
+    fn arm_rate_limit_countdown_timer(&mut self, selections: &StatusSurfaceSelections) {
+        if self.selected_terminal_title_has_visible_rate_limit_countdown(selections) {
+            self.rate_limit_countdown_refresh_due =
+                Some(Instant::now() + RATE_LIMIT_COUNTDOWN_REFRESH_INTERVAL);
+            self.frame_requester
+                .schedule_frame_in(RATE_LIMIT_COUNTDOWN_REFRESH_INTERVAL);
+        } else {
+            self.rate_limit_countdown_refresh_due = None;
+        }
+    }
+
+    /// Recompute the status surfaces if the rate-limit countdown timer has elapsed.
+    ///
+    /// Called from `pre_draw_tick` before every render. Recomputing (rather than
+    /// just redrawing) is required because the countdown string is baked into the
+    /// cached title; this is what keeps "↻ 4h59m" ticking down while idle.
+    pub(super) fn tick_rate_limit_countdown(&mut self) {
+        if let Some(due) = self.rate_limit_countdown_refresh_due
+            && Instant::now() >= due
+        {
+            // refresh_status_surfaces re-arms `rate_limit_countdown_refresh_due`
+            // (or clears it), so this cannot spin.
+            self.refresh_status_surfaces();
+        }
+    }
+
+    fn selected_terminal_title_has_visible_rate_limit_countdown(
+        &self,
+        selections: &StatusSurfaceSelections,
+    ) -> bool {
+        let Some(snapshot) = self.rate_limit_snapshots_by_limit_id.get("codex") else {
+            return false;
+        };
+        let now = Utc::now();
+        selections.terminal_title_items.iter().any(|item| {
+            let window = match item {
+                TerminalTitleItem::FiveHourLimit => {
+                    five_hour_status_window(snapshot).map(|(window, _)| window)
+                }
+                TerminalTitleItem::WeeklyLimit => {
+                    weekly_status_window(snapshot).map(|(window, _)| window)
+                }
+                _ => None,
+            };
+            window
+                .and_then(|window| window.resets_at_utc)
+                .is_some_and(|resets_at| resets_at > now)
+        })
+    }
+
     /// Clears the terminal title Codex most recently wrote, if any.
     ///
     /// This does not attempt to restore the shell or terminal's previous title;
@@ -281,6 +421,7 @@ impl ChatWidget {
         self.sync_status_surface_shared_state(&selections);
         self.refresh_status_line_from_selections(&selections);
         self.refresh_terminal_title_from_selections(&selections);
+        self.arm_rate_limit_countdown_timer(&selections);
     }
 
     /// Recomputes and emits the terminal title from config and runtime state.
@@ -400,8 +541,15 @@ impl ChatWidget {
     /// Parses configured status-line ids into known items and collects unknown ids.
     ///
     /// Unknown ids are deduplicated in insertion order for warning messages.
-    fn status_line_items_with_invalids(&self) -> (Vec<StatusLineItem>, Vec<String>) {
-        parse_items_with_invalids(self.configured_status_line_items())
+    pub(super) fn status_line_items_with_invalids(&self) -> (Vec<StatusLineItem>, Vec<String>) {
+        let (items, invalid) = parse_items_with_invalids(self.configured_status_line_items());
+        let mut unique_items = Vec::new();
+        for item in items {
+            if !unique_items.contains(&item) {
+                unique_items.push(item);
+            }
+        }
+        (unique_items, invalid)
     }
 
     pub(super) fn configured_status_line_items(&self) -> Vec<String> {
@@ -695,38 +843,27 @@ impl ChatWidget {
             }
             StatusLineItem::ContextRemaining => self
                 .status_line_context_remaining_percent()
-                .map(|remaining| format!("Context {remaining}% left")),
+                .map(|remaining| format!("ctx {remaining}% left")),
             StatusLineItem::ContextUsed => self
                 .status_line_context_used_percent()
-                .map(|used| format!("Context {used}% used")),
-            StatusLineItem::FiveHourLimit => {
-                let (window, is_secondary) = self
-                    .rate_limit_snapshots_by_limit_id
-                    .get("codex")
-                    .and_then(five_hour_status_window)?;
-                let label = limit_label_for_window(window.window_minutes, is_secondary);
-                self.status_line_limit_display(Some(window), &label)
-            }
-            StatusLineItem::WeeklyLimit => {
-                let (window, is_secondary) = self
-                    .rate_limit_snapshots_by_limit_id
-                    .get("codex")
-                    .and_then(weekly_status_window)?;
-                let label = limit_label_for_window(window.window_minutes, is_secondary);
-                self.status_line_limit_display(Some(window), &label)
-            }
+                .map(|used| format!("ctx {used}% used")),
+            StatusLineItem::AccountStatus => self.status_line_account_status(),
             StatusLineItem::CodexVersion => Some(CODEX_CLI_VERSION.to_string()),
             StatusLineItem::ContextWindowSize => self
                 .status_line_context_window_size()
                 .map(|cws| format!("{} window", format_tokens_compact(cws))),
-            StatusLineItem::TotalInputTokens => Some(format!(
-                "{} in",
-                format_tokens_compact(self.status_line_total_usage().input_tokens)
-            )),
-            StatusLineItem::TotalOutputTokens => Some(format!(
-                "{} out",
-                format_tokens_compact(self.status_line_total_usage().output_tokens)
-            )),
+            StatusLineItem::TotalInputTokens => self.token_info.as_ref().map(|info| {
+                format!(
+                    "{} in",
+                    format_tokens_compact(info.total_token_usage.input_tokens)
+                )
+            }),
+            StatusLineItem::TotalOutputTokens => self.token_info.as_ref().map(|info| {
+                format!(
+                    "{} out",
+                    format_tokens_compact(info.total_token_usage.output_tokens)
+                )
+            }),
             StatusLineItem::SessionId => self.thread_id.map(|id| id.to_string()),
             StatusLineItem::FastMode => Some(
                 if self.current_service_tier() == Some(ServiceTier::Fast.request_value()) {
@@ -778,8 +915,17 @@ impl ChatWidget {
             StatusSurfacePreviewItem::ApprovalMode => StatusLineItem::ApprovalMode,
             StatusSurfacePreviewItem::ContextRemaining => StatusLineItem::ContextRemaining,
             StatusSurfacePreviewItem::ContextUsed => StatusLineItem::ContextUsed,
-            StatusSurfacePreviewItem::FiveHourLimit => StatusLineItem::FiveHourLimit,
-            StatusSurfacePreviewItem::WeeklyLimit => StatusLineItem::WeeklyLimit,
+            StatusSurfacePreviewItem::AccountStatus => StatusLineItem::AccountStatus,
+            StatusSurfacePreviewItem::FiveHourLimit => {
+                return self.terminal_title_value_for_item(
+                    TerminalTitleItem::FiveHourLimit,
+                    Instant::now(),
+                );
+            }
+            StatusSurfacePreviewItem::WeeklyLimit => {
+                return self
+                    .terminal_title_value_for_item(TerminalTitleItem::WeeklyLimit, Instant::now());
+            }
             StatusSurfacePreviewItem::CodexVersion => StatusLineItem::CodexVersion,
             StatusSurfacePreviewItem::ContextWindowSize => StatusLineItem::ContextWindowSize,
             StatusSurfacePreviewItem::UsedTokens => StatusLineItem::UsedTokens,
@@ -826,10 +972,10 @@ impl ChatWidget {
                 .status_line_value_for_item(StatusLineItem::ContextUsed)
                 .map(|value| Self::truncate_terminal_title_part(value, /*max_chars*/ 32)),
             TerminalTitleItem::FiveHourLimit => self
-                .status_line_value_for_item(StatusLineItem::FiveHourLimit)
+                .five_hour_limit_status_text()
                 .map(|value| Self::truncate_terminal_title_part(value, /*max_chars*/ 32)),
             TerminalTitleItem::WeeklyLimit => self
-                .status_line_value_for_item(StatusLineItem::WeeklyLimit)
+                .weekly_limit_status_text()
                 .map(|value| Self::truncate_terminal_title_part(value, /*max_chars*/ 32)),
             TerminalTitleItem::CodexVersion => self
                 .status_line_value_for_item(StatusLineItem::CodexVersion)

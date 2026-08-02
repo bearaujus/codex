@@ -74,7 +74,7 @@ impl ChatWidget {
                 self.handle_item_completed_notification(notification, replay_kind);
             }
             ServerNotification::AgentMessageDelta(notification) => {
-                self.on_agent_message_delta(notification.delta);
+                self.on_agent_message_delta_for_item(notification.item_id, notification.delta);
             }
             ServerNotification::PlanDelta(notification) => self.on_plan_delta(notification.delta),
             ServerNotification::ReasoningSummaryTextDelta(notification) => {
@@ -243,12 +243,43 @@ impl ChatWidget {
         self.last_rendered_user_message_display = None;
         match notification.turn.status {
             TurnStatus::Completed => {
+                let last_agent_message =
+                    notification
+                        .turn
+                        .items
+                        .iter()
+                        .rev()
+                        .find_map(|item| match item {
+                            ThreadItem::AgentMessage {
+                                id,
+                                text,
+                                phase: Some(MessagePhase::FinalAnswer) | None,
+                                ..
+                            } => Some((item.clone(), id.clone(), text.clone())),
+                            _ => None,
+                        });
+                if let Some((item, id, _)) = &last_agent_message
+                    && self
+                        .transcript
+                        .last_completed_agent_message
+                        .as_ref()
+                        .is_none_or(|(turn_id, item_id)| {
+                            turn_id != &notification.turn.id || item_id != id
+                        })
+                {
+                    self.handle_thread_item(
+                        item.clone(),
+                        notification.turn.id.clone(),
+                        replay_kind
+                            .map_or(ThreadItemRenderSource::Live, ThreadItemRenderSource::Replay),
+                    );
+                }
                 self.last_non_retry_error = None;
                 self.on_task_complete(
-                    /*last_agent_message*/ None,
+                    last_agent_message.map(|(_, _, text)| text),
                     notification.turn.duration_ms,
                     replay_kind.is_some(),
-                )
+                );
             }
             TurnStatus::Interrupted => {
                 self.last_non_retry_error = None;
@@ -298,6 +329,9 @@ impl ChatWidget {
             }
             ThreadItem::ImageGeneration(_) => {
                 self.on_image_generation_begin();
+            }
+            ThreadItem::AgentMessage { id, phase, .. } => {
+                self.on_agent_message_item_started(id, phase);
             }
             ThreadItem::CollabAgentToolCall {
                 id,

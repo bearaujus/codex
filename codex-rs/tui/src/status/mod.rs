@@ -24,6 +24,7 @@ pub(crate) use helpers::compose_agents_summary;
 pub(crate) use helpers::format_directory_display;
 pub(crate) use helpers::format_tokens_compact;
 pub(crate) use helpers::plan_type_display_name;
+pub(crate) use rate_limits::RATE_LIMIT_STALE_THRESHOLD_MINUTES;
 pub(crate) use rate_limits::RateLimitSnapshotDisplay;
 pub(crate) use rate_limits::RateLimitWindowDisplay;
 #[cfg(test)]

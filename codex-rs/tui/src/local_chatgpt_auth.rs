@@ -26,7 +26,7 @@ pub(crate) fn load_local_chatgpt_auth(
     )
     .map_err(|err| format!("failed to load local auth: {err}"))?
     .ok_or_else(|| "no local auth available".to_string())?;
-    if matches!(auth.auth_mode, Some(AuthMode::ApiKey)) || auth.openai_api_key.is_some() {
+    if !matches!(auth.auth_mode, Some(AuthMode::Chatgpt)) || auth.tokens.is_none() {
         return Err("local auth is not a ChatGPT login".to_string());
     }
 
@@ -65,7 +65,6 @@ mod tests {
     use base64::Engine;
     use chrono::Utc;
     use codex_login::AuthDotJson;
-    use codex_login::auth::login_with_chatgpt_auth_tokens;
     use codex_login::save_auth;
     use codex_login::token_data::TokenData;
     use codex_protocol::auth::AuthMode;
@@ -104,7 +103,6 @@ mod tests {
         let access_token = fake_jwt("user@example.com", "workspace-1", plan_type);
         let auth = AuthDotJson {
             auth_mode: Some(AuthMode::Chatgpt),
-            openai_api_key: None,
             tokens: Some(TokenData {
                 id_token: codex_login::token_data::parse_chatgpt_jwt_claims(&id_token)
                     .expect("id token should parse"),
@@ -112,10 +110,9 @@ mod tests {
                 refresh_token: "refresh-token".to_string(),
                 account_id: Some("workspace-1".to_string()),
             }),
+            pool_account_id: None,
             last_refresh: Some(Utc::now()),
             agent_identity: None,
-            personal_access_token: None,
-            bedrock_api_key: None,
         };
         save_auth(
             codex_home,
@@ -158,55 +155,30 @@ mod tests {
     }
 
     #[test]
-    fn rejects_api_key_auth() {
+    fn rejects_auth_without_chatgpt_tokens() {
         let codex_home = TempDir::new().expect("tempdir");
         save_auth(
             codex_home.path(),
             &AuthDotJson {
-                auth_mode: Some(AuthMode::ApiKey),
-                openai_api_key: Some("sk-test".to_string()),
+                auth_mode: Some(AuthMode::AgentIdentity),
                 tokens: None,
+                pool_account_id: None,
                 last_refresh: None,
                 agent_identity: None,
-                personal_access_token: None,
-                bedrock_api_key: None,
             },
             AuthCredentialsStoreMode::File,
             AuthKeyringBackendKind::default(),
         )
-        .expect("api key auth should save");
+        .expect("agent identity auth should save");
 
         let err = load_local_chatgpt_auth(
             codex_home.path(),
             AuthCredentialsStoreMode::File,
             /*forced_chatgpt_workspace_id*/ None,
         )
-        .expect_err("api key auth should fail");
+        .expect_err("non-chatgpt auth should fail");
 
         assert_eq!(err, "local auth is not a ChatGPT login");
-    }
-
-    #[test]
-    fn prefers_managed_auth_over_external_ephemeral_tokens() {
-        let codex_home = TempDir::new().expect("tempdir");
-        write_chatgpt_auth(codex_home.path(), "business");
-        login_with_chatgpt_auth_tokens(
-            codex_home.path(),
-            &fake_jwt("user@example.com", "workspace-2", "enterprise"),
-            "workspace-2",
-            Some("enterprise"),
-        )
-        .expect("external auth should save");
-
-        let auth = load_local_chatgpt_auth(
-            codex_home.path(),
-            AuthCredentialsStoreMode::File,
-            Some(&["workspace-1".to_string(), "workspace-2".to_string()]),
-        )
-        .expect("managed auth should win");
-
-        assert_eq!(auth.chatgpt_account_id, "workspace-1");
-        assert_eq!(auth.chatgpt_plan_type.as_deref(), Some("business"));
     }
 
     #[test]

@@ -82,14 +82,19 @@ impl ChatWidget {
             .map(|keymap| keymap.chat.clone())
             .unwrap_or_else(|| default_keymap.chat.clone());
         let queued_message_edit_hint_binding = queued_message_edit_hint_binding(
-            &chat_keymap.edit_queued_message,
+            runtime_keymap.as_ref().unwrap_or(&default_keymap),
             current_terminal_info,
+        );
+        let pet_http_client = codex_http_client::RouteAwareClientPool::new(
+            config.http_client_factory(),
+            codex_http_client::ClientRouteClass::Other,
         );
         pets::start_configured_pet_load_if_needed(
             &config,
             /*ambient_pet_missing*/ true,
             frame_requester.clone(),
             app_event_tx.clone(),
+            pet_http_client.clone(),
         );
         let mut widget = Self {
             app_event_tx: app_event_tx.clone(),
@@ -124,6 +129,7 @@ impl ChatWidget {
             remote_connection: None,
             token_info: None,
             rate_limit_snapshots_by_limit_id: BTreeMap::new(),
+            rate_limit_full_refresh_pending: false,
             refreshing_status_outputs: Vec::new(),
             next_status_refresh_request_id: 0,
             refreshing_token_activity_output: None,
@@ -147,6 +153,7 @@ impl ChatWidget {
             adaptive_chunking: AdaptiveChunkingPolicy::default(),
             stream_controller: None,
             plan_stream_controller: None,
+            reasoning_stream_controller: None,
             pending_stream_consolidations: 0,
             clipboard_lease: None,
             copy_last_response_binding,
@@ -179,11 +186,15 @@ impl ChatWidget {
             newly_installed_marketplace_tab_id: None,
             interrupts: InterruptManager::new(),
             reasoning_buffer: String::new(),
+            full_reasoning_buffer: String::new(),
+            live_reasoning_active: false,
+            rate_limit_countdown_refresh_due: None,
             reasoning_header: None,
             reasoning_summary_parts: Vec::new(),
             status_state: StatusState::default(),
             review: ReviewState::default(),
             active_hook_cell: None,
+            pet_http_client,
             ambient_pet: None,
             pet_picker_preview_state: crate::pets::PetPickerPreviewState::default(),
             pet_picker_preview_pet: None,
@@ -203,6 +214,7 @@ impl ChatWidget {
             forked_from: None,
             interrupted_turn_notice_mode: InterruptedTurnNoticeMode::Default,
             input_queue: InputQueueState::default(),
+            undo_send: UndoSendState::default(),
             safety_buffering_prompt: None,
             chat_keymap,
             queued_message_edit_hint_binding,
@@ -268,7 +280,7 @@ impl ChatWidget {
         widget.sync_mentions_v2_enabled();
         widget
             .bottom_pane
-            .set_queued_message_edit_binding(widget.queued_message_edit_hint_binding);
+            .set_queued_message_edit_binding(Some(key_hint::plain(KeyCode::Up).into()));
         #[cfg(target_os = "windows")]
         widget
             .bottom_pane

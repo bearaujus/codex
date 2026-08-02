@@ -69,8 +69,10 @@ pub(crate) const RATE_LIMIT_STALE_THRESHOLD_MINUTES: i64 = 15;
 pub(crate) struct RateLimitWindowDisplay {
     /// Percent used for the window.
     pub used_percent: f64,
-    /// Human-readable local reset time.
+    /// Human-readable local reset time (used by the /status panel).
     pub resets_at: Option<String>,
+    /// Raw UTC reset timestamp for computing live countdowns in the status bar.
+    pub resets_at_utc: Option<DateTime<Utc>>,
     /// Window length in minutes when provided by the server.
     pub window_minutes: Option<i64>,
 }
@@ -79,13 +81,15 @@ impl RateLimitWindowDisplay {
     fn from_window(window: &RateLimitWindow, captured_at: DateTime<Local>) -> Self {
         let resets_at_utc = window
             .resets_at
-            .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0))
-            .map(|dt| dt.with_timezone(&Local));
-        let resets_at = resets_at_utc.map(|dt| format_reset_timestamp(dt, captured_at));
+            .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0));
+        let resets_at = resets_at_utc
+            .map(|dt| dt.with_timezone(&Local))
+            .map(|dt| format_reset_timestamp(dt, captured_at));
 
         Self {
             used_percent: f64::from(window.used_percent),
             resets_at,
+            resets_at_utc,
             window_minutes: window.window_duration_mins,
         }
     }
@@ -429,6 +433,7 @@ mod tests {
         RateLimitWindowDisplay {
             used_percent,
             resets_at: Some("soon".to_string()),
+            resets_at_utc: None,
             window_minutes: Some(300),
         }
     }
@@ -488,11 +493,13 @@ mod tests {
             primary: Some(RateLimitWindowDisplay {
                 used_percent: 20.0,
                 resets_at: Some("soon".to_string()),
+                resets_at_utc: None,
                 window_minutes: Some(60),
             }),
             secondary: Some(RateLimitWindowDisplay {
                 used_percent: 40.0,
                 resets_at: Some("later".to_string()),
+                resets_at_utc: None,
                 window_minutes: Some(2 * 60),
             }),
             credits: None,

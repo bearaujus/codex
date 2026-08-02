@@ -253,12 +253,14 @@ async fn submission_includes_configured_active_permission_profile() {
                         value: FileSystemSpecialPath::Root,
                     },
                     access: FileSystemAccessMode::Read,
+                    missing_path_behavior: None,
                 },
                 FileSystemSandboxEntry {
                     path: FileSystemPath::GlobPattern {
                         pattern: "/home/user/project/secrets/**".to_string(),
                     },
                     access: FileSystemAccessMode::Deny,
+                    missing_path_behavior: None,
                 },
             ],
             glob_scan_max_depth: None,
@@ -690,10 +692,9 @@ async fn submission_prefers_selected_duplicate_skill_path() {
             short_description: None,
             interface: None,
             dependencies: None,
-            policy: None,
-            path_to_skills_md: repo_skill_path,
+            path: repo_skill_path,
             scope: crate::test_support::skill_scope_repo(),
-            plugin_id: None,
+            enabled: true,
         },
         SkillMetadata {
             name: "figma".to_string(),
@@ -701,10 +702,9 @@ async fn submission_prefers_selected_duplicate_skill_path() {
             short_description: None,
             interface: None,
             dependencies: None,
-            policy: None,
-            path_to_skills_md: user_skill_path.clone(),
+            path: user_skill_path.clone(),
             scope: crate::test_support::skill_scope_user(),
-            plugin_id: None,
+            enabled: true,
         },
     ]));
 
@@ -1283,6 +1283,7 @@ async fn restore_thread_input_state_applies_running_state_policy() {
         rejected_steer_history_records: VecDeque::new(),
         queued_user_messages: VecDeque::from([UserMessage::from("already queued").into()]),
         queued_user_message_history_records: VecDeque::from([queued_history.clone()]),
+        staged_user_messages: VecDeque::new(),
         user_turn_pending_start: true,
         submit_pending_steers_after_interrupt: true,
         current_collaboration_mode: chat.current_collaboration_mode.clone(),
@@ -1363,7 +1364,7 @@ async fn restore_thread_input_state_applies_running_state_policy() {
 async fn alt_up_edits_most_recent_queued_message() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.chat_keymap.edit_queued_message = vec![crate::key_hint::alt(KeyCode::Up)];
-    chat.queued_message_edit_hint_binding = Some(crate::key_hint::alt(KeyCode::Up));
+    chat.queued_message_edit_hint_binding = Some(crate::key_hint::alt(KeyCode::Up).into());
     chat.bottom_pane
         .set_queued_message_edit_binding(chat.queued_message_edit_hint_binding);
 
@@ -1393,6 +1394,342 @@ async fn alt_up_edits_most_recent_queued_message() {
         chat.input_queue.queued_user_messages.front().unwrap().text,
         "first queued"
     );
+}
+
+#[tokio::test]
+async fn plain_up_edits_latest_queued_follow_up_only_from_an_empty_composer() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.bottom_pane.set_task_running(/*running*/ true);
+    chat.input_queue
+        .queued_user_messages
+        .push_back(UserMessage::from("queued follow-up").into());
+    chat.refresh_pending_input_preview();
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+
+    assert_eq!(chat.bottom_pane.composer_text(), "queued follow-up");
+    assert!(chat.input_queue.queued_user_messages.is_empty());
+
+    chat.input_queue
+        .queued_user_messages
+        .push_back(UserMessage::from("must stay queued").into());
+    chat.bottom_pane
+        .set_composer_text("new draft".to_string(), Vec::new(), Vec::new());
+    chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+
+    assert_eq!(chat.input_queue.queued_user_messages.len(), 1);
+}
+
+#[tokio::test]
+async fn escape_during_undo_send_restores_exact_draft_and_does_not_interrupt() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.set_undo_send_delay_for_test(Duration::from_secs(5));
+
+    let image_path = PathBuf::from("/tmp/undo-send.png");
+    let image_placeholder = "[Image #1]";
+    let paste_placeholder = "[Pasted Content 5 chars]";
+    let original_text = format!("{image_placeholder} {paste_placeholder}");
+    chat.bottom_pane.set_composer_text(
+        original_text.clone(),
+        vec![TextElement::new(
+            (0..image_placeholder.len()).into(),
+            Some(image_placeholder.to_string()),
+        )],
+        vec![image_path.clone()],
+    );
+    chat.bottom_pane
+        .set_composer_pending_pastes(vec![(paste_placeholder.to_string(), "hello".to_string())]);
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_eq!(chat.input_queue.staged_user_messages.len(), 1);
+    assert!(chat.bottom_pane.composer_is_empty());
+    assert_no_submit_op(&mut op_rx);
+
+    chat.bottom_pane
+        .set_composer_text("newer draft".to_string(), Vec::new(), Vec::new());
+    chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+    assert!(chat.input_queue.staged_user_messages.is_empty());
+    assert_eq!(
+        chat.bottom_pane.composer_text(),
+        format!("{original_text}\nnewer draft")
+    );
+    assert_eq!(
+        chat.bottom_pane.composer_local_image_paths(),
+        vec![image_path]
+    );
+    assert_eq!(
+        chat.bottom_pane.composer_pending_pastes(),
+        vec![(paste_placeholder.to_string(), "hello".to_string())]
+    );
+    assert_no_submit_op(&mut op_rx);
+
+    let rendered = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(!rendered.contains("Sending in"));
+    assert!(!rendered.contains("again to edit previous message"));
+
+    // Undo also removes the provisional local history entry. A later prompt
+    // must remain the oldest recallable entry rather than exposing the
+    // cancelled submission behind it.
+    chat.set_undo_send_delay_for_test(Duration::ZERO);
+    chat.bottom_pane.set_composer_pending_pastes(Vec::new());
+    chat.bottom_pane
+        .set_composer_text("replacement".to_string(), Vec::new(), Vec::new());
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_matches!(next_submit_op(&mut op_rx), Op::UserTurn { .. });
+    chat.bottom_pane
+        .set_composer_text(String::new(), Vec::new(), Vec::new());
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    assert_eq!(chat.bottom_pane.composer_text(), "replacement");
+    chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    assert_eq!(chat.bottom_pane.composer_text(), "replacement");
+}
+
+#[tokio::test]
+async fn escape_during_undo_send_wins_over_vim_and_stays_in_the_composer() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    chat.thread_id = Some(ThreadId::new());
+    chat.set_undo_send_delay_for_test(Duration::from_secs(5));
+    chat.bottom_pane.set_vim_enabled(/*enabled*/ true);
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+    chat.bottom_pane
+        .set_composer_text("hi".to_string(), Vec::new(), Vec::new());
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert!(chat.has_staged_submission());
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+    assert!(chat.should_handle_vim_insert_escape(esc));
+    assert!(chat.bottom_pane.composer_is_empty());
+    assert_no_submit_op(&mut op_rx);
+
+    chat.handle_key_event(esc);
+
+    assert!(!chat.has_staged_submission());
+    assert_eq!(chat.bottom_pane.composer_text(), "hi");
+    assert!(
+        chat.should_handle_vim_insert_escape(esc),
+        "undo must not silently change the editor mode"
+    );
+    let rendered = render_bottom_popup(&chat, /*width*/ 80);
+    assert!(!rendered.contains("Sending in"));
+    assert!(!rendered.contains("again to edit previous message"));
+    assert_no_submit_op(&mut op_rx);
+
+    chat.handle_key_event(esc);
+
+    assert_eq!(chat.bottom_pane.composer_text(), "hi");
+    assert!(!chat.should_handle_vim_insert_escape(esc));
+    assert_no_submit_op(&mut op_rx);
+}
+
+#[tokio::test]
+async fn escape_during_undo_send_wins_over_composer_completion_popup() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.set_undo_send_delay_for_test(Duration::from_secs(5));
+    chat.bottom_pane
+        .set_composer_text("hi".to_string(), Vec::new(), Vec::new());
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    chat.bottom_pane
+        .set_composer_text("/review".to_string(), Vec::new(), Vec::new());
+    assert!(!chat.bottom_pane.no_modal_or_popup_active());
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+    assert!(!chat.has_staged_submission());
+    assert_eq!(chat.bottom_pane.composer_text(), "hi\n/review");
+    assert!(!render_bottom_popup(&chat, /*width*/ 80).contains("Sending in"));
+    assert_no_submit_op(&mut op_rx);
+}
+
+#[tokio::test]
+async fn undo_send_expiry_dispatches_once_and_clears_the_preview_state() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.set_undo_send_delay_for_test(Duration::from_secs(5));
+    chat.bottom_pane
+        .set_composer_text("send after grace".to_string(), Vec::new(), Vec::new());
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let send_at = chat
+        .input_queue
+        .staged_user_messages
+        .front()
+        .expect("expected staged message")
+        .send_at;
+    assert_no_submit_op(&mut op_rx);
+
+    chat.tick_undo_send(send_at);
+
+    assert_matches!(next_submit_op(&mut op_rx), Op::UserTurn { .. });
+    assert!(chat.input_queue.staged_user_messages.is_empty());
+    chat.tick_undo_send(send_at + Duration::from_secs(1));
+    assert_no_submit_op(&mut op_rx);
+}
+
+#[tokio::test]
+async fn undo_send_countdown_refreshes_each_visible_second() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.set_undo_send_delay_for_test(Duration::from_secs(5));
+    chat.bottom_pane
+        .set_composer_text("count me down".to_string(), Vec::new(), Vec::new());
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let send_at = chat
+        .input_queue
+        .staged_user_messages
+        .front()
+        .expect("expected staged message")
+        .send_at;
+
+    for remaining_seconds in (1..=4).rev() {
+        chat.tick_undo_send(send_at - Duration::from_secs(remaining_seconds));
+        let rendered = render_bottom_popup(&chat, /*width*/ 80);
+        assert!(
+            rendered.contains(&format!("Sending in {remaining_seconds}s")),
+            "countdown did not refresh at {remaining_seconds}s:\n{rendered}"
+        );
+        assert_no_submit_op(&mut op_rx);
+    }
+
+    chat.tick_undo_send(send_at);
+    assert_matches!(next_submit_op(&mut op_rx), Op::UserTurn { .. });
+    assert!(!render_bottom_popup(&chat, /*width*/ 80).contains("Sending in"));
+}
+
+#[tokio::test]
+async fn undo_send_keeps_fifo_dispatch_while_escape_restores_only_the_latest_draft() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.set_undo_send_delay_for_test(Duration::from_secs(5));
+
+    chat.bottom_pane
+        .set_composer_text("first message".to_string(), Vec::new(), Vec::new());
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let first_send_at = chat
+        .input_queue
+        .staged_user_messages
+        .front()
+        .expect("expected first staged message")
+        .send_at;
+
+    chat.bottom_pane
+        .set_composer_text("second message".to_string(), Vec::new(), Vec::new());
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(chat.input_queue.staged_user_messages.len(), 2);
+    assert_no_submit_op(&mut op_rx);
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+    assert_eq!(chat.bottom_pane.composer_text(), "second message");
+    assert_eq!(chat.input_queue.staged_user_messages.len(), 1);
+    assert_eq!(
+        chat.input_queue
+            .staged_user_messages
+            .front()
+            .expect("first message should remain staged")
+            .user_message
+            .text,
+        "first message"
+    );
+    assert_no_submit_op(&mut op_rx);
+
+    chat.tick_undo_send(first_send_at);
+
+    assert_matches!(next_submit_op(&mut op_rx), Op::UserTurn { .. });
+    assert!(chat.input_queue.staged_user_messages.is_empty());
+}
+
+#[tokio::test]
+async fn undo_send_grace_window_survives_thread_input_state_restore() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.set_undo_send_delay_for_test(Duration::from_secs(5));
+    chat.bottom_pane.set_composer_text(
+        "survives thread switch".to_string(),
+        Vec::new(),
+        Vec::new(),
+    );
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    let captured = chat
+        .capture_thread_input_state()
+        .expect("thread input state should capture staged messages");
+    let send_at = captured
+        .staged_user_messages
+        .front()
+        .expect("captured staged message")
+        .send_at;
+    chat.restore_thread_input_state(
+        /*input_state*/ None,
+        ThreadInputStateRestoreMode {
+            preserve_in_flight_turn: false,
+        },
+    );
+    assert!(chat.input_queue.staged_user_messages.is_empty());
+
+    chat.restore_thread_input_state(
+        Some(captured),
+        ThreadInputStateRestoreMode {
+            preserve_in_flight_turn: false,
+        },
+    );
+    assert_eq!(chat.input_queue.staged_user_messages.len(), 1);
+    assert_no_submit_op(&mut op_rx);
+
+    chat.tick_undo_send(send_at);
+
+    assert_matches!(next_submit_op(&mut op_rx), Op::UserTurn { .. });
+    assert!(chat.input_queue.staged_user_messages.is_empty());
+}
+
+#[tokio::test]
+async fn running_turn_follow_up_has_undo_grace_then_remains_editable_with_up() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.set_undo_send_delay_for_test(Duration::from_secs(5));
+    chat.bottom_pane.set_task_running(/*running*/ true);
+    chat.bottom_pane
+        .set_composer_text("follow-up draft".to_string(), Vec::new(), Vec::new());
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_eq!(chat.input_queue.staged_user_messages.len(), 1);
+    assert!(chat.input_queue.queued_user_messages.is_empty());
+    assert_no_submit_op(&mut op_rx);
+
+    // Escape belongs to Undo Send during the grace period, not turn interruption.
+    chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert_eq!(chat.bottom_pane.composer_text(), "follow-up draft");
+    assert!(chat.input_queue.staged_user_messages.is_empty());
+    assert_no_submit_op(&mut op_rx);
+
+    // Tab creates a queued follow-up. Enter is a steer and is intentionally
+    // dispatched to the running turn once its Undo Send grace period expires.
+    chat.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    let send_at = chat
+        .input_queue
+        .staged_user_messages
+        .front()
+        .expect("expected staged follow-up")
+        .send_at;
+    chat.tick_undo_send(send_at);
+
+    assert_eq!(chat.input_queue.queued_user_messages.len(), 1);
+    assert_no_submit_op(&mut op_rx);
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+
+    assert_eq!(chat.bottom_pane.composer_text(), "follow-up draft");
+    assert!(chat.input_queue.queued_user_messages.is_empty());
+    assert_no_submit_op(&mut op_rx);
 }
 
 #[tokio::test]
@@ -1463,6 +1800,42 @@ async fn shift_left_edits_most_recent_queued_message_in_tmux() {
 }
 
 #[test]
+fn queued_message_edit_hint_displays_configured_chords() {
+    use codex_config::types::KeybindingSpec;
+    use codex_config::types::KeybindingsSpec;
+    use codex_config::types::TuiKeymap;
+
+    let terminal_info = || TerminalInfo {
+        name: TerminalName::Iterm2,
+        term_program: None,
+        version: None,
+        term: None,
+        multiplexer: None,
+    };
+    let mut config = TuiKeymap::default();
+    config.chat.edit_queued_message = Some(KeybindingsSpec::One(KeybindingSpec(
+        "ctrl-x up".to_string(),
+    )));
+    let keymap = RuntimeKeymap::from_config(&config).expect("valid queued edit chord");
+
+    assert_eq!(
+        queued_message_edit_hint_binding(&keymap, terminal_info()),
+        Some(crate::key_hint::ShortcutHint::Chord {
+            prefix: crate::key_hint::ctrl(KeyCode::Char('x')),
+            completion: crate::key_hint::plain(KeyCode::Up),
+        })
+    );
+
+    let default_keymap = RuntimeKeymap::defaults();
+    assert_eq!(
+        queued_message_edit_hint_binding(&default_keymap, terminal_info()),
+        Some(crate::key_hint::ShortcutHint::Single(crate::key_hint::alt(
+            KeyCode::Up,
+        )))
+    );
+}
+
+#[test]
 fn queued_message_edit_binding_mapping_covers_special_terminals_and_tmux() {
     assert_eq!(
         queued_message_edit_binding_for_terminal(TerminalInfo {
@@ -1516,11 +1889,10 @@ fn queued_message_edit_binding_mapping_covers_special_terminals_and_tmux() {
     );
 }
 
-/// Pressing Up to recall the most recent history entry and immediately queuing
-/// it while a task is running should always enqueue the same text, even when it
-/// is queued repeatedly.
+/// Pressing Up to edit and requeue the latest follow-up repeatedly must not
+/// duplicate or lose that queued message.
 #[tokio::test]
-async fn enqueueing_history_prompt_multiple_times_is_stable() {
+async fn editing_and_requeueing_latest_follow_up_is_stable() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.thread_id = Some(ThreadId::new());
 
@@ -1533,7 +1905,8 @@ async fn enqueueing_history_prompt_multiple_times_is_stable() {
     chat.bottom_pane.set_task_running(/*running*/ true);
 
     for _ in 0..3 {
-        // Recall the prompt from history and ensure it is what we expect.
+        // The first pass recalls history. Later passes edit the most recent
+        // queued follow-up, which is the contextual-Up behavior.
         chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(chat.bottom_pane.composer_text(), "repeat me");
 
@@ -1541,7 +1914,7 @@ async fn enqueueing_history_prompt_multiple_times_is_stable() {
         chat.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
     }
 
-    assert_eq!(chat.input_queue.queued_user_messages.len(), 3);
+    assert_eq!(chat.input_queue.queued_user_messages.len(), 1);
     for message in chat.input_queue.queued_user_messages.iter() {
         assert_eq!(message.text, "repeat me");
     }

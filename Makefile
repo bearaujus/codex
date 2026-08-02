@@ -1,6 +1,6 @@
 .PHONY: build prod release fmt check test lint install run clean
 
-# Build a cheap local codex binary into ./bin for the edit/run loop.
+# Build the fork CLI and prepare its public Code Mode host in ./bin.
 build:
 	powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1 -CargoProfile dev-small
 
@@ -28,15 +28,15 @@ test:
 lint:
 	powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/lint.ps1 $(p) $(args)
 
-# Force a fresh build and install codex onto your user PATH.
-install:
-	powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/install-windows.ps1 -CargoProfile dev-small -ForceBuild
+# Build once, then install the complete executable bundle onto your user PATH.
+install: build
+	powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/install-windows.ps1
 
 # Build + run the local codex binary.
-run:
+run: build
 	powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/run-windows.ps1
 
 # Remove all local build artifacts: the cargo target/ tree (every profile) and
-# the repo-local binary. Frees the bulk of disk; next build is a cold rebuild.
+# the repo-local bundle. Frees the bulk of disk; next build is a cold rebuild.
 clean:
 	powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/clean-repo-artifacts.ps1

@@ -53,7 +53,8 @@ const MILLISECOND_DURATION_BOUNDARIES: &[f64] = &[
 ];
 const SECOND_DURATION_UNIT: &str = "s";
 const SECOND_DURATION_BOUNDARIES: &[f64] = &[
-    0.0, 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0,
+    0.0, 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0, 12.0,
+    15.0, 20.0, 30.0, 60.0, 120.0,
 ];
 
 #[derive(Debug, Eq, Hash, PartialEq)]
@@ -105,6 +106,7 @@ struct MetricsClientInner {
     histograms: Mutex<HashMap<String, Histogram<f64>>>,
     duration_histograms: Mutex<HashMap<InstrumentKey, Histogram<f64>>>,
     runtime_reader: Option<Arc<ManualReader>>,
+    runtime_only_metrics: &'static [&'static str],
     default_tags: BTreeMap<String, String>,
 }
 
@@ -124,6 +126,10 @@ impl MetricsClientInner {
             });
         }
         let attributes = self.attributes(tags)?;
+
+        if self.runtime_only_metrics.contains(&name) {
+            return Ok(());
+        }
 
         let mut counters = self
             .counters
@@ -220,6 +226,10 @@ impl MetricsClientInner {
         validate_metric_name(name)?;
         let attributes = self.attributes(tags)?;
 
+        if self.runtime_only_metrics.contains(&name) {
+            return Ok(());
+        }
+
         let mut histograms = self
             .duration_histograms
             .lock()
@@ -289,6 +299,7 @@ impl MetricsClient {
             exporter,
             export_interval,
             runtime_reader,
+            runtime_only_metrics,
             default_tags,
         } = config;
 
@@ -333,6 +344,7 @@ impl MetricsClient {
             histograms: Mutex::new(HashMap::new()),
             duration_histograms: Mutex::new(HashMap::new()),
             runtime_reader,
+            runtime_only_metrics,
             default_tags,
         })))
     }

@@ -1,64 +1,140 @@
-## Installing & building
+# Installing and building this fork
 
-### System requirements
+Official OpenAI installers, Homebrew, npm, and upstream GitHub release binaries
+install the upstream Codex build. They do not contain this fork's custom
+features. Build this repository from source to run the fork.
 
-| Requirement                 | Details                                                         |
-| --------------------------- | --------------------------------------------------------------- |
-| Operating systems           | macOS 12+, Ubuntu 20.04+/Debian 10+, or Windows 11 **via WSL2** |
-| Git (optional, recommended) | 2.23+ for built-in PR helpers                                   |
-| RAM                         | 4-GB minimum (8-GB recommended)                                 |
+## Supported repository workflow
 
-### DotSlash
+The root `Makefile` invokes `powershell.exe` and Windows-specific helper scripts,
+so the documented fork workflow currently targets native Windows 10 or 11.
+The Rust workspace retains upstream platform-aware code, but this repository
+does not provide equivalent fork install helpers for macOS or Linux.
 
-The GitHub Release also contains a [DotSlash](https://dotslash-cli.com/) file for the Codex CLI named `codex`. Using a DotSlash file makes it possible to make a lightweight commit to source control to ensure all contributors use the same version of an executable, regardless of what platform they use for development.
+## Prerequisites
 
-### Build from source
+- Git
+- [Rustup](https://rustup.rs/) and Cargo
+- Visual Studio 2022 Build Tools with the C++ workload and a Windows SDK
+- GNU Make, available as `make`
+- PowerShell 5.1 or newer
 
-```bash
-# Clone the repository and navigate to the root of the Cargo workspace.
-git clone https://github.com/openai/codex.git
-cd codex/codex-rs
+The workspace pins Rust in
+[`codex-rs/rust-toolchain.toml`](../codex-rs/rust-toolchain.toml), including the
+`clippy` and `rustfmt` components. Some native dependencies may also require
+CMake and LLVM/Clang.
 
-# Install the Rust toolchain, if necessary.
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source "$HOME/.cargo/env"
-rustup component add rustfmt
-rustup component add clippy
-# Install nextest, used by the `make test` helper.
+Install nextest before running normal test targets:
+
+```powershell
 cargo install --locked cargo-nextest
-
-# Build Codex.
-cargo build
-
-# Launch the TUI with a sample prompt.
-cargo run --bin codex -- "explain this codebase to me"
 ```
 
-> **This fork** drives the local loop through the repo-root `Makefile` (backed by
-> `scripts/*.ps1`) instead of the upstream `justfile`. From the repo root:
->
-> ```
-> make fmt                  # format the workspace
-> make check p=codex-tui    # fast compile feedback, scoped to a crate
-> make lint  p=codex-tui    # clippy with deny lints (before committing)
-> make test  p=codex-tui    # run a crate's tests (fastest); omit p= for the full suite
-> ```
->
-> Scope with `p=<crate>` whenever possible — a bare workspace-wide build compiles
-> all ~115 crates (including the very large `v8` dependency) and balloons
-> `target/`. Avoid `--all-features` for routine runs for the same reason.
+Contributors who update TUI snapshots also need `cargo-insta`:
 
-## Tracing / verbose logging
-
-Codex is written in Rust, so it honors the `RUST_LOG` environment variable to configure its logging behavior.
-
-The TUI records diagnostics in bounded local stores by default. Set `log_dir` explicitly to enable a plaintext TUI log for a run:
-
-```bash
-codex -c log_dir=./.codex-log
-tail -F ./.codex-log/codex-tui.log
+```powershell
+cargo install --locked cargo-insta
 ```
 
-The non-interactive mode (`codex exec`) defaults to `RUST_LOG=error`, but messages are printed inline, so there is no need to monitor a separate file.
+## Clone and build
 
-See the Rust documentation on [`RUST_LOG`](https://docs.rs/env_logger/latest/env_logger/#enabling-logging) for more information on the configuration options.
+Run all repository automation from the repository root:
+
+```powershell
+git clone https://github.com/bearaujus/codex.git
+Set-Location codex
+make build
+```
+
+`make build` compiles this fork's `codex-cli` crate with the lightweight
+`dev-small` profile and prepares these repository-local executables:
+
+- `bin\codex.exe`, built from this repository
+- `bin\codex-code-mode-host.exe`, downloaded from the pinned public OpenAI
+  Codex release and verified with its SHA-256 digest
+
+The split is intentional. The upstream Code Mode host links a pointer-compressed,
+sandboxed V8 build published through OpenAI's release pipeline; the normal
+`denoland/rusty_v8` release does not publish that Windows archive. Using the
+verified public host keeps this fork's normal build from compiling V8 while the
+CLI itself still contains all fork changes.
+
+Launch that build directly:
+
+```powershell
+.\bin\codex.exe
+```
+
+Or rebuild and launch it in one step:
+
+```powershell
+make run
+```
+
+## Install on the user `PATH`
+
+```powershell
+make install
+```
+
+The install target depends on `make build`, so Cargo runs once and installation
+only copies the completed bundle. It installs both `codex.exe` and
+`codex-code-mode-host.exe` to `%LOCALAPPDATA%\codex\bin`, then puts that
+directory first on the user `PATH`. Open a new terminal after the first install,
+then verify which binary is active:
+
+```powershell
+Get-Command codex
+codex --version
+Get-Item (Join-Path $env:LOCALAPPDATA 'codex\bin\codex-code-mode-host.exe')
+```
+
+The public host is pinned and checksum-verified by
+[`scripts/prepare-code-mode-host.ps1`](../scripts/prepare-code-mode-host.ps1).
+An already verified download is reused from the user cache. Updating the pin
+should be done together with an upstream merge and a Code Mode compatibility
+check.
+
+## Development loop
+
+Use the root targets instead of invoking `cargo test` directly:
+
+```powershell
+make fmt
+make check p=codex-tui
+make test p=codex-tui
+make lint p=codex-tui
+```
+
+Prefer `p=<crate>` for checks, tests, and linting. The `fmt`, `check`, `test`,
+and `lint` targets also accept `args="<cargo flags>"`. For example:
+
+```powershell
+make test p=codex-login args="--no-run"
+make lint p=codex-tui args="--features foo"
+```
+
+Run lint last after formatting and scoped tests. A workspace-wide build or test
+compiles many crates and should be reserved for changes that require that scope.
+
+Use `make clean` to remove the Cargo target directory and the repository-local
+executable bundle. The verified public-host download remains in the user cache
+so the next build can reuse it.
+
+## Tracing and verbose logging
+
+Codex honors `RUST_LOG`. The TUI stores bounded diagnostics by default; set
+`log_dir` when you need a plaintext log:
+
+```powershell
+codex -c 'log_dir="./.codex-log"'
+```
+
+In a second terminal:
+
+```powershell
+Get-Content .\.codex-log\codex-tui.log -Wait
+```
+
+The non-interactive `codex exec` mode defaults to `RUST_LOG=error` and prints
+messages inline.

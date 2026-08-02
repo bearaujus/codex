@@ -57,7 +57,7 @@ async fn status_command_refresh_updates_cached_limits_for_future_status_outputs(
         other => panic!("expected refreshed status output, got {other:?}"),
     };
     assert!(
-        refreshed.contains("8% left"),
+        refreshed.contains("8%"),
         "expected a future /status output to use refreshed cached limits, got: {refreshed}"
     );
 }

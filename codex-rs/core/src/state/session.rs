@@ -212,6 +212,10 @@ impl SessionState {
         ));
     }
 
+    pub(crate) fn clear_rate_limits(&mut self) {
+        self.latest_rate_limits = None;
+    }
+
     pub(crate) fn token_info_and_rate_limits(
         &self,
     ) -> (Option<TokenUsageInfo>, Option<RateLimitSnapshot>) {

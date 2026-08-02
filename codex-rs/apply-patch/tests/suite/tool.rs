@@ -65,6 +65,40 @@ fn test_apply_patch_cli_applies_multiple_chunks() -> anyhow::Result<()> {
 }
 
 #[test]
+fn test_apply_patch_cli_replaces_entire_file() -> anyhow::Result<()> {
+    let tmp = tempdir()?;
+    let target_path = tmp.path().join("replace.txt");
+    fs::write(&target_path, "before\r\nafter\r\n")?;
+
+    run_apply_patch_in_dir(
+        tmp.path(),
+        "*** Begin Patch\n*** Replace File: replace.txt\n+fresh\n+content\n*** End Patch",
+    )?
+    .success()
+    .stdout("Success. Updated the following files:\nM replace.txt\n");
+
+    assert_eq!(fs::read(&target_path)?, b"fresh\r\ncontent\r\n");
+    Ok(())
+}
+
+#[test]
+fn test_apply_patch_cli_replace_requires_existing_file() -> anyhow::Result<()> {
+    let tmp = tempdir()?;
+    let missing_path = resolved_under(tmp.path(), "missing.txt")?;
+
+    apply_patch_command(tmp.path())?
+        .arg("*** Begin Patch\n*** Replace File: missing.txt\n+hello\n*** End Patch")
+        .assert()
+        .failure()
+        .stderr(format!(
+            "Failed to read file to replace {}: No such file or directory (os error 2)\n",
+            missing_path.display()
+        ));
+
+    Ok(())
+}
+
+#[test]
 fn test_apply_patch_cli_moves_file_to_new_directory() -> anyhow::Result<()> {
     let tmp = tempdir()?;
     let original_path = tmp.path().join("old/name.txt");
@@ -109,11 +143,28 @@ fn test_apply_patch_cli_reports_missing_context() -> anyhow::Result<()> {
         .assert()
         .failure()
         .stderr(format!(
-            "Failed to find expected lines in {}:\nmissing\n",
+            "Failed to find expected lines in {}:\nmissing\nThis usually means the file changed since the patch was drafted or was edited earlier in the turn. Re-read the live file and retry with current context.\nNearby live lines from line 1:\n1| line1\n2| line2\n",
             expected_target_path.display()
         ));
     assert_eq!(fs::read_to_string(&target_path)?, "line1\nline2\n");
 
+    Ok(())
+}
+
+#[test]
+fn test_apply_patch_cli_stages_multi_file_patch_before_committing() -> anyhow::Result<()> {
+    let tmp = tempdir()?;
+    let target_path = tmp.path().join("modify.txt");
+    fs::write(&target_path, "line1\nline2\n")?;
+
+    apply_patch_command(tmp.path())?
+        .arg(
+            "*** Begin Patch\n*** Update File: modify.txt\n@@\n-line2\n+changed\n*** Update File: missing.txt\n@@\n-old\n+new\n*** End Patch",
+        )
+        .assert()
+        .failure();
+
+    assert_eq!(fs::read_to_string(&target_path)?, "line1\nline2\n");
     Ok(())
 }
 
@@ -232,7 +283,7 @@ fn test_apply_patch_cli_rejects_invalid_hunk_header() -> anyhow::Result<()> {
         .arg("*** Begin Patch\n*** Frobnicate File: foo\n*** End Patch")
         .assert()
         .failure()
-        .stderr("Invalid patch hunk on line 2: '*** Frobnicate File: foo' is not a valid hunk header. Valid hunk headers: '*** Add File: {path}', '*** Delete File: {path}', '*** Update File: {path}'\n");
+        .stderr("Invalid patch hunk on line 2: '*** Frobnicate File: foo' is not a valid hunk header. Valid hunk headers: '*** Add File: {path}', '*** Delete File: {path}', '*** Replace File: {path}', '*** Update File: {path}'\n");
 
     Ok(())
 }
@@ -258,7 +309,7 @@ fn test_apply_patch_cli_updates_file_appends_trailing_newline() -> anyhow::Resul
 }
 
 #[test]
-fn test_apply_patch_cli_failure_after_partial_success_leaves_changes() -> anyhow::Result<()> {
+fn test_apply_patch_cli_failure_after_partial_success_leaves_no_changes() -> anyhow::Result<()> {
     let tmp = tempdir()?;
     let new_file = tmp.path().join("created.txt");
     let missing_file = resolved_under(tmp.path(), "missing.txt")?;
@@ -273,7 +324,7 @@ fn test_apply_patch_cli_failure_after_partial_success_leaves_changes() -> anyhow
             missing_file.display()
         ));
 
-    assert_eq!(fs::read_to_string(&new_file)?, "hello\n");
+    assert!(!new_file.exists());
 
     Ok(())
 }

@@ -162,11 +162,18 @@ fn has_usable_workspace_credits(credits: &CreditsSnapshot) -> bool {
 }
 
 impl ChatWidget {
+    pub(super) fn finish_rate_limit_full_refresh(&mut self) {
+        self.rate_limit_full_refresh_pending = false;
+    }
+
     pub(crate) fn on_rate_limit_snapshot(&mut self, snapshot: Option<RateLimitSnapshot>) {
         self.on_rate_limit_snapshot_from(snapshot, RateLimitSnapshotSource::AccountUsage);
     }
 
     pub(crate) fn on_rolling_rate_limit_snapshot(&mut self, snapshot: RateLimitSnapshot) {
+        if self.rate_limit_full_refresh_pending {
+            return;
+        }
         // Rolling app-server notifications are sparse. Preserve metadata learned from the full read.
         self.on_rate_limit_snapshot_from(Some(snapshot), RateLimitSnapshotSource::RollingUpdate);
     }
@@ -176,6 +183,9 @@ impl ChatWidget {
         snapshot: Option<RateLimitSnapshot>,
         source: RateLimitSnapshotSource,
     ) {
+        if matches!(source, RateLimitSnapshotSource::AccountUsage) {
+            self.rate_limit_full_refresh_pending = false;
+        }
         if let Some(mut snapshot) = snapshot {
             let limit_id = snapshot
                 .limit_id
@@ -297,8 +307,21 @@ impl ChatWidget {
                 self.rate_limit_switch_prompt = RateLimitSwitchPromptState::Pending;
             }
 
+            let received_at = Local::now();
+            let captured_at = if matches!(source, RateLimitSnapshotSource::AccountUsage) {
+                snapshot
+                    .fetched_at
+                    .and_then(|timestamp| {
+                        chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp, 0)
+                    })
+                    .map(|timestamp| timestamp.with_timezone(&Local))
+                    .filter(|timestamp| *timestamp <= received_at)
+                    .unwrap_or(received_at)
+            } else {
+                received_at
+            };
             let mut display =
-                rate_limit_snapshot_display_for_limit(&snapshot, limit_label, Local::now());
+                rate_limit_snapshot_display_for_limit(&snapshot, limit_label, captured_at);
             if display.individual_limit.is_none() {
                 display.individual_limit = preserved_individual_limit;
             }
@@ -468,14 +491,14 @@ impl ChatWidget {
         let items = vec![
             SelectionItem {
                 name: "Yes".to_string(),
-                display_shortcut: Some(key_hint::plain(KeyCode::Char('y'))),
+                display_shortcut: Some(key_hint::plain(KeyCode::Char('y')).into()),
                 actions: send_actions,
                 dismiss_on_select: true,
                 ..Default::default()
             },
             SelectionItem {
                 name: "No".to_string(),
-                display_shortcut: Some(key_hint::plain(KeyCode::Char('n'))),
+                display_shortcut: Some(key_hint::plain(KeyCode::Char('n')).into()),
                 is_default: true,
                 dismiss_on_select: true,
                 ..Default::default()

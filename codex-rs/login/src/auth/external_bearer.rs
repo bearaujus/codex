@@ -3,6 +3,9 @@ use super::manager::ExternalAuth;
 use super::manager::ExternalAuthFuture;
 use super::manager::ExternalAuthRefreshContext;
 use codex_protocol::config_types::ModelProviderAuthInfo;
+use reqwest::header::AUTHORIZATION;
+use reqwest::header::HeaderMap;
+use reqwest::header::HeaderValue;
 use std::fmt;
 use std::io;
 use std::path::Path;
@@ -12,6 +15,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::process::Command;
 use tokio::sync::Mutex;
+
+use super::AuthHeaders;
 
 #[derive(Clone)]
 pub(crate) struct BearerTokenRefresher {
@@ -38,7 +43,7 @@ impl BearerTokenRefresher {
                     None => true,
                 };
                 if should_use_cached_token {
-                    return Ok(CodexAuth::from_api_key(cached_token.access_token.as_str()));
+                    return Ok(auth_from_bearer_token(&cached_token.access_token));
                 }
             }
 
@@ -49,7 +54,7 @@ impl BearerTokenRefresher {
             });
             access_token
         };
-        Ok(CodexAuth::from_api_key(access_token.as_str()))
+        Ok(auth_from_bearer_token(&access_token))
     }
 
     async fn refresh(&self, _context: ExternalAuthRefreshContext) -> io::Result<CodexAuth> {
@@ -59,8 +64,18 @@ impl BearerTokenRefresher {
             access_token: access_token.clone(),
             fetched_at: Instant::now(),
         });
-        Ok(CodexAuth::from_api_key(access_token.as_str()))
+        Ok(auth_from_bearer_token(&access_token))
     }
+}
+
+fn auth_from_bearer_token(access_token: &str) -> CodexAuth {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {access_token}"))
+            .unwrap_or_else(|_| HeaderValue::from_static("Bearer")),
+    );
+    CodexAuth::Headers(AuthHeaders::new(headers))
 }
 
 impl ExternalAuth for BearerTokenRefresher {

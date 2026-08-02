@@ -187,7 +187,7 @@ impl From<JsonSchema> for AdditionalProperties {
 
 /// Parse the tool `input_schema` or return an error for invalid schema.
 pub fn parse_tool_input_schema(input_schema: &JsonValue) -> Result<JsonSchema, serde_json::Error> {
-    let mut input_schema = prepare_tool_input_schema(input_schema);
+    let mut input_schema = prepare_tool_input_schema(input_schema)?;
     compact_large_tool_schema(&mut input_schema);
     deserialize_tool_input_schema(input_schema)
 }
@@ -196,14 +196,55 @@ pub fn parse_tool_input_schema(input_schema: &JsonValue) -> Result<JsonSchema, s
 pub fn parse_tool_input_schema_without_compaction(
     input_schema: &JsonValue,
 ) -> Result<JsonSchema, serde_json::Error> {
-    deserialize_tool_input_schema(prepare_tool_input_schema(input_schema))
+    deserialize_tool_input_schema(prepare_tool_input_schema(input_schema)?)
 }
 
-fn prepare_tool_input_schema(input_schema: &JsonValue) -> JsonValue {
+/// Maximum JSON nesting depth accepted in a tool `input_schema`.
+///
+/// Every downstream pass here (`sanitize_json_schema`, `prune_unreachable_definitions`,
+/// the `serde_json::from_value::<JsonSchema>` deserialize, and the eventual recursive
+/// `Drop`) descends the structure recursively, so an input nested thousands of levels
+/// deep exhausts the thread stack and aborts the process with STATUS_STACK_OVERFLOW
+/// rather than returning an error. Tool schemas legitimately nest only a handful of
+/// levels; cap at serde_json's own parser recursion limit (128) so anything that could
+/// have arrived as JSON text is accepted while pathological input is rejected gracefully.
+const MAX_TOOL_SCHEMA_NESTING_DEPTH: usize = 128;
+
+fn prepare_tool_input_schema(input_schema: &JsonValue) -> Result<JsonValue, serde_json::Error> {
+    if json_value_exceeds_depth(input_schema, MAX_TOOL_SCHEMA_NESTING_DEPTH) {
+        return Err(schema_too_deep_error());
+    }
     let mut input_schema = input_schema.clone();
     sanitize_json_schema(&mut input_schema);
     prune_unreachable_definitions(&mut input_schema);
-    input_schema
+    Ok(input_schema)
+}
+
+/// Returns `true` if `value` nests deeper than `limit`.
+///
+/// Uses an explicit work stack rather than recursion so the depth guard itself
+/// cannot overflow on the very input it is meant to reject.
+fn json_value_exceeds_depth(value: &JsonValue, limit: usize) -> bool {
+    let mut stack = vec![(value, 0usize)];
+    while let Some((value, depth)) = stack.pop() {
+        if depth > limit {
+            return true;
+        }
+        match value {
+            JsonValue::Array(values) => {
+                for value in values {
+                    stack.push((value, depth + 1));
+                }
+            }
+            JsonValue::Object(map) => {
+                for value in map.values() {
+                    stack.push((value, depth + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 fn deserialize_tool_input_schema(input_schema: JsonValue) -> Result<JsonSchema, serde_json::Error> {
@@ -796,6 +837,16 @@ fn singleton_null_schema_error() -> serde_json::Error {
     serde_json::Error::io(std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
         "tool input schema must not be a singleton null type",
+    ))
+}
+
+fn schema_too_deep_error() -> serde_json::Error {
+    serde_json::Error::io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "tool input schema nests deeper than the supported limit of \
+             {MAX_TOOL_SCHEMA_NESTING_DEPTH}"
+        ),
     ))
 }
 

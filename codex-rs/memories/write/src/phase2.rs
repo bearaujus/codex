@@ -326,7 +326,6 @@ mod agent {
         // Approval policy
         agent_config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
         // Consolidation runs as an internal worker and must not recursively delegate.
-        let _ = agent_config.features.disable(Feature::SpawnCsv);
         let _ = agent_config.features.disable(Feature::Collab);
         let _ = agent_config.features.disable(Feature::MemoryTool);
         let _ = agent_config.features.disable(Feature::Apps);
@@ -407,6 +406,17 @@ mod agent {
             {
                 emit_token_usage_metrics(context.as_ref(), &token_usage);
             }
+
+            if let Err(err) = context
+                .shutdown_consolidation_agent(SpawnedConsolidationAgent { thread_id, thread })
+                .await
+            {
+                warn!("failed to auto-close global memory consolidation agent {thread_id}: {err}");
+                // Keep the existing lease until it expires so another worker cannot race a
+                // consolidation agent whose shutdown has not completed.
+                return;
+            }
+
             let artifacts_valid = if agent_completed {
                 match validate_consolidation_artifacts(&memory_root).await {
                     Ok(()) => true,
@@ -470,18 +480,6 @@ mod agent {
             } else if !agent_completed {
                 job::failed(context.as_ref(), &db, &claim, "failed_agent").await;
             }
-
-            let cleanup_context = Arc::clone(&context);
-            tokio::spawn(async move {
-                if let Err(err) = cleanup_context
-                    .shutdown_consolidation_agent(SpawnedConsolidationAgent { thread_id, thread })
-                    .await
-                {
-                    warn!(
-                        "failed to auto-close global memory consolidation agent {thread_id}: {err}"
-                    );
-                }
-            });
         });
     }
 

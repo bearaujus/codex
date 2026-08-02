@@ -681,8 +681,7 @@
     },
     "ForcedLoginMethod": {
       "enum": [
-        "chatgpt",
-        "api"
+        "chatgpt"
       ],
       "type": "string"
     },

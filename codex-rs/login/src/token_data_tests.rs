@@ -1,4 +1,26 @@
 use super::*;
+
+#[test]
+fn token_data_debug_redacts_credentials() {
+    const SENTINEL: &str = "secret-token-material";
+    let tokens = TokenData {
+        id_token: IdTokenInfo {
+            raw_jwt: format!("{SENTINEL}-id"),
+            ..IdTokenInfo::default()
+        },
+        access_token: format!("{SENTINEL}-access"),
+        refresh_token: format!("{SENTINEL}-refresh"),
+        account_id: Some(format!("{SENTINEL}-account")),
+    };
+
+    let rendered = format!("{tokens:?}");
+    assert!(
+        !rendered.contains(SENTINEL),
+        "TokenData Debug leaked credentials: {rendered}"
+    );
+    assert!(rendered.contains("access_token_set: true"));
+    assert!(rendered.contains("refresh_token_set: true"));
+}
 use chrono::TimeZone;
 use chrono::Utc;
 use codex_protocol::auth::KnownPlan;
@@ -41,6 +63,29 @@ fn id_token_info_parses_email_and_plan() {
 }
 
 #[test]
+fn id_token_info_uses_profile_and_legacy_user_fallbacks_for_empty_primary_claims() {
+    let fake_jwt = fake_jwt(serde_json::json!({
+        "email": "",
+        "sub": "subject-1",
+        "https://api.openai.com/profile": {
+            "email": "profile@example.com"
+        },
+        "https://api.openai.com/auth": {
+            "chatgpt_user_id": "",
+            "user_id": "legacy-user-1"
+        }
+    }));
+
+    let info = parse_chatgpt_jwt_claims(&fake_jwt).expect("should parse");
+    assert_eq!(info.email.as_deref(), Some("profile@example.com"));
+    assert_eq!(info.chatgpt_user_id.as_deref(), Some("legacy-user-1"));
+    assert_eq!(
+        info.member_identity_key().as_deref(),
+        Some("chatgpt_user_id:legacy-user-1")
+    );
+}
+
+#[test]
 fn id_token_info_parses_go_plan() {
     let fake_jwt = fake_jwt(serde_json::json!({
         "email": "user@example.com",
@@ -66,6 +111,25 @@ fn id_token_info_parses_hc_plan_as_enterprise() {
     let info = parse_chatgpt_jwt_claims(&fake_jwt).expect("should parse");
     assert_eq!(info.email.as_deref(), Some("user@example.com"));
     assert_eq!(info.get_chatgpt_plan_type().as_deref(), Some("Enterprise"));
+    assert_eq!(
+        info.get_chatgpt_plan_type_raw().as_deref(),
+        Some("enterprise")
+    );
+    assert_eq!(info.is_workspace_account(), true);
+}
+
+#[test]
+fn id_token_info_parses_ent26_plan() {
+    let fake_jwt = fake_jwt(serde_json::json!({
+        "email": "user@example.com",
+        "https://api.openai.com/auth": {
+            "chatgpt_plan_type": "ent26"
+        }
+    }));
+
+    let info = parse_chatgpt_jwt_claims(&fake_jwt).expect("should parse");
+    assert_eq!(info.get_chatgpt_plan_type().as_deref(), Some("Enterprise"));
+    assert_eq!(info.get_chatgpt_plan_type_raw().as_deref(), Some("ent26"));
     assert_eq!(info.is_workspace_account(), true);
 }
 
@@ -105,6 +169,48 @@ fn id_token_info_parses_usage_based_business_plans() {
         Some("enterprise_cbp_usage_based")
     );
     assert_eq!(enterprise_cbp.is_workspace_account(), true);
+}
+
+#[test]
+fn id_token_info_parses_enterprise_cbp_automation_plan() {
+    let jwt = fake_jwt(serde_json::json!({
+        "email": "service-account@example.com",
+        "https://api.openai.com/auth": {
+            "chatgpt_plan_type": "enterprise_cbp_automation"
+        }
+    }));
+
+    let info = parse_chatgpt_jwt_claims(&jwt).expect("should parse");
+    assert_eq!(
+        info.get_chatgpt_plan_type().as_deref(),
+        Some("Enterprise (Automation)")
+    );
+    assert_eq!(
+        info.get_chatgpt_plan_type_raw().as_deref(),
+        Some("enterprise_cbp_automation")
+    );
+    assert_eq!(info.is_workspace_account(), true);
+}
+
+#[test]
+fn id_token_info_parses_self_serve_business_prolite_plan() {
+    let jwt = fake_jwt(serde_json::json!({
+        "email": "user@example.com",
+        "https://api.openai.com/auth": {
+            "chatgpt_plan_type": "self_serve_business_prolite"
+        }
+    }));
+
+    let info = parse_chatgpt_jwt_claims(&jwt).expect("should parse");
+    assert_eq!(
+        info.get_chatgpt_plan_type().as_deref(),
+        Some("Self Serve Business ProLite")
+    );
+    assert_eq!(
+        info.get_chatgpt_plan_type_raw().as_deref(),
+        Some("self_serve_business_prolite")
+    );
+    assert_eq!(info.is_workspace_account(), true);
 }
 
 #[test]
@@ -175,4 +281,16 @@ fn workspace_account_detection_matches_workspace_plans() {
         ..IdTokenInfo::default()
     };
     assert_eq!(personal.is_workspace_account(), false);
+}
+
+#[test]
+fn pool_account_id_derivation_has_a_cross_implementation_contract_vector() {
+    assert_eq!(
+        derive_pool_account_id("workspace-1", Some("chatgpt_user_id:user-1"),),
+        "pool_fbeb49cabde08adecb62e781e375ce19"
+    );
+    assert_ne!(
+        derive_pool_account_id("workspace-1", Some("chatgpt_user_id:user-1"),),
+        derive_pool_account_id("workspace-1", Some("chatgpt_user_id:user-2"),)
+    );
 }

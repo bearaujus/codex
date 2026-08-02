@@ -12,6 +12,7 @@ use codex_login::CodexAuth;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::models::ImageDetail;
 use codex_protocol::openai_models::InputModality;
+use codex_protocol::openai_models::ToolMode;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
@@ -96,6 +97,7 @@ async fn responses_lite_uses_input_items_for_instructions_and_tools() -> Result<
     let mut builder = test_codex()
         .with_model_info_override("gpt-5.4", |model_info| {
             model_info.use_responses_lite = true;
+            model_info.tool_mode = Some(ToolMode::CodeMode);
         })
         .with_config(|config| {
             config.base_instructions = Some("test instructions".to_string());
@@ -127,6 +129,23 @@ async fn responses_lite_uses_input_items_for_instructions_and_tools() -> Result<
 
     let tools = additional_tools(&body)?;
     assert!(!tools.is_empty());
+    let client_metadata = body["client_metadata"]
+        .as_object()
+        .context("Responses request should include client metadata")?;
+    let turn_metadata: Value = serde_json::from_str(
+        client_metadata["x-codex-turn-metadata"]
+            .as_str()
+            .context("Responses request should include turn metadata")?,
+    )?;
+
+    assert_eq!(
+        turn_metadata["code_mode_tool_names"]["view_image"],
+        serde_json::json!({
+            "name": "view_image",
+            "namespace": null,
+        })
+    );
+    assert!(!client_metadata.contains_key("x-codex-code-mode-tool-names"));
 
     Ok(())
 }
@@ -260,7 +279,7 @@ async fn responses_lite_exposes_standalone_tools_for_actor_authorized_provider()
     )
     .await;
 
-    let auth = CodexAuth::from_api_key("dummy");
+    let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
     let extensions = responses_extensions(&auth);
     let mut builder = test_codex()
         .with_auth(auth)
@@ -286,6 +305,89 @@ async fn responses_lite_exposes_standalone_tools_for_actor_authorized_provider()
     let tools = additional_tools(&body)?;
     assert!(has_namespaced_tool(tools, "web", "run"));
     assert!(has_namespaced_tool(tools, "image_gen", "imagegen"));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_lite_exposes_standalone_web_search_for_opted_in_custom_provider() -> Result<()> {
+    assert_responses_lite_custom_provider_web_search(
+        WebSearchMode::Live,
+        /*supports_standalone_web_search*/ true,
+        /*expect_web_run*/ true,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_lite_does_not_expose_standalone_web_search_for_custom_provider_by_default()
+-> Result<()> {
+    assert_responses_lite_custom_provider_web_search(
+        WebSearchMode::Live,
+        /*supports_standalone_web_search*/ false,
+        /*expect_web_run*/ false,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_lite_does_not_expose_disabled_standalone_web_search_for_opted_in_provider()
+-> Result<()> {
+    assert_responses_lite_custom_provider_web_search(
+        WebSearchMode::Disabled,
+        /*supports_standalone_web_search*/ true,
+        /*expect_web_run*/ false,
+    )
+    .await
+}
+
+async fn assert_responses_lite_custom_provider_web_search(
+    web_search_mode: WebSearchMode,
+    supports_standalone_web_search: bool,
+    expect_web_run: bool,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let response_mock = responses::mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_response_created("resp-1"),
+            responses::ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+
+    let auth = CodexAuth::Headers(codex_login::AuthHeaders::new(http::HeaderMap::new()));
+    let extensions = responses_extensions(&auth);
+    let mut builder = test_codex()
+        .with_auth(auth)
+        .with_extensions(extensions)
+        .with_model_info_override("gpt-5.4", |model_info| {
+            model_info.use_responses_lite = true;
+        })
+        .with_config(move |config| {
+            configure_responses_tools(config);
+            assert!(config.web_search_mode.set(web_search_mode).is_ok());
+            config.model_provider.name = "custom-responses".to_string();
+            config.model_provider.requires_openai_auth = false;
+            config.model_provider.http_headers = None;
+            config.model_provider.supports_standalone_web_search = supports_standalone_web_search;
+        });
+    let test = builder.build(&server).await?;
+
+    test.submit_turn("Use standalone web search").await?;
+
+    let request = response_mock.single_request();
+    assert_eq!(
+        request.header(RESPONSES_LITE_HEADER).as_deref(),
+        Some("true")
+    );
+    let body = request.body_json();
+    assert!(body.get("tools").is_none());
+    let tools = additional_tools(&body)?;
+    assert_eq!(has_namespaced_tool(tools, "web", "run"), expect_web_run);
+    assert!(!has_hosted_tool(tools, "web_search"));
 
     Ok(())
 }

@@ -100,11 +100,12 @@ async fn emits_warning_when_resumed_model_differs() {
     let initial_history = resume_history(&config, "previous-model", &rollout_path);
 
     let thread_manager = codex_core::test_support::thread_manager_with_models_provider(
-        CodexAuth::from_api_key("test"),
+        CodexAuth::create_dummy_chatgpt_auth_for_testing(),
         config.model_provider.clone(),
     );
-    let auth_manager =
-        codex_core::test_support::auth_manager_from_auth(CodexAuth::from_api_key("test"));
+    let auth_manager = codex_core::test_support::auth_manager_from_auth(
+        CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+    );
 
     // Act: resume the conversation.
     let NewThread {

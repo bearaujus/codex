@@ -3,9 +3,10 @@ source: tui/src/chatwidget/tests/exec_flow.rs
 expression: normalized_backend_snapshot(terminal.backend())
 ---
 "                                                                                "
-"• Working (0s • esc to interrupt)                                               "
+"• Working · 0s · esc to interrupt                                               "
+"  └ Preamble line                                                               "
 "                                                                                "
 "                                                                                "
-"› Ask Codex to do anything                                                      "
+"› Add a follow-up while Codex works                                             "
 "                                                                                "
-"  gpt-5.6-sol default · /tmp/project                                            "
+"  gpt-5.6-sol default  ·  /tmp/project                                          "

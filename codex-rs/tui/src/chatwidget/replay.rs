@@ -118,6 +118,7 @@ impl ChatWidget {
                             }
                         }),
                     },
+                    &turn_id,
                     from_replay,
                 );
             }
@@ -146,6 +147,12 @@ impl ChatWidget {
                 status: codex_app_server_protocol::CommandExecutionStatus::InProgress,
                 ..
             } => self.on_command_execution_started(item),
+            item @ ThreadItem::CommandExecution { .. } if from_replay => {
+                // Completed unified-exec items normally require a live task in
+                // `on_command_execution_completed`. Resume history is terminal by definition, so
+                // rebuild its transcript state directly without live process-tracking gates.
+                self.handle_command_execution_completed_now(item);
+            }
             item @ ThreadItem::CommandExecution { .. } => self.on_command_execution_completed(item),
             ThreadItem::FileChange {
                 status: codex_app_server_protocol::PatchApplyStatus::InProgress,

@@ -1,3 +1,5 @@
+use crate::JsonSchema;
+use crate::TS;
 use crate::protocol::common::AuthMode;
 use codex_experimental_api_macros::ExperimentalApi;
 use codex_protocol::account::PlanType;
@@ -7,53 +9,31 @@ use codex_protocol::protocol::RateLimitReachedType as CoreRateLimitReachedType;
 use codex_protocol::protocol::RateLimitSnapshot as CoreRateLimitSnapshot;
 use codex_protocol::protocol::RateLimitWindow as CoreRateLimitWindow;
 use codex_protocol::protocol::SpendControlLimitSnapshot as CoreSpendControlLimitSnapshot;
-use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
-use ts_rs::TS;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "camelCase")]
 #[ts(tag = "type")]
 #[ts(export_to = "v2/")]
 pub enum Account {
-    #[serde(rename = "apiKey", rename_all = "camelCase")]
-    #[ts(rename = "apiKey", rename_all = "camelCase")]
-    ApiKey {},
-
     #[serde(rename = "chatgpt", rename_all = "camelCase")]
     #[ts(rename = "chatgpt", rename_all = "camelCase")]
     Chatgpt {
-        #[schemars(required, schema_with = "nullable_string_schema")]
+        #[schemars(
+            required,
+            schema_with = "crate::protocol::serde_helpers::nullable_string_schema"
+        )]
         email: Option<String>,
         plan_type: PlanType,
     },
-
-    #[serde(rename = "amazonBedrock", rename_all = "camelCase")]
-    #[ts(rename = "amazonBedrock", rename_all = "camelCase")]
-    AmazonBedrock {
-        #[serde(default)]
-        uses_codex_managed_credentials: bool,
-    },
-}
-
-fn nullable_string_schema(
-    generator: &mut schemars::r#gen::SchemaGenerator,
-) -> schemars::schema::Schema {
-    generator.subschema_for::<Option<String>>()
 }
 
 impl From<ProviderAccount> for Account {
     fn from(account: ProviderAccount) -> Self {
         match account {
-            ProviderAccount::ApiKey => Self::ApiKey {},
             ProviderAccount::Chatgpt { email, plan_type } => Self::Chatgpt { email, plan_type },
-            ProviderAccount::AmazonBedrock {
-                uses_codex_managed_credentials,
-            } => Self::AmazonBedrock {
-                uses_codex_managed_credentials,
-            },
         }
     }
 }
@@ -63,13 +43,6 @@ impl From<ProviderAccount> for Account {
 #[ts(tag = "type")]
 #[ts(export_to = "v2/")]
 pub enum LoginAccountParams {
-    #[serde(rename = "apiKey", rename_all = "camelCase")]
-    #[ts(rename = "apiKey", rename_all = "camelCase")]
-    ApiKey {
-        #[serde(rename = "apiKey")]
-        #[ts(rename = "apiKey")]
-        api_key: String,
-    },
     #[serde(rename = "chatgpt", rename_all = "camelCase")]
     #[ts(rename = "chatgpt", rename_all = "camelCase")]
     Chatgpt {
@@ -84,29 +57,6 @@ pub enum LoginAccountParams {
     #[serde(rename = "chatgptDeviceCode")]
     #[ts(rename = "chatgptDeviceCode")]
     ChatgptDeviceCode,
-    /// [UNSTABLE] FOR OPENAI INTERNAL USE ONLY - DO NOT USE.
-    /// The access token must contain the same scopes that Codex-managed ChatGPT auth tokens have.
-    #[experimental("account/login/start.chatgptAuthTokens")]
-    #[serde(rename = "chatgptAuthTokens", rename_all = "camelCase")]
-    #[ts(rename = "chatgptAuthTokens", rename_all = "camelCase")]
-    ChatgptAuthTokens {
-        /// Access token (JWT) supplied by the client.
-        /// This token is used for backend API requests and email extraction.
-        access_token: String,
-        /// Workspace/account identifier supplied by the client.
-        chatgpt_account_id: String,
-        /// Optional plan type supplied by the client.
-        ///
-        /// When `null`, Codex attempts to derive the plan type from access-token
-        /// claims. If unavailable, the plan defaults to `unknown`.
-        #[ts(optional = nullable)]
-        chatgpt_plan_type: Option<String>,
-    },
-    /// [UNSTABLE] Managed Amazon Bedrock login is experimental.
-    #[experimental("account/login/start.amazonBedrock")]
-    #[serde(rename = "amazonBedrock", rename_all = "camelCase")]
-    #[ts(rename = "amazonBedrock", rename_all = "camelCase")]
-    AmazonBedrock { api_key: String, region: String },
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
@@ -124,9 +74,6 @@ pub enum LoginAppBrand {
 #[ts(tag = "type")]
 #[ts(export_to = "v2/")]
 pub enum LoginAccountResponse {
-    #[serde(rename = "apiKey", rename_all = "camelCase")]
-    #[ts(rename = "apiKey", rename_all = "camelCase")]
-    ApiKey {},
     #[serde(rename = "chatgpt", rename_all = "camelCase")]
     #[ts(rename = "chatgpt", rename_all = "camelCase")]
     Chatgpt {
@@ -147,12 +94,6 @@ pub enum LoginAccountResponse {
         /// One-time code the user must enter after signing in.
         user_code: String,
     },
-    #[serde(rename = "chatgptAuthTokens", rename_all = "camelCase")]
-    #[ts(rename = "chatgptAuthTokens", rename_all = "camelCase")]
-    ChatgptAuthTokens {},
-    #[serde(rename = "amazonBedrock", rename_all = "camelCase")]
-    #[ts(rename = "amazonBedrock", rename_all = "camelCase")]
-    AmazonBedrock {},
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -255,38 +196,20 @@ pub enum AccountSessionWorkspaceKind {
 #[ts(export_to = "v2/")]
 pub struct LogoutAccountResponse {}
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "v2/")]
-pub enum ChatgptAuthTokensRefreshReason {
-    /// Codex attempted a backend request and received `401 Unauthorized`.
-    Unauthorized,
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
-pub struct ChatgptAuthTokensRefreshParams {
-    pub reason: ChatgptAuthTokensRefreshReason,
-    /// Workspace/account identifier that Codex was previously using.
-    ///
-    /// Clients that manage multiple accounts/workspaces can use this as a hint
-    /// to refresh the token for the correct workspace.
-    ///
-    /// This may be `null` when the prior auth state did not include a workspace
-    /// identifier (`chatgpt_account_id`).
+pub struct GetAccountRateLimitsParams {
+    /// Whether the server should also make the online request for reset-credit
+    /// details. Callers that only need the locally cached usage snapshots can
+    /// disable this to avoid coupling UI hydration to network latency. Defaults
+    /// to `true` when omitted.
+    #[serde(default)]
     #[ts(optional = nullable)]
-    pub previous_account_id: Option<String>,
+    pub include_reset_credits: Option<bool>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "v2/")]
-pub struct ChatgptAuthTokensRefreshResponse {
-    pub access_token: String,
-    pub chatgpt_account_id: String,
-    pub chatgpt_plan_type: Option<String>,
-}
+pub type NullableGetAccountRateLimitsParams = Option<GetAccountRateLimitsParams>;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
@@ -484,9 +407,7 @@ pub enum AddCreditsNudgeEmailStatus {
 pub struct GetAccountParams {
     /// When `true`, requests a proactive token refresh before returning.
     ///
-    /// In managed auth mode this triggers the normal refresh-token flow. In
-    /// external auth mode this flag is ignored. Clients should refresh tokens
-    /// themselves and call `account/login/start` with `chatgptAuthTokens`.
+    /// Triggers the normal ChatGPT refresh-token flow for pool-managed auth.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub refresh_token: bool,
 }
@@ -505,6 +426,8 @@ pub struct GetAccountResponse {
 pub struct AccountUpdatedNotification {
     pub auth_mode: Option<AuthMode>,
     pub plan_type: Option<PlanType>,
+    /// Email for the current account, or `null` when unavailable or signed out.
+    pub account_email: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -525,6 +448,12 @@ pub struct AccountRateLimitsUpdatedNotification {
 pub struct RateLimitSnapshot {
     pub limit_id: Option<String>,
     pub limit_name: Option<String>,
+    /// Unix timestamp in seconds when this snapshot was fetched from the backend.
+    ///
+    /// `null` for rolling updates and servers that do not preserve the original
+    /// observation time. Clients should use their receipt time only as a fallback.
+    #[ts(type = "number | null")]
+    pub fetched_at: Option<i64>,
     pub primary: Option<RateLimitWindow>,
     pub secondary: Option<RateLimitWindow>,
     pub credits: Option<CreditsSnapshot>,
@@ -540,6 +469,7 @@ impl From<CoreRateLimitSnapshot> for RateLimitSnapshot {
         Self {
             limit_id: value.limit_id,
             limit_name: value.limit_name,
+            fetched_at: None,
             primary: value.primary.map(RateLimitWindow::from),
             secondary: value.secondary.map(RateLimitWindow::from),
             credits: value.credits.map(CreditsSnapshot::from),

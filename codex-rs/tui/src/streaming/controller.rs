@@ -43,8 +43,12 @@ use crate::markdown::render_markdown_agent_with_links_cwd_and_visualizations;
 use crate::style::proposed_plan_style;
 use crate::terminal_hyperlinks::HyperlinkLine;
 use crate::terminal_hyperlinks::prefix_hyperlink_lines;
+use crate::ui_consts::REASONING_PREVIEW_MAX_LINES;
 use ratatui::prelude::Stylize;
+use ratatui::style::Modifier;
+use ratatui::style::Style;
 use ratatui::text::Line;
+use std::collections::VecDeque;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -756,6 +760,214 @@ impl PlanStreamController {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ReasoningStreamController — agent reasoning summary streams
+// ---------------------------------------------------------------------------
+
+/// Controller that streams reasoning-summary markdown into compact, dim cells.
+///
+/// Wraps [`StreamCore`] so completed reasoning lines commit to transcript-only
+/// cells while a bounded recent preview stays in the live `active_cell`. When
+/// the reasoning block ends, the preview leaves the primary viewport instead
+/// of becoming permanent scrollback. This keeps repeated reason/tool/reason
+/// cycles focused without losing full-fidelity progress in the transcript
+/// overlay or raw mode.
+///
+/// Reasoning is usually prose, so completed lines normally flow straight to
+/// the stable region. The shared table holdback still protects the occasional
+/// structured block until it can render coherently.
+pub(crate) struct ReasoningStreamController {
+    core: StreamCore,
+    preview_lines: VecDeque<HyperlinkLine>,
+}
+
+impl ReasoningStreamController {
+    pub(crate) fn new(width: Option<usize>, cwd: &Path, render_mode: HistoryRenderMode) -> Self {
+        Self {
+            core: StreamCore::new(
+                width,
+                cwd,
+                render_mode,
+                /*inline_visualization_context*/ None,
+            ),
+            preview_lines: VecDeque::with_capacity(REASONING_PREVIEW_MAX_LINES),
+        }
+    }
+
+    pub(crate) fn push(&mut self, delta: &str) -> bool {
+        self.core.push_delta(delta)
+    }
+
+    /// Finalize the active reasoning stream, emitting any not-yet-committed lines
+    /// to the transcript only.
+    pub(crate) fn finalize(&mut self) -> Option<Box<dyn HistoryCell>> {
+        let (remaining, source) = self.core.finalize_remaining();
+        if source.is_empty() {
+            self.core.reset();
+            self.clear_preview();
+            return None;
+        }
+
+        let transcript_lines = self.render_display_lines(remaining);
+        let out = if transcript_lines.is_empty() {
+            None
+        } else {
+            Some(
+                Box::new(history_cell::ReasoningStreamCell::transcript_chunk(
+                    transcript_lines,
+                )) as Box<dyn HistoryCell>,
+            )
+        };
+        self.core.reset();
+        self.clear_preview();
+        out
+    }
+
+    pub(crate) fn on_commit_tick(&mut self) -> (Option<Box<dyn HistoryCell>>, bool) {
+        let step = self.core.tick();
+        (self.emit(step), self.core.is_idle())
+    }
+
+    pub(crate) fn on_commit_tick_batch(
+        &mut self,
+        max_lines: usize,
+    ) -> (Option<Box<dyn HistoryCell>>, bool) {
+        let step = self.core.tick_batch(max_lines);
+        (self.emit(step), self.core.is_idle())
+    }
+
+    #[inline]
+    pub(crate) fn queued_lines(&self) -> usize {
+        self.core.queued_lines()
+    }
+
+    pub(crate) fn oldest_queued_age(&self, now: Instant) -> Option<Duration> {
+        self.core.oldest_queued_age(now)
+    }
+
+    pub(crate) fn current_tail_display_lines(&self) -> Vec<HyperlinkLine> {
+        // Completed reasoning stays available in the transcript while the main
+        // viewport presents only a bounded rolling preview. We intentionally do
+        // NOT preview the in-progress (not-yet-newline-terminated) line here. That
+        // preview was the only stream tail that overlapped the viewport/scrollback
+        // boundary while re-rendering on every delta, which on some terminals
+        // produced a transient "sliding window" duplication (a/b/c → b/c/d).
+        //
+        // The held-back table region (the only case `has_tail()` is true for reasoning,
+        // since tables must re-render as a unit) is still surfaced so streamed tables do
+        // not vanish mid-render.
+        let mut preview = self.stored_preview_display_lines();
+        preview.extend(self.current_tail_transcript_lines());
+        preview
+    }
+
+    pub(crate) fn current_tail_transcript_lines(&self) -> Vec<HyperlinkLine> {
+        if !self.core.has_tail() {
+            return Vec::new();
+        }
+        let lines = self.core.current_tail_lines();
+        // Drop leading blank lines: the tail renders directly below already-committed
+        // reasoning, separated by the active cell's top inset, so a leading
+        // paragraph-break blank would double the visible gap.
+        let first_non_blank = lines.iter().position(|line| {
+            line.line
+                .spans
+                .iter()
+                .any(|span| !span.content.trim().is_empty())
+        });
+        let lines = match first_non_blank {
+            Some(idx) => lines[idx..].to_vec(),
+            None => return Vec::new(),
+        };
+        self.render_display_lines(lines)
+    }
+
+    pub(crate) fn clear_queue(&mut self) {
+        self.core.state.clear_queue();
+        self.core.enqueued_stable_len = self.core.emitted_stable_len;
+    }
+
+    pub(crate) fn set_width(&mut self, width: Option<usize>) {
+        self.core.set_width(width);
+        self.rebuild_preview_from_emitted_lines();
+    }
+
+    pub(crate) fn set_render_mode(&mut self, render_mode: HistoryRenderMode) {
+        self.core.set_render_mode(render_mode);
+        self.rebuild_preview_from_emitted_lines();
+    }
+
+    fn emit(&mut self, lines: Vec<HyperlinkLine>) -> Option<Box<dyn HistoryCell>> {
+        if lines.is_empty() {
+            return None;
+        }
+        let out_lines = self.render_display_lines(lines);
+        if out_lines.is_empty() {
+            return None;
+        }
+        self.remember_preview_lines(out_lines.clone());
+        Some(Box::new(
+            history_cell::ReasoningStreamCell::transcript_chunk(out_lines),
+        ))
+    }
+
+    fn remember_preview_lines(&mut self, lines: impl IntoIterator<Item = HyperlinkLine>) {
+        for line in lines {
+            if self.preview_lines.len() == REASONING_PREVIEW_MAX_LINES {
+                self.preview_lines.pop_front();
+            }
+            self.preview_lines.push_back(line);
+        }
+    }
+
+    fn stored_preview_display_lines(&self) -> Vec<HyperlinkLine> {
+        self.preview_lines.iter().cloned().collect()
+    }
+
+    fn rebuild_preview_from_emitted_lines(&mut self) {
+        let emitted_len = self
+            .core
+            .emitted_stable_len
+            .min(self.core.render.lines.len());
+        let emitted = self.core.render.lines[..emitted_len].to_vec();
+        self.clear_preview();
+        let rendered = self.render_display_lines(emitted);
+        self.remember_preview_lines(rendered);
+    }
+
+    fn clear_preview(&mut self) {
+        self.preview_lines.clear();
+    }
+
+    /// Style rendered lines as supporting reasoning and apply a continuous rail
+    /// that remains visually distinct from tool and assistant markers.
+    fn render_display_lines(&self, lines: Vec<HyperlinkLine>) -> Vec<HyperlinkLine> {
+        let reasoning_style = Style::default().dim();
+        let lines = lines
+            .into_iter()
+            .filter(|line| {
+                line.line
+                    .spans
+                    .iter()
+                    .any(|span| !span.content.trim().is_empty())
+            })
+            .collect::<Vec<_>>();
+        prefix_hyperlink_lines(lines, "┊ ".dim(), "┊ ".dim())
+            .into_iter()
+            .map(|mut line| {
+                line.line = line.line.style(reasoning_style);
+                for span in &mut line.line.spans {
+                    span.style = span
+                        .style
+                        .patch(reasoning_style)
+                        .remove_modifier(Modifier::BOLD);
+                }
+                line
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -856,6 +1068,155 @@ mod tests {
             lines.extend(cell.transcript_lines(u16::MAX));
         }
         lines_to_plain_strings(&lines)
+    }
+
+    fn reasoning_stream_controller(width: Option<usize>) -> ReasoningStreamController {
+        ReasoningStreamController::new(width, &test_cwd(), HistoryRenderMode::Rich)
+    }
+
+    fn collect_reasoning_streamed_lines(deltas: &[&str], width: Option<usize>) -> Vec<String> {
+        let mut ctrl = reasoning_stream_controller(width);
+        let mut lines = Vec::new();
+        for d in deltas {
+            ctrl.push(d);
+            while let (Some(cell), idle) = ctrl.on_commit_tick() {
+                lines.extend(cell.transcript_lines(u16::MAX));
+                if idle {
+                    break;
+                }
+            }
+        }
+        if let Some(cell) = ctrl.finalize() {
+            lines.extend(cell.transcript_lines(u16::MAX));
+        }
+        lines_to_plain_strings(&lines)
+    }
+
+    #[test]
+    fn reasoning_controller_keeps_full_transcript_with_rail() {
+        let out = collect_reasoning_streamed_lines(
+            &[
+                "First reasoning line.\n",
+                "Second reasoning line.\n",
+                "Third reasoning line.",
+            ],
+            Some(80),
+        );
+        let joined = out.join("\n");
+        assert!(joined.contains("First reasoning line."), "got: {out:?}");
+        assert!(joined.contains("Second reasoning line."), "got: {out:?}");
+        assert!(joined.contains("Third reasoning line."), "got: {out:?}");
+        assert!(
+            out.iter().all(|l| l.starts_with("┊ ")),
+            "reasoning rows should carry the reasoning rail, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn live_reasoning_is_subdued_without_forced_emphasis() {
+        let mut ctrl = reasoning_stream_controller(Some(80));
+        assert!(ctrl.push("**Readable reasoning.**\n"));
+        let (cell, _) = ctrl.on_commit_tick_batch(usize::MAX);
+        let cell = cell.expect("reasoning should emit");
+        assert!(
+            cell.display_lines(/*width*/ 80).is_empty(),
+            "stable reasoning chunks should stay out of the primary viewport"
+        );
+        let lines = visible_lines(ctrl.current_tail_display_lines());
+
+        assert!(lines.iter().all(|line| {
+            line.style
+                .add_modifier
+                .contains(ratatui::style::Modifier::DIM)
+                && !line
+                    .style
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::ITALIC)
+                && line.spans.iter().all(|span| {
+                    !span
+                        .style
+                        .add_modifier
+                        .contains(ratatui::style::Modifier::ITALIC)
+                        && !span
+                            .style
+                            .add_modifier
+                            .contains(ratatui::style::Modifier::BOLD)
+                })
+        }));
+    }
+
+    #[test]
+    fn live_reasoning_preview_keeps_only_the_latest_two_lines() {
+        let mut ctrl = reasoning_stream_controller(Some(80));
+        let source = (1..=8)
+            .map(|step| format!("Progress update {step}.\n"))
+            .collect::<String>();
+        assert!(ctrl.push(&source));
+        let (cell, idle) = ctrl.on_commit_tick_batch(usize::MAX);
+
+        assert!(idle);
+        assert!(
+            cell.expect("reasoning transcript chunk")
+                .display_lines(/*width*/ 80)
+                .is_empty()
+        );
+        assert!(
+            ctrl.current_tail_transcript_lines().is_empty(),
+            "the live transcript tail must not duplicate already committed preview lines"
+        );
+        let preview = lines_to_plain_strings(&visible_lines(ctrl.current_tail_display_lines()));
+        assert_eq!(
+            preview,
+            vec!["┊ Progress update 7.", "┊ Progress update 8.",]
+        );
+
+        assert!(
+            ctrl.finalize().is_none(),
+            "fully committed reasoning should not leave a permanent viewport cell"
+        );
+        assert!(ctrl.current_tail_display_lines().is_empty());
+    }
+
+    #[test]
+    fn finalized_reasoning_tail_is_transcript_only() {
+        let mut ctrl = reasoning_stream_controller(Some(80));
+        assert!(!ctrl.push("Final reasoning tail without a newline."));
+
+        let finalized = ctrl.finalize().expect("reasoning transcript tail");
+        assert!(finalized.display_lines(/*width*/ 80).is_empty());
+        assert_eq!(
+            lines_to_plain_strings(&finalized.transcript_lines(/*width*/ 80)),
+            vec!["┊ Final reasoning tail without a newline."]
+        );
+    }
+
+    #[test]
+    fn reasoning_chunk_cells_use_the_rail_instead_of_blank_separators() {
+        // The reasoning rail is a persistent visual boundary, so neither the
+        // first chunk nor later commit-tick chunks need a leading blank row.
+        let mut ctrl = reasoning_stream_controller(Some(80));
+        ctrl.push("Line one.\nLine two.\nLine three.\n");
+        let mut cells: Vec<Box<dyn HistoryCell>> = Vec::new();
+        while let (Some(cell), idle) = ctrl.on_commit_tick() {
+            cells.push(cell);
+            if idle {
+                break;
+            }
+        }
+        if let Some(cell) = ctrl.finalize() {
+            cells.push(cell);
+        }
+        assert!(
+            cells.len() >= 2,
+            "expected multiple chunk cells, got {}",
+            cells.len()
+        );
+        for (i, cell) in cells.iter().enumerate() {
+            assert!(
+                cell.is_stream_continuation(),
+                "reasoning chunk {i} should not spend a row on a blank separator"
+            );
+        }
     }
 
     #[test]
@@ -1069,7 +1430,7 @@ mod tests {
                 .transcript_lines(u16::MAX),
         );
 
-        assert_eq!(rendered, vec!["• tail without newline".to_string()]);
+        assert_eq!(rendered, vec!["› tail without newline".to_string()]);
     }
 
     #[test]

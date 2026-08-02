@@ -4,6 +4,8 @@
 use anyhow::Result;
 use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerTransportConfig;
+use codex_core::StartThreadOptions;
+use codex_features::Feature;
 use codex_login::CodexAuth;
 use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
 use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
@@ -304,51 +306,6 @@ async fn app_only_tools_are_not_visible_or_runnable_by_direct_model_calls() -> R
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn app_search_sources_are_hidden_for_api_key_auth() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = start_mock_server().await;
-    let apps_server = AppsTestServer::mount(&server).await?;
-    let mock = mount_sse_once(
-        &server,
-        sse(vec![
-            ev_response_created("resp-1"),
-            ev_assistant_message("msg-1", "done"),
-            ev_completed("resp-1"),
-        ]),
-    )
-    .await;
-
-    let mut builder = test_codex()
-        .with_auth(CodexAuth::from_api_key("Test API Key"))
-        .with_config(move |config| {
-            configure_search_capable_apps(config, apps_server.chatgpt_base_url.as_str())
-        });
-    let test = builder.build(&server).await?;
-
-    test.submit_turn_with_approval_and_permission_profile(
-        "list tools",
-        AskForApproval::Never,
-        PermissionProfile::Disabled,
-    )
-    .await?;
-
-    let body = mock.single_request().body_json();
-    let tools = tool_names(&body);
-    assert!(
-        !tools.iter().any(|name| name == SEARCH_CALENDAR_NAMESPACE),
-        "tools list should not include app tools for API key auth: {tools:?}"
-    );
-    let description = tool_search_description(&body).unwrap_or_default();
-    assert!(
-        !description.contains("Calendar"),
-        "tool_search description should not include app sources for API key auth: {description}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn search_tool_adds_discovery_instructions_to_tool_description() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -385,6 +342,57 @@ async fn search_tool_adds_discovery_instructions_to_tool_description() -> Result
     assert!(
         !description.contains("remainder of the current session/thread"),
         "tool_search description should not mention legacy client-side persistence: {description:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_tool_omits_sources_when_deferred_tool_world_state_is_enabled() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let apps_server = AppsTestServer::mount_searchable(&server).await?;
+    let mock = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg-1", "done"),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+
+    let mut builder =
+        configured_builder(apps_server.chatgpt_base_url.clone()).with_config(|config| {
+            config
+                .features
+                .enable(Feature::DeferredToolWorldState)
+                .expect("test config should allow feature update");
+        });
+    let test = builder.build(&server).await?;
+    test.submit_turn_with_approval_and_permission_profile(
+        "list tools",
+        AskForApproval::Never,
+        PermissionProfile::Disabled,
+    )
+    .await?;
+
+    let request = mock.single_request();
+    let body = request.body_json();
+    let description = tool_search_description(&body).expect("tool_search description should exist");
+    assert!(
+        !SEARCH_TOOL_DESCRIPTION_SNIPPETS
+            .iter()
+            .any(|snippet| description.contains(snippet)),
+        "tool_search should not repeat sources already advertised in world state: {description:?}"
+    );
+    assert!(
+        request
+            .message_input_texts("developer")
+            .into_iter()
+            .any(|text| text.contains(SEARCH_CALENDAR_NAMESPACE)),
+        "world state should advertise the deferred Calendar namespace"
     );
 
     Ok(())
@@ -934,12 +942,25 @@ async fn tool_search_returns_deferred_dynamic_tool_and_routes_follow_up_call() -
             },
         )],
     });
+    let shadow_tool = DynamicToolSpec::Function(DynamicToolFunctionSpec {
+        name: TOOL_SEARCH_TOOL_NAME.to_string(),
+        description: "Client-provided tool that must not replace tool search.".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false,
+        }),
+        defer_loading: false,
+    });
 
     let mut builder = test_codex().with_config(configure_search_capable_model);
-    let base_test = builder.build(&server).await?;
+    let base_test = builder.build_with_auto_env(&server).await?;
     let new_thread = base_test
         .thread_manager
-        .start_thread_with_tools(base_test.config.clone(), vec![dynamic_tool])
+        .start_thread(StartThreadOptions {
+            dynamic_tools: vec![dynamic_tool, shadow_tool],
+            ..StartThreadOptions::new(base_test.config.clone())
+        })
         .await?;
     let mut test = base_test;
     test.codex = new_thread.thread;
@@ -992,11 +1013,23 @@ async fn tool_search_returns_deferred_dynamic_tool_and_routes_follow_up_call() -
 
     let first_request_body = requests[0].body_json();
     let first_request_tools = tool_names(&first_request_body);
-    assert!(
-        first_request_tools
-            .iter()
-            .any(|name| name == TOOL_SEARCH_TOOL_NAME),
-        "first request should advertise tool_search: {first_request_tools:?}"
+    let advertised_search_tool_types = first_request_body
+        .get("tools")
+        .and_then(Value::as_array)
+        .expect("first request should contain model tools")
+        .iter()
+        .filter(|tool| {
+            tool.get("name")
+                .or_else(|| tool.get("type"))
+                .and_then(Value::as_str)
+                == Some(TOOL_SEARCH_TOOL_NAME)
+        })
+        .map(|tool| tool.get("type").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        advertised_search_tool_types,
+        vec![Some(TOOL_SEARCH_TOOL_NAME)],
+        "first request should advertise exactly one host tool_search: {first_request_tools:?}"
     );
     assert!(
         !first_request_tools.iter().any(|name| name == tool_name),
@@ -1571,7 +1604,10 @@ async fn tool_search_matches_dynamic_tools_by_name_description_namespace_and_sch
     let base_test = builder.build(&server).await?;
     let new_thread = base_test
         .thread_manager
-        .start_thread_with_tools(base_test.config.clone(), vec![dynamic_tool])
+        .start_thread(StartThreadOptions {
+            dynamic_tools: vec![dynamic_tool],
+            ..StartThreadOptions::new(base_test.config.clone())
+        })
         .await?;
     let mut test = base_test;
     test.codex = new_thread.thread;

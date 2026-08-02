@@ -10,7 +10,6 @@ impl ChatWidget {
         let Some(wait) = self.unified_exec_wait_streak.take() else {
             return;
         };
-        self.transcript.needs_final_message_separator = true;
         let cell = history_cell::new_unified_exec_interaction(wait.command_display, String::new());
         self.app_event_tx
             .send(AppEvent::InsertHistoryCell(Box::new(cell)));
@@ -44,10 +43,10 @@ impl ChatWidget {
                 return;
             }
         }
-        let item2 = item.clone();
         self.defer_or_handle(
-            |q| q.push_item_started(item),
-            |s| s.handle_command_execution_started_now(item2),
+            item,
+            InterruptManager::push_item_started,
+            Self::handle_command_execution_started_now,
         );
     }
 
@@ -57,18 +56,76 @@ impl ChatWidget {
             return;
         }
 
+        if self.append_exec_output_to_active_cell(call_id, delta) {
+            return;
+        }
+
+        // The active cell is not this call's exec cell, so a plain append would
+        // silently drop the output and the rendered tool output ends up trimmed.
+        // This shows up with `stream_reasoning_live` because the live reasoning
+        // tail (a `ReasoningStreamCell`) can hold the active slot, and it can also
+        // happen when this call's `begin` is still queued in the interrupt manager.
+        // Recover so streamed output is never lost:
+        //   1. Drain any deferred begin so its exec cell is materialized.
+        if !self.interrupts.is_empty() {
+            self.flush_interrupt_queue();
+            if self.append_exec_output_to_active_cell(call_id, delta) {
+                return;
+            }
+        }
+        //   2. Otherwise re-establish the running command's exec cell as active —
+        //      committing whatever currently owns the slot (e.g. live reasoning)
+        //      to scrollback first so it is preserved, not discarded. Only do this
+        //      when the active cell is NOT itself an exec cell: a different active
+        //      exec cell means parallel/grouped calls are streaming, and flushing it
+        //      mid-run would trim *its* output. In that (rare) case leave the output
+        //      to the completion event's aggregated payload rather than risk worse.
+        let active_is_exec = self
+            .transcript
+            .active_cell
+            .as_ref()
+            .is_some_and(|cell| cell.as_any().is::<ExecCell>());
+        if !active_is_exec && let Some(running) = self.running_commands.get(call_id).cloned() {
+            self.flush_active_cell();
+            let mut cell = new_active_exec_command(
+                call_id.to_string(),
+                running.command,
+                running.parsed_cmd,
+                running.presentation,
+                running.source,
+                /*interaction_input*/ None,
+                self.config.animations,
+            );
+            let appended = cell.append_output(call_id, delta);
+            self.transcript.active_cell = Some(Box::new(cell));
+            self.bump_active_cell_revision();
+            if appended {
+                self.request_redraw();
+            }
+        }
+    }
+
+    /// Appends `delta` to the active exec cell when it tracks `call_id`.
+    ///
+    /// Returns `false` (without mutating) when the active cell is absent or is not
+    /// the exec cell for this call, so callers can fall back to recovery instead of
+    /// dropping the output.
+    fn append_exec_output_to_active_cell(&mut self, call_id: &str, delta: &str) -> bool {
         let Some(cell) = self
             .transcript
             .active_cell
             .as_mut()
             .and_then(|c| c.as_any_mut().downcast_mut::<ExecCell>())
         else {
-            return;
+            return false;
         };
 
         if cell.append_output(call_id, delta) {
             self.bump_active_cell_revision();
             self.request_redraw();
+            true
+        } else {
+            false
         }
     }
 
@@ -155,10 +212,10 @@ impl ChatWidget {
                 return;
             }
         }
-        let item2 = item.clone();
         self.defer_or_handle(
-            |q| q.push_item_completed(item),
-            |s| s.handle_command_execution_completed_now(item2),
+            item,
+            InterruptManager::push_item_completed,
+            Self::handle_command_execution_completed_now,
         );
     }
 
@@ -254,12 +311,25 @@ impl ChatWidget {
             command_execution_command_and_parsed(&command, &command_actions);
         // Ensure the status indicator is visible while the command runs.
         self.bottom_pane.ensure_status_indicator();
-        let parsed_cmd = self.annotate_skill_reads_in_parsed_cmd(parsed_cmd);
+        let presented = command_display::presentation_parsed_commands(&command, parsed_cmd);
+        let presentation = if source == ExecCommandSource::UserShell {
+            CommandPresentation::Command
+        } else {
+            presented.presentation
+        };
+        let parsed_cmd = self.annotate_skill_reads_in_parsed_cmd(presented.parsed);
+        if source != ExecCommandSource::UserShell
+            && (presentation != CommandPresentation::Command
+                || strip_bash_lc_and_escape(&command).chars().count() > 140)
+        {
+            self.mark_hidden_transcript_detail();
+        }
         self.running_commands.insert(
             id.clone(),
             RunningCommand {
                 command: command.clone(),
                 parsed_cmd: parsed_cmd.clone(),
+                presentation: presentation.clone(),
                 source,
             },
         );
@@ -288,6 +358,7 @@ impl ChatWidget {
                 id.clone(),
                 command.clone(),
                 parsed_cmd.clone(),
+                presentation.clone(),
                 source,
                 /*interaction_input*/ None,
             )
@@ -300,6 +371,7 @@ impl ChatWidget {
                 id,
                 command,
                 parsed_cmd,
+                presentation,
                 source,
                 /*interaction_input*/ None,
                 self.config.animations,
@@ -325,6 +397,9 @@ impl ChatWidget {
             // We have an active exec group, but it does not contain this call id. Render the end
             // as a standalone finalized history cell so the active group remains intact.
             OrphanHistoryWhileActiveExec,
+            // Resume history contains completed items rather than begin/end pairs. Consecutive
+            // clean exploration items should rebuild the same compact group as the live flow.
+            AppendCompletedExploration,
             // No active exec cell can safely own this end; build a new cell from the end payload.
             NewCell,
         }
@@ -356,14 +431,50 @@ impl ChatWidget {
         if self.suppressed_exec_calls.remove(&id) {
             return;
         }
-        let (command, parsed, source) = match running {
-            Some(rc) => (rc.command, rc.parsed_cmd, rc.source),
-            None => (event_command, event_parsed, source),
+        let (command, parsed, presentation, source) = match running {
+            Some(rc) => (rc.command, rc.parsed_cmd, rc.presentation, rc.source),
+            None => {
+                let presented =
+                    command_display::presentation_parsed_commands(&event_command, event_parsed);
+                (
+                    event_command,
+                    presented.parsed,
+                    presented.presentation,
+                    source,
+                )
+            }
+        };
+        let presentation = if source == ExecCommandSource::UserShell {
+            CommandPresentation::Command
+        } else {
+            presentation
         };
         let parsed = self.annotate_skill_reads_in_parsed_cmd(parsed);
         let is_unified_exec_interaction =
             matches!(source, ExecCommandSource::UnifiedExecInteraction);
         let is_user_shell = source == ExecCommandSource::UserShell;
+        if !is_user_shell
+            && (presentation != CommandPresentation::Command
+                || aggregated_output.lines().count() > crate::exec_cell::TOOL_CALL_MAX_LINES
+                || aggregated_output
+                    .lines()
+                    .any(|line| line.chars().count() > 140)
+                || strip_bash_lc_and_escape(&command).chars().count() > 140)
+        {
+            self.mark_hidden_transcript_detail();
+        }
+
+        // Unified exec interaction rows intentionally hide command output text in the exec cell and
+        // instead render the interaction-specific content elsewhere in the UI.
+        let output = if is_unified_exec_interaction {
+            CommandOutput::new(exit_code, String::new())
+        } else {
+            CommandOutput::new(exit_code, aggregated_output)
+        };
+        let incoming_is_clean_exploration = presentation == CommandPresentation::Exploration
+            && command_display::is_exploration(&parsed)
+            && output.exit_code == 0
+            && !output.has_diagnostic_signal();
         let end_target = match self.transcript.active_cell.as_ref() {
             Some(cell) => match cell.as_any().downcast_ref::<ExecCell>() {
                 Some(exec_cell) if exec_cell.iter_calls().any(|call| call.call_id == id) => {
@@ -372,57 +483,176 @@ impl ChatWidget {
                 Some(exec_cell) if exec_cell.is_active() => {
                     ExecEndTarget::OrphanHistoryWhileActiveExec
                 }
+                Some(exec_cell)
+                    if exec_cell.is_exploring_cell() && incoming_is_clean_exploration =>
+                {
+                    ExecEndTarget::AppendCompletedExploration
+                }
                 Some(_) | None => ExecEndTarget::NewCell,
             },
             None => ExecEndTarget::NewCell,
         };
-
-        // Unified exec interaction rows intentionally hide command output text in the exec cell and
-        // instead render the interaction-specific content elsewhere in the UI.
-        let output = if is_unified_exec_interaction {
-            CommandOutput {
-                exit_code,
-                aggregated_output: String::new(),
-            }
-        } else {
-            CommandOutput {
-                exit_code,
-                aggregated_output,
-            }
-        };
+        // Completion means actual command work was observed, regardless of which history target
+        // owns the finalized call below.
+        self.transcript.had_work_activity = true;
 
         match end_target {
             ExecEndTarget::ActiveTracked => {
-                if let Some(cell) = self
+                enum CompletionAction {
+                    KeepGrouped,
+                    RefreshActive,
+                    FlushSingle,
+                    Extract {
+                        call: crate::exec_cell::ExecCall,
+                        remaining_is_empty: bool,
+                        flush_completed_remainder: bool,
+                    },
+                    Orphan {
+                        output: CommandOutput,
+                    },
+                }
+
+                let action = match self
                     .transcript
                     .active_cell
                     .as_mut()
-                    .and_then(|c| c.as_any_mut().downcast_mut::<ExecCell>())
+                    .and_then(|cell| cell.as_any_mut().downcast_mut::<ExecCell>())
                 {
-                    let completed = cell.complete_call(&id, output, duration);
-                    debug_assert!(completed, "active exec cell should contain {id}");
-                    if cell.should_flush() {
-                        self.flush_active_cell();
-                    } else {
+                    Some(cell) => {
+                        let completed = cell.complete_call(&id, output, duration);
+                        debug_assert!(completed, "active exec cell should contain {id}");
+                        let keep_grouped =
+                            cell.call_is_exploring(&id) && cell.call_is_clean_success(&id);
+                        if keep_grouped {
+                            CompletionAction::KeepGrouped
+                        } else if cell.iter_calls().count() == 1 && !cell.call_is_exploring(&id) {
+                            CompletionAction::FlushSingle
+                        } else if let Some(call) = cell.take_call(&id) {
+                            CompletionAction::Extract {
+                                call,
+                                remaining_is_empty: cell.is_empty(),
+                                flush_completed_remainder: !cell.is_empty() && !cell.is_active(),
+                            }
+                        } else {
+                            debug_assert!(
+                                false,
+                                "completed call {id} should still be present in the active exec cell"
+                            );
+                            CompletionAction::RefreshActive
+                        }
+                    }
+                    None => CompletionAction::Orphan { output },
+                };
+
+                match action {
+                    CompletionAction::KeepGrouped | CompletionAction::RefreshActive => {
                         self.bump_active_cell_revision();
+                        self.request_redraw();
+                    }
+                    CompletionAction::FlushSingle => self.flush_active_cell(),
+                    CompletionAction::Extract {
+                        call,
+                        remaining_is_empty,
+                        flush_completed_remainder,
+                    } => {
+                        if remaining_is_empty {
+                            self.transcript.active_cell = None;
+                            self.bump_active_cell_revision();
+                        } else if flush_completed_remainder {
+                            self.flush_active_cell();
+                        } else {
+                            self.bump_active_cell_revision();
+                        }
+                        let cell = ExecCell::new_standalone(call, self.config.animations);
+                        self.app_event_tx
+                            .send(AppEvent::InsertHistoryCell(Box::new(cell)));
+                        self.request_redraw();
+                    }
+                    CompletionAction::Orphan { output } => {
+                        let mut orphan = ExecCell::new_standalone(
+                            crate::exec_cell::ExecCall {
+                                call_id: id.clone(),
+                                command,
+                                parsed,
+                                presentation,
+                                output: None,
+                                source,
+                                start_time: Some(Instant::now()),
+                                duration: None,
+                                interaction_input: None,
+                            },
+                            self.config.animations,
+                        );
+                        let completed = orphan.complete_call(&id, output, duration);
+                        debug_assert!(completed, "new orphan exec cell should contain {id}");
+                        self.app_event_tx
+                            .send(AppEvent::InsertHistoryCell(Box::new(orphan)));
                         self.request_redraw();
                     }
                 }
             }
             ExecEndTarget::OrphanHistoryWhileActiveExec => {
-                let mut orphan = new_active_exec_command(
-                    id.clone(),
-                    command,
-                    parsed,
-                    source,
-                    /*interaction_input*/ None,
+                let mut orphan = ExecCell::new_standalone(
+                    crate::exec_cell::ExecCall {
+                        call_id: id.clone(),
+                        command,
+                        parsed,
+                        presentation,
+                        output: None,
+                        source,
+                        start_time: Some(Instant::now()),
+                        duration: None,
+                        interaction_input: None,
+                    },
                     self.config.animations,
                 );
                 let completed = orphan.complete_call(&id, output, duration);
                 debug_assert!(completed, "new orphan exec cell should contain {id}");
-                self.transcript.needs_final_message_separator = true;
                 self.app_event_tx
                     .send(AppEvent::InsertHistoryCell(Box::new(orphan)));
+                self.request_redraw();
+            }
+            ExecEndTarget::AppendCompletedExploration => {
+                if let Some(cell) = self
+                    .transcript
+                    .active_cell
+                    .as_mut()
+                    .and_then(|cell| cell.as_any_mut().downcast_mut::<ExecCell>())
+                {
+                    let added = cell.add_call(
+                        id.clone(),
+                        command.clone(),
+                        parsed.clone(),
+                        presentation.clone(),
+                        source,
+                        /*interaction_input*/ None,
+                    );
+                    if added {
+                        let completed = cell.complete_call(&id, output, duration);
+                        debug_assert!(completed, "joined exploration call should contain {id}");
+                        self.bump_active_cell_revision();
+                        self.request_redraw();
+                        debug_assert!(!is_user_shell, "user shell calls cannot join exploration");
+                        return;
+                    }
+                }
+
+                // The target is chosen from the current active cell immediately above, but
+                // recover defensively if that invariant changes instead of dropping resume data.
+                self.flush_active_cell();
+                let mut cell = new_active_exec_command(
+                    id.clone(),
+                    command,
+                    parsed,
+                    presentation,
+                    source,
+                    /*interaction_input*/ None,
+                    self.config.animations,
+                );
+                let completed = cell.complete_call(&id, output, duration);
+                debug_assert!(completed, "fallback exploration cell should contain {id}");
+                self.transcript.active_cell = Some(Box::new(cell));
+                self.bump_active_cell_revision();
                 self.request_redraw();
             }
             ExecEndTarget::NewCell => {
@@ -431,6 +661,7 @@ impl ChatWidget {
                     id.clone(),
                     command,
                     parsed,
+                    presentation,
                     source,
                     /*interaction_input*/ None,
                     self.config.animations,
@@ -446,8 +677,6 @@ impl ChatWidget {
                 }
             }
         }
-        // Mark that actual work was done (command executed)
-        self.transcript.had_work_activity = true;
         if is_user_shell {
             self.maybe_send_next_queued_input();
         }

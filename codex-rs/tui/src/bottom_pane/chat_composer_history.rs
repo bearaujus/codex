@@ -134,6 +134,10 @@ pub(crate) struct ChatComposerHistory {
     /// Messages submitted by the user *during this UI session* (newest at END).
     /// Local entries retain full draft state (text elements, image paths, pending pastes, remote image URLs).
     local_history: Vec<HistoryEntry>,
+    /// Stable identifiers parallel to `local_history`, used to undo one
+    /// submission without removing newer command/history entries.
+    local_history_ids: Vec<u64>,
+    next_local_history_id: u64,
     /// Local entries seeded from resumed transcript replay.
     replay_seeded_history: Vec<HistoryEntry>,
 
@@ -257,6 +261,8 @@ impl ChatComposerHistory {
             persistent_log_id: None,
             persistent_entry_count: 0,
             local_history: Vec::new(),
+            local_history_ids: Vec::new(),
+            next_local_history_id: 1,
             replay_seeded_history: Vec::new(),
             fetched_history: HashMap::new(),
             history_cursor: None,
@@ -289,6 +295,7 @@ impl ChatComposerHistory {
         self.persistent_entry_count = entry_count;
         self.fetched_history.clear();
         self.local_history.clear();
+        self.local_history_ids.clear();
         self.replay_seeded_history.clear();
         self.history_cursor = None;
         self.pending_navigation_direction = None;
@@ -304,13 +311,17 @@ impl ChatComposerHistory {
         self.record_local_submission_inner(entry);
     }
 
+    pub fn record_local_submission_with_id(&mut self, entry: HistoryEntry) -> Option<u64> {
+        self.record_local_submission_inner(entry)
+    }
+
     pub fn record_replayed_submission(&mut self, entry: HistoryEntry) {
-        if self.record_local_submission_inner(entry.clone()) {
+        if self.record_local_submission_inner(entry.clone()).is_some() {
             self.replay_seeded_history.push(entry);
         }
     }
 
-    fn record_local_submission_inner(&mut self, entry: HistoryEntry) -> bool {
+    fn record_local_submission_inner(&mut self, entry: HistoryEntry) -> Option<u64> {
         if entry.text.is_empty()
             && entry.text_elements.is_empty()
             && entry.local_image_paths.is_empty()
@@ -318,7 +329,7 @@ impl ChatComposerHistory {
             && entry.mention_bindings.is_empty()
             && entry.pending_pastes.is_empty()
         {
-            return false;
+            return None;
         }
         self.history_cursor = None;
         self.pending_navigation_direction = None;
@@ -327,10 +338,31 @@ impl ChatComposerHistory {
 
         // Avoid inserting a duplicate if identical to the previous entry.
         if self.local_history.last().is_some_and(|prev| prev == &entry) {
-            return false;
+            return None;
         }
 
+        let id = self.next_local_history_id;
+        self.next_local_history_id = self.next_local_history_id.wrapping_add(1).max(1);
         self.local_history.push(entry);
+        self.local_history_ids.push(id);
+        Some(id)
+    }
+
+    /// Remove one locally recorded submission by identity.
+    ///
+    /// Newer entries are preserved, which matters when an immediate command is
+    /// used during another message's Undo Send window.
+    pub fn remove_local_submission(&mut self, id: u64) -> bool {
+        let Some(index) = self
+            .local_history_ids
+            .iter()
+            .position(|candidate| *candidate == id)
+        else {
+            return false;
+        };
+        self.local_history.remove(index);
+        self.local_history_ids.remove(index);
+        self.reset_navigation();
         true
     }
 
@@ -1000,6 +1032,25 @@ mod tests {
             history.local_history.last().unwrap(),
             &HistoryEntry::new("world".to_string())
         );
+    }
+
+    #[test]
+    fn removing_submission_by_id_preserves_newer_history() {
+        let mut history = ChatComposerHistory::new();
+        let cancelled_id = history
+            .record_local_submission_with_id(HistoryEntry::new("cancelled".to_string()))
+            .expect("first entry should be recorded");
+        let newer_id = history
+            .record_local_submission_with_id(HistoryEntry::new("newer command".to_string()))
+            .expect("second entry should be recorded");
+
+        assert!(history.remove_local_submission(cancelled_id));
+        assert_eq!(
+            history.local_history,
+            vec![HistoryEntry::new("newer command".to_string())]
+        );
+        assert_eq!(history.local_history_ids, vec![newer_id]);
+        assert!(!history.remove_local_submission(cancelled_id));
     }
 
     #[test]

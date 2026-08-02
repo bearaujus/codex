@@ -7,18 +7,15 @@ use sha2::Sha256;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::fs::File;
-use std::fs::OpenOptions;
 use std::io::Read;
 use std::io::Write;
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use tempfile::Builder as TempFileBuilder;
 use tracing::warn;
 
-use super::BedrockApiKeyAuth;
 use crate::token_data::TokenData;
 use codex_agent_identity::AgentIdentityJwtClaims;
 use codex_agent_identity::decode_agent_identity_jwt;
@@ -41,30 +38,36 @@ pub struct AuthDotJson {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_mode: Option<AuthMode>,
 
-    #[serde(rename = "OPENAI_API_KEY")]
-    pub openai_api_key: Option<String>,
-
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens: Option<TokenData>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_account_id: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_refresh: Option<DateTime<Utc>>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_identity: Option<AgentIdentityStorage>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub personal_access_token: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bedrock_api_key: Option<BedrockApiKeyAuth>,
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum AgentIdentityStorage {
     Jwt(String),
     Record(AgentIdentityAuthRecord),
+}
+
+impl std::fmt::Debug for AgentIdentityStorage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Jwt(jwt) => f
+                .debug_struct("AgentIdentityJwt")
+                .field("jwt_set", &!jwt.is_empty())
+                .finish(),
+            Self::Record(record) => f.debug_tuple("AgentIdentityRecord").field(record).finish(),
+        }
+    }
 }
 
 impl AgentIdentityStorage {
@@ -86,7 +89,7 @@ impl AgentIdentityStorage {
     }
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct AgentIdentityAuthRecord {
     pub agent_runtime_id: String,
     pub agent_private_key: String,
@@ -102,6 +105,24 @@ pub struct AgentIdentityAuthRecord {
     pub chatgpt_account_is_fedramp: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
+}
+
+impl std::fmt::Debug for AgentIdentityAuthRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentIdentityAuthRecord")
+            .field("agent_runtime_id", &self.agent_runtime_id)
+            .field("agent_private_key", &"<redacted>")
+            .field("account_id", &self.account_id)
+            .field("chatgpt_user_id", &self.chatgpt_user_id)
+            .field("email", &self.email)
+            .field("plan_type", &self.plan_type)
+            .field(
+                "chatgpt_account_is_fedramp",
+                &self.chatgpt_account_is_fedramp,
+            )
+            .field("task_id", &self.task_id)
+            .finish()
+    }
 }
 
 fn deserialize_optional_non_empty_string<'de, D>(
@@ -201,20 +222,32 @@ impl AuthStorageBackend for FileAuthStorage {
 
     fn save(&self, auth_dot_json: &AuthDotJson) -> std::io::Result<()> {
         let auth_file = get_auth_file(&self.codex_home);
+        let dir = auth_file
+            .parent()
+            .ok_or_else(|| std::io::Error::other("auth file has no parent directory"))?;
+        std::fs::create_dir_all(dir)?;
 
-        if let Some(parent) = auth_file.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let json_data = serde_json::to_string_pretty(auth_dot_json)?;
-        let mut options = OpenOptions::new();
-        options.truncate(true).write(true).create(true);
+
+        // Write to a uniquely-named temp file in the same directory, then
+        // atomically rename it into place.  This guarantees that any reader
+        // either sees the complete previous file or the complete new file —
+        // never a zero-byte or partially-written auth.json (which would lose
+        // the refresh token and permanently break the account).
+        let mut builder = TempFileBuilder::new();
+        builder.prefix("auth.json.").suffix(".tmp");
         #[cfg(unix)]
         {
-            options.mode(0o600);
+            use std::os::unix::fs::OpenOptionsExt;
+            builder.permissions(std::fs::Permissions::from(
+                std::os::unix::fs::PermissionsExt::from_mode(0o600),
+            ));
         }
-        let mut file = options.open(auth_file)?;
-        file.write_all(json_data.as_bytes())?;
-        file.flush()?;
+        let mut temp = builder.tempfile_in(dir)?;
+        temp.write_all(json_data.as_bytes())?;
+        temp.flush()?;
+        temp.as_file().sync_all()?;
+        temp.persist(&auth_file).map_err(|e| e.error)?;
         Ok(())
     }
 

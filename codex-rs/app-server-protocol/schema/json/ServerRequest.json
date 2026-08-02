@@ -124,35 +124,6 @@
     "AttestationGenerateParams": {
       "type": "object"
     },
-    "ChatgptAuthTokensRefreshParams": {
-      "properties": {
-        "previousAccountId": {
-          "description": "Workspace/account identifier that Codex was previously using.\n\nClients that manage multiple accounts/workspaces can use this as a hint to refresh the token for the correct workspace.\n\nThis may be `null` when the prior auth state did not include a workspace identifier (`chatgpt_account_id`).",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "reason": {
-          "$ref": "#/definitions/ChatgptAuthTokensRefreshReason"
-        }
-      },
-      "required": [
-        "reason"
-      ],
-      "type": "object"
-    },
-    "ChatgptAuthTokensRefreshReason": {
-      "oneOf": [
-        {
-          "description": "Codex attempted a backend request and received `401 Unauthorized`.",
-          "enum": [
-            "unauthorized"
-          ],
-          "type": "string"
-        }
-      ]
-    },
     "CommandAction": {
       "oneOf": [
         {
@@ -164,7 +135,7 @@
               "type": "string"
             },
             "path": {
-              "$ref": "#/definitions/AbsolutePathBuf"
+              "$ref": "#/definitions/LegacyAppPathString"
             },
             "type": {
               "enum": [
@@ -1732,12 +1703,16 @@
       "properties": {
         "autoResolutionMs": {
           "default": null,
+          "description": "@deprecated Use `isBlocking` to decide whether the request should block.",
           "format": "uint64",
           "minimum": 0.0,
           "type": [
             "integer",
             "null"
           ]
+        },
+        "isBlocking": {
+          "type": "boolean"
         },
         "itemId": {
           "type": "string"
@@ -1756,6 +1731,7 @@
         }
       },
       "required": [
+        "isBlocking",
         "itemId",
         "questions",
         "threadId",
@@ -1951,30 +1927,6 @@
         "params"
       ],
       "title": "Item/tool/callRequest",
-      "type": "object"
-    },
-    {
-      "properties": {
-        "id": {
-          "$ref": "#/definitions/RequestId"
-        },
-        "method": {
-          "enum": [
-            "account/chatgptAuthTokens/refresh"
-          ],
-          "title": "Account/chatgptAuthTokens/refreshRequestMethod",
-          "type": "string"
-        },
-        "params": {
-          "$ref": "#/definitions/ChatgptAuthTokensRefreshParams"
-        }
-      },
-      "required": [
-        "id",
-        "method",
-        "params"
-      ],
-      "title": "Account/chatgptAuthTokens/refreshRequest",
       "type": "object"
     },
     {

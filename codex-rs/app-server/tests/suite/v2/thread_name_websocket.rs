@@ -15,7 +15,7 @@ use app_test_support::create_fake_rollout_with_text_elements;
 use app_test_support::create_mock_responses_server_repeating_assistant;
 use app_test_support::to_response;
 use codex_app_server_protocol::JSONRPCNotification;
-use codex_app_server_protocol::JSONRPCResponse;
+use codex_app_server_protocol::ThreadGoalClearedNotification;
 use codex_app_server_protocol::ThreadNameUpdatedNotification;
 use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadResumeResponse;
@@ -53,9 +53,18 @@ async fn thread_name_updated_broadcasts_for_loaded_threads() -> Result<()> {
             })?),
         )
         .await?;
-        let resume_resp: JSONRPCResponse = read_response_for_id(&mut ws1, /*id*/ 10).await?;
+        let (resume_resp, ws1_goal_notification) = read_response_and_notification_for_method(
+            &mut ws1,
+            /*id*/ 10,
+            "thread/goal/cleared",
+        )
+        .await?;
         let resume: ThreadResumeResponse = to_response::<ThreadResumeResponse>(resume_resp)?;
         assert_eq!(resume.thread.id, conversation_id);
+        assert_thread_goal_cleared(ws1_goal_notification, &conversation_id)?;
+        let ws2_goal_notification =
+            read_notification_for_method(&mut ws2, "thread/goal/cleared").await?;
+        assert_thread_goal_cleared(ws2_goal_notification, &conversation_id)?;
 
         let renamed = "Loaded rename";
         send_request(
@@ -177,6 +186,18 @@ fn assert_thread_name_updated(
         serde_json::from_value(notification.params.context("thread/name/updated params")?)?;
     assert_eq!(notification.thread_id, thread_id);
     assert_eq!(notification.thread_name.as_deref(), Some(thread_name));
+    Ok(())
+}
+
+fn assert_thread_goal_cleared(notification: JSONRPCNotification, thread_id: &str) -> Result<()> {
+    let notification: ThreadGoalClearedNotification =
+        serde_json::from_value(notification.params.context("thread/goal/cleared params")?)?;
+    assert_eq!(
+        notification,
+        ThreadGoalClearedNotification {
+            thread_id: thread_id.to_string(),
+        }
+    );
     Ok(())
 }
 

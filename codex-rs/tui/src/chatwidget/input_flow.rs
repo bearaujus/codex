@@ -21,6 +21,7 @@ impl ChatWidget {
             InputResult::Submitted {
                 text,
                 text_elements,
+                restore_draft,
             } => {
                 let user_message = self.user_message_from_submission(text, text_elements);
                 if user_message.text.is_empty()
@@ -29,35 +30,28 @@ impl ChatWidget {
                 {
                     return;
                 }
-                let should_submit_now = self.is_session_configured()
-                    && !self.is_plan_streaming_in_tui()
-                    && !self.input_queue.suppress_queue_autosend;
-                if should_submit_now {
-                    if self.only_user_shell_commands_running()
-                        && !user_message.text.starts_with('!')
-                    {
-                        self.queue_user_message(user_message);
-                        return;
-                    }
-                    // Submitted is emitted when user submits.
-                    // Reset any reasoning header only when we are actually submitting a turn.
-                    self.reasoning_buffer.clear();
-                    self.reasoning_header = None;
-                    self.reasoning_summary_parts.clear();
-                    self.set_status_header(String::from("Working"));
-                    self.submit_user_message(user_message);
-                } else {
-                    self.queue_user_message(user_message);
-                }
+                self.stage_user_message_for_undo(
+                    user_message,
+                    restore_draft,
+                    StagedInputRoute::Dispatch,
+                );
             }
             InputResult::Queued {
                 text,
                 text_elements,
                 action,
                 pending_pastes,
+                restore_draft,
             } => {
                 let user_message = self.user_message_from_submission(text, text_elements);
-                self.queue_user_message_with_options(user_message, action, pending_pastes);
+                self.stage_user_message_for_undo(
+                    user_message,
+                    restore_draft,
+                    StagedInputRoute::Queue {
+                        action,
+                        pending_pastes,
+                    },
+                );
             }
             InputResult::Command(cmd) => {
                 self.handle_slash_command_dispatch(cmd);
@@ -77,6 +71,28 @@ impl ChatWidget {
             self.maybe_send_next_queued_input();
         }
         self.refresh_plan_mode_nudge();
+    }
+
+    /// Dispatch a composer message after its Undo Send grace window expires.
+    pub(super) fn dispatch_composer_user_message(&mut self, user_message: UserMessage) {
+        let should_submit_now = self.is_session_configured()
+            && !self.is_plan_streaming_in_tui()
+            && !self.input_queue.suppress_queue_autosend
+            && (!self.input_queue.user_turn_pending_start
+                || self.turn_lifecycle.agent_turn_running);
+        if should_submit_now {
+            if self.only_user_shell_commands_running() && !user_message.text.starts_with('!') {
+                self.queue_user_message(user_message);
+                return;
+            }
+            self.reasoning_buffer.clear();
+            self.reasoning_header = None;
+            self.reasoning_summary_parts.clear();
+            self.set_status_header(String::from("Working"));
+            self.submit_user_message(user_message);
+        } else {
+            self.queue_user_message(user_message);
+        }
     }
 
     pub(super) fn defer_input_until_settings_applied(&mut self) {
@@ -108,10 +124,10 @@ impl ChatWidget {
         action: QueuedInputAction,
         pending_pastes: Vec<(String, String)>,
     ) {
-        if !self.is_session_configured()
-            || self.is_user_turn_pending_or_running()
-            || self.input_queue.suppress_queue_autosend
-        {
+        let should_run_now = self.is_session_configured()
+            && !self.is_user_turn_pending_or_running()
+            && !self.input_queue.suppress_queue_autosend;
+        if !should_run_now || action != QueuedInputAction::Plain {
             self.input_queue
                 .queued_user_messages
                 .push_back(QueuedUserMessage {
@@ -123,6 +139,9 @@ impl ChatWidget {
                 .queued_user_message_history_records
                 .push_back(UserMessageHistoryRecord::UserMessageText);
             self.refresh_pending_input_preview();
+            if should_run_now {
+                self.maybe_send_next_queued_input();
+            }
         } else {
             self.submit_user_message(user_message);
         }
@@ -174,7 +193,10 @@ impl ChatWidget {
     }
 
     pub(super) fn is_user_turn_pending_or_running(&self) -> bool {
-        self.input_queue.user_turn_pending_start || self.bottom_pane.is_task_running()
+        self.input_queue.user_turn_pending_start
+            || self.turn_lifecycle.agent_turn_running
+            || self.review.is_review_mode
+            || (self.bottom_pane.is_task_running() && self.mcp_startup_status.is_none())
     }
 
     pub(super) fn only_user_shell_commands_running(&self) -> bool {
@@ -188,7 +210,42 @@ impl ChatWidget {
 
     /// Rebuild and update the bottom-pane pending-input preview.
     pub(super) fn refresh_pending_input_preview(&mut self) {
+        self.refresh_pending_input_preview_at(Instant::now());
+    }
+
+    pub(super) fn refresh_pending_input_preview_at(&mut self, now: Instant) {
+        let staged = self
+            .input_queue
+            .staged_user_messages
+            .iter()
+            .map(|message| {
+                let mut preview = message.restore_composer.text.clone();
+                let image_count = message.restore_composer.local_images.len()
+                    + message.restore_composer.remote_image_urls.len();
+                if preview.trim().is_empty() && image_count > 0 {
+                    let suffix = if image_count == 1 { "" } else { "s" };
+                    preview = format!("[{image_count} image attachment{suffix}]");
+                } else {
+                    let represented_local_images = message
+                        .restore_composer
+                        .local_images
+                        .iter()
+                        .filter(|image| preview.contains(&image.placeholder))
+                        .count();
+                    let hidden_image_count = image_count.saturating_sub(represented_local_images);
+                    if hidden_image_count > 0 {
+                        let suffix = if hidden_image_count == 1 { "" } else { "s" };
+                        preview.push_str(&format!(
+                            " · [{hidden_image_count} image attachment{suffix}]"
+                        ));
+                    }
+                }
+                let remaining = message.send_at.saturating_duration_since(now);
+                (preview, undo_send::countdown_seconds(remaining))
+            })
+            .collect();
         let preview = self.input_queue.preview();
+        self.bottom_pane.set_staged_input_preview(staged);
         self.bottom_pane.set_pending_input_preview(
             preview.queued_messages,
             preview.pending_steers,

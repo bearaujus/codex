@@ -1,6 +1,7 @@
 use super::*;
 use codex_app_server_protocol::ImageGenerationItem;
 use codex_app_server_protocol::PluginAvailability;
+use codex_utils_absolute_path::test_support::PathExt;
 use pretty_assertions::assert_eq;
 
 pub(super) async fn test_config() -> Config {
@@ -15,7 +16,7 @@ pub(super) async fn test_config() -> Config {
             .await
             .expect("config");
     config.codex_home = codex_home.abs();
-    config.sqlite_home = codex_home.clone();
+    config.sqlite = codex_state::SqliteConfig::new_for_testing(codex_home.as_path().abs());
     config.log_dir = codex_home.join("log");
     config.cwd = PathBuf::from(test_path_display("/tmp/project")).abs();
     config.config_layer_stack = ConfigLayerStack::default();
@@ -105,6 +106,7 @@ pub(super) fn snapshot(percent: f64) -> RateLimitSnapshot {
     RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        fetched_at: None,
         primary: Some(RateLimitWindow {
             used_percent: percent.round() as i32,
             window_duration_mins: Some(60),
@@ -203,6 +205,7 @@ pub(super) async fn make_chatwidget_manual_with_auth(
         session_telemetry,
     };
     let mut widget = ChatWidget::new_with_op_target(common, super::CodexOpTarget::Direct(op_tx));
+    widget.set_undo_send_delay_for_test(Duration::ZERO);
     widget.transcript.active_cell = None;
     widget.transcript.active_cell_revision = 0;
     widget.normal_placeholder_text = "Ask Codex to do anything".to_string();
@@ -213,6 +216,10 @@ pub(super) async fn make_chatwidget_manual_with_auth(
         .set_placeholder_text(widget.normal_placeholder_text.clone());
     widget.set_model(&resolved_model);
     (widget, rx, op_rx)
+}
+
+pub(crate) fn set_active_cell(chat: &mut ChatWidget, cell: Box<dyn HistoryCell>) {
+    chat.transcript.active_cell = Some(cell);
 }
 
 // ChatWidget may emit other `Op`s (e.g. history/logging updates) on the same channel; this helper
@@ -336,6 +343,15 @@ pub(super) fn drain_insert_history(
         }
     }
     out
+}
+
+pub(super) fn drain_insert_history_text(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+) -> String {
+    drain_insert_history(rx)
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect()
 }
 
 pub(super) fn lines_to_single_string(lines: &[ratatui::text::Line<'static>]) -> String {
@@ -495,6 +511,14 @@ pub(super) fn handle_model_verification(
 }
 
 pub(super) fn handle_agent_message_delta(chat: &mut ChatWidget, delta: impl Into<String>) {
+    handle_agent_message_delta_for_item(chat, "msg-1", delta);
+}
+
+pub(super) fn handle_agent_message_delta_for_item(
+    chat: &mut ChatWidget,
+    item_id: &str,
+    delta: impl Into<String>,
+) {
     chat.handle_server_notification(
         ServerNotification::AgentMessageDelta(
             codex_app_server_protocol::AgentMessageDeltaNotification {
@@ -504,10 +528,35 @@ pub(super) fn handle_agent_message_delta(chat: &mut ChatWidget, delta: impl Into
                     .last_turn_id
                     .clone()
                     .unwrap_or_else(|| "turn-1".to_string()),
-                item_id: "msg-1".to_string(),
+                item_id: item_id.to_string(),
                 delta: delta.into(),
             },
         ),
+        /*replay_kind*/ None,
+    );
+}
+
+pub(super) fn start_assistant_message(
+    chat: &mut ChatWidget,
+    item_id: &str,
+    phase: Option<MessagePhase>,
+) {
+    chat.handle_server_notification(
+        ServerNotification::ItemStarted(ItemStartedNotification {
+            thread_id: thread_id(chat),
+            turn_id: chat
+                .turn_lifecycle
+                .last_turn_id
+                .clone()
+                .unwrap_or_else(|| "turn-1".to_string()),
+            started_at_ms: 0,
+            item: AppServerThreadItem::AgentMessage {
+                id: item_id.to_string(),
+                text: String::new(),
+                phase,
+                memory_citation: None,
+            },
+        }),
         /*replay_kind*/ None,
     );
 }
@@ -761,11 +810,27 @@ pub(super) fn replay_agent_message(
     text: impl Into<String>,
     replay_kind: ReplayKind,
 ) {
+    replay_agent_message_with_phase(
+        chat,
+        item_id,
+        text,
+        Some(MessagePhase::FinalAnswer),
+        replay_kind,
+    );
+}
+
+pub(super) fn replay_agent_message_with_phase(
+    chat: &mut ChatWidget,
+    item_id: &str,
+    text: impl Into<String>,
+    phase: Option<MessagePhase>,
+    replay_kind: ReplayKind,
+) {
     chat.replay_thread_item(
         AppServerThreadItem::AgentMessage {
             id: item_id.to_string(),
             text: text.into(),
-            phase: Some(MessagePhase::FinalAnswer),
+            phase,
             memory_citation: None,
         },
         "turn-1".to_string(),
@@ -825,6 +890,8 @@ pub(super) fn begin_exec_with_source(
         command: codex_shell_command::parse_command::shlex_join(&command),
         cwd: chat.config.cwd.clone().into(),
         process_id: None,
+        plugin_id: None,
+        script_path: None,
         source,
         status: AppServerCommandExecutionStatus::InProgress,
         command_actions,
@@ -848,6 +915,8 @@ pub(super) fn begin_unified_exec_startup(
         command: codex_shell_command::parse_command::shlex_join(&command),
         cwd: chat.config.cwd.clone().into(),
         process_id: Some(process_id.to_string()),
+        plugin_id: None,
+        script_path: None,
         source: ExecCommandSource::UnifiedExecStartup,
         status: AppServerCommandExecutionStatus::InProgress,
         command_actions: Vec::new(),
@@ -1060,6 +1129,8 @@ pub(super) fn end_exec(
         command,
         cwd,
         process_id,
+        plugin_id,
+        script_path,
         source,
         command_actions,
         ..
@@ -1074,6 +1145,8 @@ pub(super) fn end_exec(
             command,
             cwd,
             process_id,
+            plugin_id,
+            script_path,
             source,
             status: if exit_code == 0 {
                 AppServerCommandExecutionStatus::Completed
@@ -1104,6 +1177,24 @@ pub(super) fn handle_exec_end(chat: &mut ChatWidget, item: AppServerThreadItem) 
     );
 }
 
+pub(super) fn handle_exec_output_delta(chat: &mut ChatWidget, call_id: &str, delta: &str) {
+    chat.handle_server_notification(
+        ServerNotification::CommandExecutionOutputDelta(
+            codex_app_server_protocol::CommandExecutionOutputDeltaNotification {
+                thread_id: thread_id(chat),
+                turn_id: chat
+                    .turn_lifecycle
+                    .last_turn_id
+                    .clone()
+                    .unwrap_or_else(|| "turn-1".to_string()),
+                item_id: call_id.to_string(),
+                delta: delta.to_string(),
+            },
+        ),
+        /*replay_kind*/ None,
+    );
+}
+
 pub(super) fn active_blob(chat: &ChatWidget) -> String {
     let lines = chat
         .transcript
@@ -1112,6 +1203,12 @@ pub(super) fn active_blob(chat: &ChatWidget) -> String {
         .expect("active cell present")
         .display_lines(/*width*/ 80);
     lines_to_single_string(&lines)
+}
+
+pub(super) fn active_blob_or_empty(chat: &ChatWidget) -> String {
+    chat.active_cell_transcript_lines(/*width*/ 80)
+        .map(|lines| lines_to_single_string(&lines))
+        .unwrap_or_default()
 }
 
 pub(super) fn active_hook_blob(chat: &ChatWidget) -> String {
@@ -1160,7 +1257,7 @@ pub(super) async fn assert_shift_left_edits_most_recent_queued_message_for_termi
 ) {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.queued_message_edit_hint_binding =
-        Some(queued_message_edit_binding_for_terminal(terminal_info));
+        Some(queued_message_edit_binding_for_terminal(terminal_info).into());
     chat.bottom_pane
         .set_queued_message_edit_binding(chat.queued_message_edit_hint_binding);
 
@@ -1341,12 +1438,15 @@ pub(super) fn plugins_test_summary(
             path: plugins_test_absolute_path(&format!("plugins/{name}")),
         },
         installed,
+        installed_at: None,
         enabled,
         install_policy,
         install_policy_source: None,
         must_show_installation_interstitial: None,
         auth_policy: PluginAuthPolicy::OnInstall,
         availability: PluginAvailability::Available,
+        disabled_reason: None,
+        eligible_plan_types: None,
         interface: Some(plugins_test_interface(
             display_name,
             description,
@@ -1372,12 +1472,15 @@ pub(super) fn plugins_test_remote_summary(
         share_context: None,
         source: PluginSource::Remote,
         installed,
+        installed_at: None,
         enabled: true,
         install_policy: PluginInstallPolicy::Available,
         install_policy_source: None,
         must_show_installation_interstitial: None,
         auth_policy: PluginAuthPolicy::OnInstall,
         availability: PluginAvailability::Available,
+        disabled_reason: None,
+        eligible_plan_types: None,
         interface: Some(plugins_test_interface(
             display_name,
             description,

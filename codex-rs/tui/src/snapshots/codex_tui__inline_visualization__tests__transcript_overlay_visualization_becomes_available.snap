@@ -4,7 +4,7 @@ expression: "format!(\"before:\\n{unavailable}\\n\\nafter:\\n{available}\")"
 ---
 before:
 / T R A N S C R I P T / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / /
-• Visualization unavailable on this device.
+› Visualization unavailable on this device.
 ~
 ~
 ~
@@ -18,10 +18,10 @@ before:
 
 after:
 / T R A N S C R I P T / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / / /
-• Open chart visualization in the browser
+› Open chart visualization in the browser
   file://<viewer-path>
 
-• next message
+› next message
 ~
 ~
 ~

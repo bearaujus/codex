@@ -15,7 +15,6 @@ use super::manager::REVOKE_TOKEN_URL;
 use super::manager::REVOKE_TOKEN_URL_OVERRIDE_ENV_VAR;
 use super::manager::oauth_client_id;
 use super::storage::AuthDotJson;
-use super::util::try_parse_error_message;
 use crate::default_client::create_default_auth_client;
 use crate::outbound_proxy::AuthRouteConfig;
 use crate::token_data::TokenData;
@@ -54,7 +53,7 @@ struct RevokeTokenRequest<'a> {
 
 pub(super) async fn revoke_auth_tokens(
     auth_dot_json: Option<&AuthDotJson>,
-    auth_route_config: Option<&AuthRouteConfig>,
+    auth_route_config: &AuthRouteConfig,
 ) -> Result<(), std::io::Error> {
     let Some((token, kind)) = auth_dot_json.and_then(revocable_token) else {
         return Ok(());
@@ -63,6 +62,25 @@ pub(super) async fn revoke_auth_tokens(
     let endpoint = revoke_token_endpoint();
     let client = create_default_auth_client(&endpoint, auth_route_config)?;
     revoke_oauth_token(&client, endpoint.as_str(), token, kind, REVOKE_HTTP_TIMEOUT).await
+}
+
+pub(super) async fn revoke_refresh_token(
+    refresh_token: &str,
+    auth_route_config: &AuthRouteConfig,
+) -> Result<(), std::io::Error> {
+    if refresh_token.is_empty() {
+        return Ok(());
+    }
+    let endpoint = revoke_token_endpoint();
+    let client = create_default_auth_client(&endpoint, auth_route_config)?;
+    revoke_oauth_token(
+        &client,
+        endpoint.as_str(),
+        refresh_token,
+        RevokeTokenKind::Refresh,
+        REVOKE_HTTP_TIMEOUT,
+    )
+    .await
 }
 
 fn revocable_token(auth_dot_json: &AuthDotJson) -> Option<(&str, RevokeTokenKind)> {
@@ -85,13 +103,7 @@ fn managed_chatgpt_tokens(auth_dot_json: &AuthDotJson) -> Option<&TokenData> {
 }
 
 fn resolved_auth_mode(auth_dot_json: &AuthDotJson) -> AuthMode {
-    if let Some(mode) = auth_dot_json.auth_mode {
-        return mode;
-    }
-    if auth_dot_json.openai_api_key.is_some() {
-        return AuthMode::ApiKey;
-    }
-    AuthMode::Chatgpt
+    auth_dot_json.auth_mode.unwrap_or(AuthMode::Chatgpt)
 }
 
 async fn revoke_oauth_token(
@@ -121,13 +133,10 @@ async fn revoke_oauth_token(
         return Ok(());
     }
 
-    let body = response.text().await.unwrap_or_default();
-    let message = try_parse_error_message(&body);
     Err(std::io::Error::other(format!(
-        "failed to revoke {}: {}: {}",
+        "failed to revoke {}: {}",
         kind.as_str(),
         status,
-        message
     )))
 }
 
@@ -200,8 +209,42 @@ mod tests {
 
         let reqwest_error = error
             .get_ref()
-            .and_then(|error| error.downcast_ref::<reqwest::Error>())
-            .expect("timeout error should preserve reqwest error");
+            .and_then(|error| error.downcast_ref::<codex_http_client::HttpError>())
+            .expect("timeout error should preserve HTTP client error");
         assert!(reqwest_error.is_timeout());
+    }
+
+    #[tokio::test]
+    async fn revoke_error_does_not_expose_response_body() {
+        const SENTINEL: &str = "secret-refresh-token-echo";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/revoke"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(SENTINEL))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let endpoint = format!("{}/oauth/revoke", server.uri());
+        let client = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault)
+            .build_client(&endpoint, ClientRouteClass::Auth)
+            .expect("test HTTP client should build");
+        let error = revoke_oauth_token(
+            &client,
+            endpoint.as_str(),
+            SENTINEL,
+            RevokeTokenKind::Refresh,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("failed revoke should return an error");
+        let rendered = error.to_string();
+
+        assert!(
+            !rendered.contains(SENTINEL),
+            "revoke error leaked response body: {rendered}"
+        );
+        assert!(rendered.contains("400 Bad Request"));
+        server.verify().await;
     }
 }

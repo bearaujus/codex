@@ -37,11 +37,11 @@ use crate::terminal_hyperlinks::mark_buffer_hyperlinks;
 use crate::terminal_hyperlinks::plain_hyperlink_lines;
 use crate::terminal_hyperlinks::prefix_hyperlink_lines;
 use crate::terminal_hyperlinks::visible_lines;
+use crate::terminal_hyperlinks::visible_lines_ref;
 #[cfg(test)]
 use crate::test_support::PathBufExt;
 #[cfg(test)]
 use crate::test_support::test_path_buf;
-use crate::text_formatting::format_and_truncate_tool_result;
 use crate::text_formatting::truncate_text;
 use crate::tooltips;
 use crate::ui_consts::LIVE_PREFIX_COLS;
@@ -102,11 +102,9 @@ use std::time::Duration;
 use std::time::Instant;
 use tracing::error;
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
 use url::Url;
 
 const RAW_DIFF_SUMMARY_WIDTH: usize = 10_000;
-const RAW_TOOL_OUTPUT_WIDTH: usize = 10_000;
 
 mod approvals;
 mod base;
@@ -114,6 +112,9 @@ mod exec;
 mod hook_cell;
 mod markdown_render_cache;
 mod mcp;
+mod mcp_tool_call;
+mod mcp_tool_call_args;
+mod mcp_tool_call_output;
 mod messages;
 mod notices;
 mod patches;
@@ -130,6 +131,7 @@ pub(crate) use hook_cell::HookCell;
 pub(crate) use hook_cell::new_active_hook_cell;
 pub(crate) use hook_cell::new_completed_hook_cell;
 pub(crate) use mcp::*;
+pub(crate) use mcp_tool_call::*;
 pub(crate) use messages::*;
 pub(crate) use notices::*;
 pub(crate) use patches::*;
@@ -256,22 +258,9 @@ pub(crate) trait HistoryCell: std::fmt::Debug + Send + Sync + Any {
 
     /// Returns the number of viewport rows for the transcript overlay.
     ///
-    /// Uses the same `Paragraph::line_count` measurement as
-    /// `desired_height`. Contains a workaround for a ratatui bug where
-    /// a single whitespace-only line reports 2 rows instead of 1.
+    /// Uses the same `Paragraph::line_count` measurement as `desired_height`.
     fn desired_transcript_height(&self, width: u16) -> u16 {
         let lines = visible_lines(self.transcript_hyperlink_lines(width));
-        // Workaround: ratatui's line_count returns 2 for a single
-        // whitespace-only line. Clamp to 1 in that case.
-        if let [line] = &lines[..]
-            && line
-                .spans
-                .iter()
-                .all(|s| s.content.chars().all(char::is_whitespace))
-        {
-            return 1;
-        }
-
         Paragraph::new(Text::from(lines))
             .wrap(Wrap { trim: false })
             .line_count(width)
@@ -309,7 +298,7 @@ pub(crate) trait HistoryCell: std::fmt::Debug + Send + Sync + Any {
 impl Renderable for Box<dyn HistoryCell> {
     fn render(&self, area: Rect, buf: &mut Buffer) {
         let hyperlink_lines = self.display_hyperlink_lines(area.width);
-        let lines = visible_lines(hyperlink_lines.clone());
+        let lines = visible_lines_ref(&hyperlink_lines);
         let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
         let y = if area.height == 0 {
             0

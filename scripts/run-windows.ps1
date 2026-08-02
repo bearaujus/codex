@@ -1,10 +1,8 @@
-# Build + run the local codex binary, forwarding any args.
-# Uses the cheap local profile for a tighter edit/run loop.
+# Run the already-prepared local codex binary, forwarding any args.
+# The Makefile's run target depends on build, so this script stays focused on
+# launching the resulting artifact bundle.
 $ErrorActionPreference = 'Stop'
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
-
-& (Join-Path $PSScriptRoot 'build.ps1') -CargoProfile dev-small
-
 $Exe = Join-Path $RepoRoot 'bin\codex.exe'
 & $Exe @args

@@ -2,6 +2,7 @@
 
 use super::markdown_render_cache::MarkdownRenderCache;
 use super::*;
+use crate::ui_consts::REASONING_PREVIEW_MAX_LINES;
 
 #[derive(Debug)]
 pub(crate) struct UserHistoryCell {
@@ -237,33 +238,77 @@ impl ReasoningSummaryCell {
     }
 
     fn lines(&self, width: u16) -> Vec<Line<'static>> {
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        append_markdown(
-            &self.content,
-            crate::width::usable_content_width_u16(width, /*reserved_cols*/ 2),
-            Some(self.cwd.as_path()),
-            &mut lines,
-        );
-        let summary_style = Style::default().dim().italic();
-        let summary_lines = lines
-            .into_iter()
-            .map(|mut line| {
-                line.spans = line
-                    .spans
-                    .into_iter()
-                    .map(|span| span.patch_style(summary_style))
-                    .collect();
-                line
-            })
-            .collect::<Vec<_>>();
-
-        adaptive_wrap_lines(
-            &summary_lines,
-            RtOptions::new(width as usize)
-                .initial_indent("• ".dim().into())
-                .subsequent_indent("  ".into()),
-        )
+        format_reasoning_summary_lines(&self.content, width, self.cwd.as_path())
     }
+}
+
+fn format_reasoning_summary_lines(content: &str, width: u16, cwd: &Path) -> Vec<Line<'static>> {
+    if content.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    append_markdown(
+        content,
+        crate::width::usable_content_width_u16(width, /*reserved_cols*/ 2),
+        Some(cwd),
+        &mut lines,
+    );
+    // Reasoning is supporting context rather than the final answer. Keep it
+    // subdued, but avoid forcing long passages into italics: terminal italic
+    // fonts are often narrower and substantially harder to scan.
+    let summary_style = Style::default().dim();
+    let summary_lines = lines
+        .into_iter()
+        // Markdown paragraph gaps make a live progress feed unnecessarily tall.
+        // Raw/transcript source still preserves the original spacing.
+        .filter(|line| {
+            line.spans
+                .iter()
+                .any(|span| !span.content.trim().is_empty())
+        })
+        .map(|mut line| {
+            line.spans = line
+                .spans
+                .into_iter()
+                .map(|mut span| {
+                    // Reasoning summaries frequently encode every progress update as a bold
+                    // heading. Preserving that weight turns a secondary activity feed into the
+                    // loudest surface on screen, so the reasoning rail carries the hierarchy
+                    // instead.
+                    span.style = span
+                        .style
+                        .patch(summary_style)
+                        .remove_modifier(Modifier::BOLD);
+                    span
+                })
+                .collect();
+            line
+        })
+        .collect::<Vec<_>>();
+
+    adaptive_wrap_lines(
+        &summary_lines,
+        RtOptions::new(width as usize)
+            .initial_indent("┊ ".dim().into())
+            .subsequent_indent("┊ ".dim().into()),
+    )
+}
+
+fn compact_reasoning_summary_lines(
+    lines: Vec<Line<'static>>,
+    max_visible_lines: usize,
+) -> Vec<Line<'static>> {
+    let hidden = lines.len().saturating_sub(max_visible_lines);
+    if hidden == 0 {
+        return lines;
+    }
+
+    lines.into_iter().skip(hidden).collect()
+}
+
+fn assistant_message_prefix() -> Span<'static> {
+    Span::styled("› ", crate::style::accent_style())
 }
 
 impl HistoryCell for ReasoningSummaryCell {
@@ -271,7 +316,7 @@ impl HistoryCell for ReasoningSummaryCell {
         if self.transcript_only {
             Vec::new()
         } else {
-            self.lines(width)
+            compact_reasoning_summary_lines(self.lines(width), REASONING_PREVIEW_MAX_LINES)
         }
     }
 
@@ -285,6 +330,12 @@ impl HistoryCell for ReasoningSummaryCell {
         } else {
             raw_lines_from_source(self.content.trim())
         }
+    }
+
+    fn is_stream_continuation(&self) -> bool {
+        // The reasoning rail already separates supporting context from the
+        // preceding block, so an additional blank transcript row is redundant.
+        true
     }
 }
 
@@ -320,7 +371,7 @@ impl HistoryCell for AgentMessageCell {
         let mut wrapped = Vec::new();
         for (index, line) in self.lines.iter().enumerate() {
             let initial_indent = if index == 0 && self.is_first_line {
-                "• ".dim().into()
+                assistant_message_prefix().into()
             } else {
                 "  ".into()
             };
@@ -371,6 +422,14 @@ pub(crate) struct AgentMarkdownCell {
     cwd: PathBuf,
     inline_visualization_context: Option<crate::inline_visualization::InlineVisualizationContext>,
     rendered_lines: Option<MarkdownRenderCache>,
+    presentation: AgentMarkdownPresentation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentMarkdownPresentation {
+    Answer,
+    Commentary,
+    TranscriptOnly,
 }
 
 impl AgentMarkdownCell {
@@ -403,28 +462,43 @@ impl AgentMarkdownCell {
             cwd: cwd.to_path_buf(),
             inline_visualization_context,
             rendered_lines,
+            presentation: AgentMarkdownPresentation::Answer,
         }
     }
-}
 
-impl HistoryCell for AgentMarkdownCell {
-    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        visible_lines(self.display_hyperlink_lines(width))
+    pub(crate) fn new_commentary(markdown_source: String, cwd: &Path) -> Self {
+        let mut cell = Self::new_with_inline_visualizations(
+            markdown_source,
+            cwd,
+            /*inline_visualization_context*/ None,
+        );
+        cell.presentation = AgentMarkdownPresentation::Commentary;
+        cell
     }
 
-    fn display_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
+    pub(crate) fn new_transcript_only(markdown_source: String, cwd: &Path) -> Self {
+        let mut cell = Self::new_with_inline_visualizations(
+            markdown_source,
+            cwd,
+            /*inline_visualization_context*/ None,
+        );
+        cell.presentation = AgentMarkdownPresentation::TranscriptOnly;
+        cell
+    }
+
+    fn rendered_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
         let render = || {
             let Some(wrap_width) =
                 crate::width::usable_content_width_u16(width, /*reserved_cols*/ 2)
             else {
                 return prefix_hyperlink_lines(
                     vec![HyperlinkLine::new(Line::default())],
-                    "• ".dim(),
+                    self.message_prefix(),
                     "  ".into(),
                 );
             };
 
-            // Re-render markdown from source at the current width. Reserve 2 columns for the "• " /
+            // Re-render markdown from source at the current width. Reserve 2 columns for the "› " /
             // " " prefix prepended below.
             let lines = crate::markdown::render_markdown_agent_with_links_cwd_and_visualizations(
                 &self.markdown_source,
@@ -432,7 +506,11 @@ impl HistoryCell for AgentMarkdownCell {
                 Some(self.cwd.as_path()),
                 self.inline_visualization_context.as_ref(),
             );
-            prefix_hyperlink_lines(lines, "• ".dim(), "  ".into())
+            normalize_whitespace_only_hyperlink_lines(prefix_hyperlink_lines(
+                lines,
+                self.message_prefix(),
+                "  ".into(),
+            ))
         };
 
         if let Some(rendered_lines) = &self.rendered_lines {
@@ -442,8 +520,50 @@ impl HistoryCell for AgentMarkdownCell {
         }
     }
 
+    fn message_prefix(&self) -> Span<'static> {
+        match self.presentation {
+            AgentMarkdownPresentation::Commentary => "• ".cyan().bold(),
+            AgentMarkdownPresentation::Answer | AgentMarkdownPresentation::TranscriptOnly => {
+                assistant_message_prefix()
+            }
+        }
+    }
+}
+
+fn normalize_whitespace_only_hyperlink_lines(mut lines: Vec<HyperlinkLine>) -> Vec<HyperlinkLine> {
+    for line in &mut lines {
+        if line
+            .line
+            .spans
+            .iter()
+            .all(|span| span.content.chars().all(char::is_whitespace))
+        {
+            line.line = Line::default().style(line.line.style);
+            line.hyperlinks.clear();
+        }
+    }
+    lines
+}
+
+impl HistoryCell for AgentMarkdownCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        visible_lines(self.display_hyperlink_lines(width))
+    }
+
+    fn display_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
+        if self.presentation == AgentMarkdownPresentation::TranscriptOnly {
+            Vec::new()
+        } else {
+            self.rendered_hyperlink_lines(width)
+        }
+    }
+
     fn transcript_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
-        self.display_hyperlink_lines(width)
+        self.rendered_hyperlink_lines(width)
+    }
+
+    fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
+        visible_lines(self.rendered_hyperlink_lines(width))
     }
 
     fn raw_lines(&self) -> Vec<Line<'static>> {
@@ -452,6 +572,49 @@ impl HistoryCell for AgentMarkdownCell {
 
     fn has_stable_transcript_height(&self) -> bool {
         self.rendered_lines.is_some()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct InterruptedCommentaryCell {
+    summary: String,
+}
+
+impl InterruptedCommentaryCell {
+    pub(crate) fn new(markdown_source: &str) -> Self {
+        let summary = markdown_source
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("Work stopped before a final response.")
+            .trim_start_matches(['>', '-', '*', '•', '›', ' '])
+            .to_string();
+        Self { summary }
+    }
+}
+
+impl HistoryCell for InterruptedCommentaryCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let line = Line::from(vec![
+            "• ".red().bold(),
+            "Interrupted: ".bold(),
+            self.summary.clone().dim(),
+        ]);
+        vec![
+            crate::line_truncation::truncate_line_with_ellipsis_if_overflow(
+                line,
+                usize::from(width),
+            ),
+        ]
+    }
+
+    fn transcript_lines(&self, _width: u16) -> Vec<Line<'static>> {
+        Vec::new()
+    }
+
+    fn raw_lines(&self) -> Vec<Line<'static>> {
+        Vec::new()
     }
 }
 
@@ -487,27 +650,15 @@ impl HistoryCell for StreamingAgentTailCell {
     fn display_hyperlink_lines(&self, _width: u16) -> Vec<HyperlinkLine> {
         // Tail lines are already rendered at the controller's current stream width.
         // Re-wrapping them here can split table borders and produce malformed in-flight rows.
-        let mut lines = prefix_hyperlink_lines(
+        normalize_whitespace_only_hyperlink_lines(prefix_hyperlink_lines(
             self.lines.clone(),
             if self.is_first_line {
-                "• ".dim()
+                assistant_message_prefix()
             } else {
                 "  ".into()
             },
             "  ".into(),
-        );
-        for line in &mut lines {
-            if line
-                .line
-                .spans
-                .iter()
-                .all(|span| span.content.chars().all(char::is_whitespace))
-            {
-                line.line = Line::default().style(line.line.style);
-                line.hyperlinks.clear();
-            }
-        }
-        lines
+        ))
     }
 
     fn transcript_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
@@ -522,6 +673,110 @@ impl HistoryCell for StreamingAgentTailCell {
         !self.is_first_line
     }
 }
+
+/// Streamed reasoning content emitted by `ReasoningStreamController`.
+///
+/// Rich-mode commit chunks are transcript-only while the `active_cell` presents a bounded rolling
+/// preview. Completed previews do not become permanent scrollback: repeated reason/tool/reason
+/// cycles otherwise leave a ladder of stale micro-status lines between every tool call. Raw mode
+/// and the transcript overlay still receive every source line.
+#[derive(Debug)]
+pub(crate) struct ReasoningStreamCell {
+    display_lines: Vec<HyperlinkLine>,
+    transcript_lines: Vec<HyperlinkLine>,
+}
+
+impl ReasoningStreamCell {
+    pub(crate) fn live_preview(
+        display_lines: Vec<HyperlinkLine>,
+        transcript_lines: Vec<HyperlinkLine>,
+    ) -> Self {
+        Self {
+            display_lines,
+            transcript_lines,
+        }
+    }
+
+    pub(crate) fn transcript_chunk(lines: Vec<HyperlinkLine>) -> Self {
+        Self {
+            display_lines: Vec::new(),
+            transcript_lines: lines,
+        }
+    }
+}
+
+impl HistoryCell for ReasoningStreamCell {
+    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
+        visible_lines(self.display_lines.clone())
+    }
+
+    fn display_hyperlink_lines(&self, _width: u16) -> Vec<HyperlinkLine> {
+        self.display_lines.clone()
+    }
+
+    fn transcript_hyperlink_lines(&self, _width: u16) -> Vec<HyperlinkLine> {
+        self.transcript_lines.clone()
+    }
+
+    fn transcript_lines(&self, _width: u16) -> Vec<Line<'static>> {
+        visible_lines(self.transcript_lines.clone())
+    }
+
+    fn raw_lines(&self) -> Vec<Line<'static>> {
+        plain_lines(visible_lines(self.transcript_lines.clone()))
+    }
+
+    fn is_stream_continuation(&self) -> bool {
+        // Every rendered row carries the reasoning rail, including the first
+        // chunk, so it can sit compactly beside the preceding transcript block.
+        true
+    }
+}
+
+/// Source-backed cell that the streamed `ReasoningStreamCell` run is consolidated
+/// into once a live reasoning block finishes.
+///
+/// `ReasoningStreamCell` stores lines that were wrapped at the width that was
+/// live at commit time, so they cannot re-wrap on resize. This cell instead keeps
+/// the raw reasoning markdown and re-renders it at the requested width — the same
+/// trick `AgentMarkdownCell` uses for finalized agent answers — so transcript
+/// reasoning reflows correctly after the terminal is resized. Completed reasoning
+/// stays out of the primary viewport but retains the *full* source (header included)
+/// in Ctrl+T and raw mode.
+#[derive(Debug)]
+pub(crate) struct ReasoningMarkdownCell {
+    source: String,
+    /// Session cwd used to render local file links inside the reasoning body.
+    cwd: PathBuf,
+}
+
+impl ReasoningMarkdownCell {
+    pub(crate) fn new(source: String, cwd: &Path) -> Self {
+        Self {
+            source,
+            cwd: cwd.to_path_buf(),
+        }
+    }
+}
+
+impl HistoryCell for ReasoningMarkdownCell {
+    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
+        Vec::new()
+    }
+
+    fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
+        format_reasoning_summary_lines(&self.source, width, self.cwd.as_path())
+    }
+
+    fn raw_lines(&self) -> Vec<Line<'static>> {
+        raw_lines_from_source(self.source.trim())
+    }
+
+    fn is_stream_continuation(&self) -> bool {
+        true
+    }
+}
+
 pub(crate) fn new_user_prompt(
     message: String,
     text_elements: Vec<TextElement>,
@@ -546,7 +801,13 @@ pub(crate) fn new_reasoning_summary_block(
     cwd: &Path,
 ) -> Box<dyn HistoryCell> {
     let (header, content) = split_reasoning_summary_parts(&reasoning_parts);
-    let transcript_only = header.is_empty();
+    let title_only = content
+        .strip_prefix("**")
+        .and_then(|content| content.strip_suffix("**"))
+        .is_some_and(|content| !content.is_empty() && !content.contains("**"));
+    // Completed reasoning normally leaves the primary viewport in this fork,
+    // while retaining upstream's title-only summary exception.
+    let transcript_only = !title_only;
     Box::new(ReasoningSummaryCell::new(
         header,
         content,

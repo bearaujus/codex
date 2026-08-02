@@ -24,6 +24,7 @@ use codex_api::RealtimeSessionMode;
 use codex_api::RealtimeWebsocketClient;
 use codex_api::RealtimeWebsocketEvents;
 use codex_api::RealtimeWebsocketWriter;
+use codex_api::build_session_headers;
 use codex_api::map_api_error;
 use codex_config::config_toml::RealtimeWsMode;
 use codex_config::config_toml::RealtimeWsVersion;
@@ -63,6 +64,7 @@ use http::HeaderMap;
 use http::HeaderValue;
 use http::header::AUTHORIZATION;
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -90,6 +92,7 @@ const REALTIME_STARTUP_CONTEXT_TOKEN_BUDGET: usize = 5_300;
 const REALTIME_ASSISTANT_OUTPUT_TOKEN_BUDGET: usize = 1_000;
 const REALTIME_INITIAL_ITEMS_MAX_COUNT: usize = 128;
 const REALTIME_INITIAL_ITEMS_MAX_TOKENS: usize = 8_192;
+const REALTIME_MODE_INSTRUCTIONS_MAX_TOKENS: usize = 8_192;
 const HANDOFF_STREAM_FLUSH_INTERVAL: Duration = Duration::from_millis(200);
 const HANDOFF_STREAM_TRUNCATION_MARKER: &str = "\n…output truncated…\n";
 const AGENT_FINAL_MESSAGE_PREFIX: &str = "\"Agent Final Message\":\n\n";
@@ -120,6 +123,13 @@ enum RealtimeFanoutTaskStop {
 
 pub(crate) struct RealtimeConversationManager {
     state: Mutex<Option<ConversationState>>,
+    mode_instructions: Mutex<Option<RealtimeModeInstructions>>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RealtimeModeInstructions {
+    pub(crate) start: Option<String>,
+    pub(crate) end: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -137,6 +147,7 @@ struct RealtimeHandoffState {
     codex_responses_as_items: bool,
     codex_response_item_prefix: Option<String>,
     codex_response_handoff_mode: CodexResponseHandoffMode,
+    codex_response_handoff_channel_prefixes: Arc<BTreeMap<String, Vec<String>>>,
     session_kind: RealtimeSessionKind,
     event_parser: RealtimeEventParser,
 }
@@ -429,28 +440,6 @@ struct RealtimeInputChannels {
 }
 
 impl RealtimeHandoffState {
-    fn new(
-        output_tx: Sender<RealtimeOutbound>,
-        client_managed_handoffs: bool,
-        codex_responses_as_items: bool,
-        codex_response_item_prefix: Option<String>,
-        codex_response_handoff_mode: CodexResponseHandoffMode,
-        session_kind: RealtimeSessionKind,
-        event_parser: RealtimeEventParser,
-    ) -> Self {
-        Self {
-            output_tx,
-            last_output: Arc::new(Mutex::new(None)),
-            stream: Arc::new(Mutex::new(RealtimeHandoffStreamState::default())),
-            client_managed_handoffs,
-            codex_responses_as_items,
-            codex_response_item_prefix,
-            codex_response_handoff_mode,
-            session_kind,
-            event_parser,
-        }
-    }
-
     fn streams_handoff_append(&self) -> bool {
         self.event_parser == RealtimeEventParser::FramelessBidi
             && !self.client_managed_handoffs
@@ -477,12 +466,14 @@ struct ConversationState {
 
 struct RealtimeStart {
     api_provider: ApiProvider,
+    realtime_sideband_base_url: Option<String>,
     extra_headers: Option<HeaderMap>,
     client_managed_handoffs: bool,
     flush_transcript_tail_on_session_end: bool,
     codex_responses_as_items: bool,
     codex_response_item_prefix: Option<String>,
     codex_response_handoff_mode: CodexResponseHandoffMode,
+    codex_response_handoff_channel_prefixes: Option<BTreeMap<String, Vec<String>>>,
     realtime_call_api_provider: Option<ApiProvider>,
     session_config: RealtimeSessionConfig,
     model_client: ModelClient,
@@ -501,7 +492,12 @@ impl RealtimeConversationManager {
     pub(crate) fn new() -> Self {
         Self {
             state: Mutex::new(None),
+            mode_instructions: Mutex::new(None),
         }
+    }
+
+    pub(crate) async fn mode_instructions(&self) -> Option<RealtimeModeInstructions> {
+        self.mode_instructions.lock().await.clone()
     }
 
     pub(crate) async fn running_state(&self) -> Option<()> {
@@ -521,7 +517,11 @@ impl RealtimeConversationManager {
         )
     }
 
-    async fn start(&self, start: RealtimeStart) -> CodexResult<RealtimeStartOutput> {
+    async fn start(
+        &self,
+        start: RealtimeStart,
+        mode_instructions: RealtimeModeInstructions,
+    ) -> CodexResult<RealtimeStartOutput> {
         let previous_state = {
             let mut guard = self.state.lock().await;
             guard.take()
@@ -530,18 +530,22 @@ impl RealtimeConversationManager {
             stop_conversation_state(state, RealtimeFanoutTaskStop::Await).await;
         }
 
-        self.start_inner(start).await
+        let output = self.start_inner(start).await?;
+        *self.mode_instructions.lock().await = Some(mode_instructions);
+        Ok(output)
     }
 
     async fn start_inner(&self, start: RealtimeStart) -> CodexResult<RealtimeStartOutput> {
         let RealtimeStart {
             api_provider,
+            realtime_sideband_base_url,
             extra_headers,
             client_managed_handoffs,
             flush_transcript_tail_on_session_end,
             codex_responses_as_items,
             codex_response_item_prefix,
             codex_response_handoff_mode,
+            codex_response_handoff_channel_prefixes,
             realtime_call_api_provider,
             session_config,
             model_client,
@@ -565,15 +569,20 @@ impl RealtimeConversationManager {
 
         let realtime_active = Arc::new(AtomicBool::new(true));
         let stop_token = CancellationToken::new();
-        let handoff = RealtimeHandoffState::new(
-            handoff_output_tx,
+        let handoff = RealtimeHandoffState {
+            output_tx: handoff_output_tx,
+            last_output: Arc::new(Mutex::new(None)),
+            stream: Arc::new(Mutex::new(RealtimeHandoffStreamState::default())),
             client_managed_handoffs,
             codex_responses_as_items,
             codex_response_item_prefix,
             codex_response_handoff_mode,
+            codex_response_handoff_channel_prefixes: Arc::new(
+                codex_response_handoff_channel_prefixes.unwrap_or_default(),
+            ),
             session_kind,
             event_parser,
-        );
+        };
         let input_channels = RealtimeInputChannels {
             text_rx,
             handoff_output_rx,
@@ -581,6 +590,10 @@ impl RealtimeConversationManager {
         };
 
         let client = RealtimeWebsocketClient::new(api_provider);
+        let client = match realtime_sideband_base_url {
+            Some(base_url) => client.with_webrtc_sideband_base_url(base_url),
+            None => client,
+        };
         let (task, sdp) = if let Some(sdp) = sdp {
             let call = model_client
                 .create_realtime_call_with_headers(
@@ -754,7 +767,10 @@ impl RealtimeConversationManager {
             return Ok(());
         }
         let phase = if handoff.routes_handoff_by_bem() {
-            match bem_message_phase(&output_text) {
+            match bem_message_phase(
+                &output_text,
+                &handoff.codex_response_handoff_channel_prefixes,
+            ) {
                 Some(phase) => Some(phase),
                 None => {
                     warn!("BEM output did not contain a recognized channel header");
@@ -854,9 +870,11 @@ impl RealtimeConversationManager {
                 } else {
                     phase
                 },
-                bem_channel_parser: handoff
-                    .routes_handoff_by_bem()
-                    .then(BemChannelParser::default),
+                bem_channel_parser: handoff.routes_handoff_by_bem().then(|| {
+                    BemChannelParser::new(Arc::clone(
+                        &handoff.codex_response_handoff_channel_prefixes,
+                    ))
+                }),
                 prefix_final_message: handoff.event_parser == RealtimeEventParser::V1,
                 sent_bytes: 0,
                 buffered_text: String::new(),
@@ -1097,12 +1115,16 @@ pub(crate) async fn handle_start(
 
 struct PreparedRealtimeConversationStart {
     api_provider: ApiProvider,
+    realtime_sideband_base_url: Option<String>,
     extra_headers: Option<HeaderMap>,
     client_managed_handoffs: bool,
     flush_transcript_tail_on_session_end: bool,
     codex_responses_as_items: bool,
     codex_response_item_prefix: Option<String>,
     codex_response_handoff_mode: CodexResponseHandoffMode,
+    codex_response_handoff_channel_prefixes: Option<BTreeMap<String, Vec<String>>>,
+    realtime_start_instructions: Option<String>,
+    realtime_end_instructions: Option<String>,
     realtime_call_api_provider: Option<ApiProvider>,
     requested_realtime_session_id: Option<String>,
     version: RealtimeWsVersion,
@@ -1132,13 +1154,14 @@ async fn prepare_realtime_start(
         .transport
         .clone()
         .unwrap_or(ConversationStartTransport::Websocket);
-    let mut api_provider = provider.to_api_provider(Some(AuthMode::ApiKey))?;
-    if let Some(realtime_ws_base_url) = &config.experimental_realtime_ws_base_url {
+    let mut api_provider = provider.to_api_provider(Some(AuthMode::Chatgpt))?;
+    let realtime_sideband_base_url = config.experimental_realtime_ws_base_url.clone();
+    if let Some(realtime_ws_base_url) = &realtime_sideband_base_url {
         api_provider.base_url = realtime_ws_base_url.clone();
     }
     let realtime_call_api_provider =
         if let Some(realtime_call_base_url) = &config.experimental_realtime_webrtc_call_base_url {
-            let mut api_provider = provider.to_api_provider(Some(AuthMode::ApiKey))?;
+            let mut api_provider = provider.to_api_provider(Some(AuthMode::Chatgpt))?;
             api_provider.base_url = realtime_call_base_url.clone();
             Some(api_provider)
         } else {
@@ -1162,12 +1185,13 @@ async fn prepare_realtime_start(
     let requested_realtime_session_id = session_config.session_id.clone();
     let event_parser = session_config.event_parser;
     let originator = sess.originator().await;
-    let extra_headers = match transport {
+    let mut extra_headers = match transport {
         ConversationStartTransport::Websocket => {
-            let realtime_api_key = realtime_api_key(auth.as_ref(), &provider)?;
+            let realtime_auth = realtime_api_auth(auth.as_ref(), &provider)?;
             realtime_request_headers(
                 requested_realtime_session_id.as_deref(),
-                Some(realtime_api_key.as_str()),
+                Some(realtime_auth.bearer.as_str()),
+                realtime_auth.chatgpt_account_id.as_deref(),
                 event_parser,
                 originator.as_str(),
             )?
@@ -1176,19 +1200,29 @@ async fn prepare_realtime_start(
             realtime_request_headers(
                 requested_realtime_session_id.as_deref(),
                 /*api_key*/ None,
+                /*chatgpt_account_id*/ None,
                 event_parser,
                 originator.as_str(),
             )?
         }
-    };
+    }
+    .unwrap_or_default();
+    extra_headers.extend(build_session_headers(
+        Some(sess.session_id().to_string()),
+        Some(sess.thread_id().to_string()),
+    ));
     Ok(PreparedRealtimeConversationStart {
         api_provider,
-        extra_headers,
+        realtime_sideband_base_url,
+        extra_headers: Some(extra_headers),
         client_managed_handoffs: params.client_managed_handoffs,
         flush_transcript_tail_on_session_end: params.flush_transcript_tail_on_session_end,
         codex_responses_as_items: params.codex_responses_as_items,
         codex_response_item_prefix: params.codex_response_item_prefix,
         codex_response_handoff_mode: params.codex_response_handoff_mode,
+        codex_response_handoff_channel_prefixes: params.codex_response_handoff_channel_prefixes,
+        realtime_start_instructions: params.realtime_start_instructions,
+        realtime_end_instructions: params.realtime_end_instructions,
         realtime_call_api_provider,
         requested_realtime_session_id,
         version,
@@ -1220,6 +1254,25 @@ pub(crate) async fn build_realtime_session_config(
     version: RealtimeWsVersion,
     configured_voice: ConfiguredRealtimeVoice,
 ) -> CodexResult<RealtimeSessionConfig> {
+    for (name, instructions) in [
+        (
+            "realtime start instructions",
+            params.realtime_start_instructions.as_deref(),
+        ),
+        (
+            "realtime end instructions",
+            params.realtime_end_instructions.as_deref(),
+        ),
+    ] {
+        if instructions.is_some_and(|instructions| {
+            approx_token_count(instructions) > REALTIME_MODE_INSTRUCTIONS_MAX_TOKENS
+        }) {
+            return Err(CodexErr::InvalidRequest(format!(
+                "{name} must not exceed {REALTIME_MODE_INSTRUCTIONS_MAX_TOKENS} estimated tokens"
+            )));
+        }
+    }
+
     let config = sess.get_config().await;
     let prompt = prepare_realtime_backend_prompt(
         params.prompt.clone(),
@@ -1306,6 +1359,7 @@ pub(crate) async fn build_realtime_session_config(
     Ok(RealtimeSessionConfig {
         instructions: prompt,
         initial_items: params.initial_items.clone(),
+        delegation_ack_filler: params.delegation_ack_filler,
         model,
         session_id: Some(
             params
@@ -1381,12 +1435,16 @@ async fn handle_start_inner(
 ) -> CodexResult<()> {
     let PreparedRealtimeConversationStart {
         api_provider,
+        realtime_sideband_base_url,
         extra_headers,
         client_managed_handoffs,
         flush_transcript_tail_on_session_end,
         codex_responses_as_items,
         codex_response_item_prefix,
         codex_response_handoff_mode,
+        codex_response_handoff_channel_prefixes,
+        realtime_start_instructions,
+        realtime_end_instructions,
         realtime_call_api_provider,
         requested_realtime_session_id,
         version,
@@ -1398,20 +1456,26 @@ async fn handle_start_inner(
         ConversationStartTransport::Websocket => None,
         ConversationStartTransport::Webrtc { sdp } => Some(sdp),
     };
+    let mode_instructions = RealtimeModeInstructions {
+        start: realtime_start_instructions,
+        end: realtime_end_instructions,
+    };
     let start = RealtimeStart {
         api_provider,
+        realtime_sideband_base_url,
         extra_headers,
         client_managed_handoffs,
         flush_transcript_tail_on_session_end,
         codex_responses_as_items,
         codex_response_item_prefix,
         codex_response_handoff_mode,
+        codex_response_handoff_channel_prefixes,
         realtime_call_api_provider,
         session_config,
         model_client: sess.services.model_client.clone(),
         sdp,
     };
-    let start_output = sess.conversation.start(start).await?;
+    let start_output = sess.conversation.start(start, mode_instructions).await?;
 
     info!("realtime conversation started");
 
@@ -1556,35 +1620,57 @@ fn wrap_realtime_delegation_input(
     RealtimeDelegation::new(input, transcript_delta, source).render()
 }
 
-fn realtime_api_key(auth: Option<&CodexAuth>, provider: &ModelProviderInfo) -> CodexResult<String> {
+struct RealtimeApiAuth {
+    bearer: String,
+    chatgpt_account_id: Option<String>,
+}
+
+fn realtime_api_auth(
+    auth: Option<&CodexAuth>,
+    provider: &ModelProviderInfo,
+) -> CodexResult<RealtimeApiAuth> {
     if let Some(api_key) = provider.api_key()? {
-        return Ok(api_key);
+        return Ok(RealtimeApiAuth {
+            bearer: api_key,
+            chatgpt_account_id: None,
+        });
     }
 
     if let Some(token) = provider.experimental_bearer_token.clone() {
-        return Ok(token);
+        return Ok(RealtimeApiAuth {
+            bearer: token,
+            chatgpt_account_id: None,
+        });
     }
 
-    if let Some(api_key) = auth.and_then(CodexAuth::api_key) {
-        return Ok(api_key.to_string());
+    if let Some(auth) = auth
+        && let Ok(token) = auth.get_token()
+    {
+        return Ok(RealtimeApiAuth {
+            bearer: token,
+            chatgpt_account_id: auth.get_account_id(),
+        });
     }
 
-    // TODO(aibrahim): Remove this temporary fallback once realtime auth no longer
-    // requires API key auth for ChatGPT/SIWC sessions.
+    // Optional env fallback for local/dev OpenAI providers without pool auth.
     if provider.is_openai()
         && let Some(api_key) = read_openai_api_key_from_env()
     {
-        return Ok(api_key);
+        return Ok(RealtimeApiAuth {
+            bearer: api_key,
+            chatgpt_account_id: None,
+        });
     }
 
     Err(CodexErr::InvalidRequest(
-        "realtime conversation requires API key auth".to_string(),
+        "realtime conversation requires ChatGPT or provider API authentication".to_string(),
     ))
 }
 
 fn realtime_request_headers(
     realtime_session_id: Option<&str>,
     api_key: Option<&str>,
+    chatgpt_account_id: Option<&str>,
     event_parser: RealtimeEventParser,
     originator: &str,
 ) -> CodexResult<Option<HeaderMap>> {
@@ -1611,6 +1697,12 @@ fn realtime_request_headers(
             CodexErr::InvalidRequest(format!("invalid realtime api key header: {err}"))
         })?;
         headers.insert(AUTHORIZATION, auth_value);
+    }
+    if let Some(account_id) = chatgpt_account_id {
+        let account_id = HeaderValue::from_str(account_id).map_err(|err| {
+            CodexErr::InvalidRequest(format!("invalid ChatGPT account id header: {err}"))
+        })?;
+        headers.insert("ChatGPT-Account-ID", account_id);
     }
 
     add_originator_header(&mut headers, originator);

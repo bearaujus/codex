@@ -9,6 +9,7 @@ use super::X_CODEX_PARENT_THREAD_ID_HEADER;
 use super::X_CODEX_TURN_METADATA_HEADER;
 use super::X_CODEX_WINDOW_ID_HEADER;
 use super::X_OPENAI_SUBAGENT_HEADER;
+use super::websocket_auth_key;
 use crate::AttestationContext;
 use crate::AttestationProvider;
 use crate::GenerateAttestationFuture;
@@ -104,7 +105,6 @@ fn test_model_client_with_thread_id(
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
-        /*item_ids_enabled*/ false,
         /*concurrent_reasoning_summaries_enabled*/ false,
         /*attestation_provider*/ None,
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
@@ -150,7 +150,6 @@ async fn compact_uses_bearer_after_agent_identity_session_fallback() -> anyhow::
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
-        /*item_ids_enabled*/ false,
         /*concurrent_reasoning_summaries_enabled*/ false,
         /*attestation_provider*/ None,
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
@@ -178,11 +177,11 @@ async fn compact_uses_bearer_after_agent_identity_session_fallback() -> anyhow::
         TestCodexResponsesRequestKind::Turn,
     );
 
-    let output = client
+    let mut client_session = client.new_session();
+    let output = client_session
         .compact_conversation_history(
             &prompt,
             &test_model_info(),
-            /*turn_state*/ None,
             CompactConversationRequestSettings {
                 effort: None,
                 summary: codex_protocol::config_types::ReasoningSummary::None,
@@ -219,6 +218,88 @@ async fn compact_uses_bearer_after_agent_identity_session_fallback() -> anyhow::
         Some("account-123")
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn compact_session_records_the_pool_account_attached_to_the_request() -> anyhow::Result<()> {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses/compact"))
+        .respond_with(ResponseTemplate::new(/*status*/ 200).set_body_json(json!({
+            "output": []
+        })))
+        .expect(/*requests*/ 1)
+        .mount(&server)
+        .await;
+
+    let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
+    let expected_account_id = auth
+        .get_pool_account_id()
+        .expect("dummy ChatGPT auth should have a pool account id");
+    let auth_manager = AuthManager::from_auth_for_testing(auth);
+    let mut provider =
+        ModelProviderInfo::create_openai_provider(Some(format!("{}/v1", server.uri())));
+    provider.supports_websockets = false;
+    let client = ModelClient::new(
+        Some(auth_manager),
+        AgentIdentityAuthPolicy::JwtOnly,
+        ThreadId::new(),
+        provider,
+        SessionSource::Cli,
+        "test_originator".to_string(),
+        /*model_verbosity*/ None,
+        /*enable_request_compression*/ false,
+        /*include_timing_metrics*/ false,
+        /*beta_features_header*/ None,
+        /*concurrent_reasoning_summaries_enabled*/ false,
+        /*attestation_provider*/ None,
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    );
+    let prompt = Prompt {
+        input: vec![ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "please compact".to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }],
+        base_instructions: BaseInstructions {
+            text: "base instructions".to_string(),
+        },
+        ..Default::default()
+    };
+    let responses_metadata = test_responses_metadata_for_client(
+        &client,
+        /*turn_id*/ None,
+        format!("{}:0", client.state.thread_id),
+        /*parent_thread_id*/ None,
+        TestCodexResponsesRequestKind::Turn,
+    );
+    let mut client_session = client.new_session();
+
+    let output = client_session
+        .compact_conversation_history(
+            &prompt,
+            &test_model_info(),
+            CompactConversationRequestSettings {
+                effort: None,
+                summary: codex_protocol::config_types::ReasoningSummary::None,
+                service_tier: None,
+            },
+            &test_session_telemetry(),
+            &CompactionTraceContext::disabled(),
+            &responses_metadata,
+        )
+        .await?;
+
+    assert!(output.is_empty());
+    assert_eq!(
+        client_session.last_request_pool_account_id(),
+        Some(expected_account_id.as_str())
+    );
     Ok(())
 }
 
@@ -325,12 +406,11 @@ async fn chatgpt_auth_manager(
     write_chatgpt_auth_json(codex_home.path());
     let auth_manager = AuthManager::shared(
         codex_home.path().to_path_buf(),
-        /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
         /*forced_chatgpt_workspace_id*/ None,
         /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::default(),
-        /*auth_route_config*/ None,
+        codex_login::test_support::transport_default_auth_route_config(),
     )
     .await;
     let auth = auth_manager.auth().await.expect("auth should load");
@@ -779,6 +859,20 @@ fn auth_request_telemetry_context_tracks_agent_identity_ids() {
     );
 }
 
+#[test]
+fn websocket_auth_key_changes_with_request_credentials() {
+    let first = websocket_auth_key(
+        /*auth*/ None,
+        &BearerAuthProvider::for_test(Some("access-token-1"), Some("workspace-123")),
+    );
+    let second = websocket_auth_key(
+        /*auth*/ None,
+        &BearerAuthProvider::for_test(Some("access-token-2"), Some("workspace-123")),
+    );
+
+    assert_ne!(first, second);
+}
+
 fn model_client_with_counting_attestation(
     include_attestation: bool,
 ) -> (ModelClient, Arc<AtomicUsize>) {
@@ -825,7 +919,6 @@ fn model_client_with_counting_attestation(
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
-        /*item_ids_enabled*/ false,
         /*concurrent_reasoning_summaries_enabled*/ false,
         Some(Arc::new(CountingAttestationProvider {
             calls: attestation_calls.clone(),

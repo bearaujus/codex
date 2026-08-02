@@ -30,6 +30,7 @@ use crate::hooks_rpc::HookTrustUpdate;
 use crate::hooks_rpc::hook_needs_review;
 use crate::key_hint;
 use crate::key_hint::KeyBindingListExt;
+use crate::keymap::ListAction;
 use crate::keymap::ListKeymap;
 use crate::line_truncation::truncate_line_with_ellipsis_if_overflow;
 use crate::render::renderable::Renderable;
@@ -492,6 +493,14 @@ impl HooksBrowserView {
             Some(MAX_COMMAND_DETAIL_LINES),
         ));
         lines.push(detail_line("Timeout", &format!("{}s", hook.timeout_sec)));
+        if let Some(limit) = hook.additional_context_limit {
+            let value = if limit == 0 {
+                "unlimited".to_string()
+            } else {
+                format!("limit: {limit} approximate tokens")
+            };
+            lines.push(detail_line("Context", &value));
+        }
         lines.push(detail_line("Trust", hook_trust_label(hook.trust_status)));
         lines
     }
@@ -503,35 +512,40 @@ impl HooksBrowserView {
             width: area.width.saturating_sub(2),
             height: area.height,
         };
+        let accept = self.keymap.primary_hint(ListAction::Accept);
+        let cancel = self
+            .keymap
+            .primary_hint(ListAction::Cancel)
+            .unwrap_or_else(|| key_hint::plain(KeyCode::Esc).into());
         let footer = match self.page {
-            HooksBrowserPage::Events if self.review_needed_total_count() > 0 => Line::from(vec![
-                "Press ".into(),
-                key_hint::plain(KeyCode::Char('t')).into(),
-                " to trust all; ".into(),
-                key_hint::plain(KeyCode::Enter).into(),
-                " to review hooks; ".into(),
-                key_hint::plain(KeyCode::Esc).into(),
-                " to close".into(),
-            ]),
-            HooksBrowserPage::Events => Line::from(vec![
-                "Press ".into(),
-                key_hint::plain(KeyCode::Enter).into(),
-                " to view hooks; ".into(),
-                key_hint::plain(KeyCode::Esc).into(),
-                " to close".into(),
-            ]),
+            HooksBrowserPage::Events if self.review_needed_total_count() > 0 => {
+                let mut spans = vec![
+                    "Press ".into(),
+                    key_hint::plain(KeyCode::Char('t')).into(),
+                    " to trust all; ".into(),
+                ];
+                if let Some(accept) = accept {
+                    spans.extend([accept.into(), " to review hooks; ".into()]);
+                }
+                spans.extend([cancel.into(), " to close".into()]);
+                Line::from(spans)
+            }
+            HooksBrowserPage::Events => {
+                let mut spans = vec!["Press ".into()];
+                if let Some(accept) = accept {
+                    spans.extend([accept.into(), " to view hooks; ".into()]);
+                }
+                spans.extend([cancel.into(), " to close".into()]);
+                Line::from(spans)
+            }
             HooksBrowserPage::Handlers(event_name) => {
                 let selected_hook = self.selected_hook(event_name);
                 if selected_hook.is_none() {
-                    Line::from(vec![
-                        "Press ".into(),
-                        key_hint::plain(KeyCode::Esc).into(),
-                        " to go back".into(),
-                    ])
+                    Line::from(vec!["Press ".into(), cancel.into(), " to go back".into()])
                 } else if selected_hook.is_some_and(|hook| hook.is_managed) {
                     Line::from(vec![
                         "Managed hooks are always on; press ".into(),
-                        key_hint::plain(KeyCode::Esc).into(),
+                        cancel.into(),
                         " to go back".into(),
                     ])
                 } else if selected_hook.is_some_and(hook_needs_review) {
@@ -539,19 +553,17 @@ impl HooksBrowserView {
                         "Press ".into(),
                         key_hint::plain(KeyCode::Char('t')).into(),
                         " to trust; ".into(),
-                        key_hint::plain(KeyCode::Esc).into(),
+                        cancel.into(),
                         " to go back".into(),
                     ])
                 } else {
-                    Line::from(vec![
-                        "Press ".into(),
-                        key_hint::plain(KeyCode::Char(' ')).into(),
-                        " or ".into(),
-                        key_hint::plain(KeyCode::Enter).into(),
-                        " to toggle; ".into(),
-                        key_hint::plain(KeyCode::Esc).into(),
-                        " to go back".into(),
-                    ])
+                    let mut spans =
+                        vec!["Press ".into(), key_hint::plain(KeyCode::Char(' ')).into()];
+                    if let Some(accept) = accept {
+                        spans.extend([" or ".into(), accept.into()]);
+                    }
+                    spans.extend([" to toggle; ".into(), cancel.into(), " to go back".into()]);
+                    Line::from(spans)
                 }
             }
         };
@@ -560,6 +572,10 @@ impl HooksBrowserView {
 }
 
 impl BottomPaneView for HooksBrowserView {
+    fn keymap_contexts(&self) -> crate::keymap::KeymapContextSet {
+        crate::keymap::KeymapContextSet::new(crate::keymap::KeymapContext::List)
+    }
+
     fn handle_key_event(&mut self, key_event: KeyEvent) {
         match key_event {
             _ if self.keymap.move_up.is_pressed(key_event) => self.move_up(),
@@ -936,6 +952,7 @@ mod tests {
             command: Some(command.to_string()),
             timeout_sec: 30,
             status_message: None,
+            additional_context_limit: None,
             source_path: test_path_buf("/tmp/hooks.json").abs(),
             source,
             plugin_id: plugin_id.map(str::to_string),
@@ -993,8 +1010,10 @@ mod tests {
 
     #[test]
     fn renders_event_browser() {
-        let view = view();
+        let mut view = view();
         assert_snapshot!("hooks_browser_events", render_lines(&view, /*width*/ 112));
+        view.keymap.accept.clear();
+        assert!(!render_lines(&view, /*width*/ 112).contains("enter to view hooks"));
     }
 
     #[test]
@@ -1078,6 +1097,35 @@ mod tests {
         let mut view = view();
         view.handle_key_event(KeyEvent::from(KeyCode::Enter));
         assert_snapshot!("hooks_browser_handlers", render_lines(&view, /*width*/ 112));
+    }
+
+    #[test]
+    fn renders_handler_additional_context_limit() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let mut configured_hook = hook(
+            "path:context-limit",
+            HookEventName::PreToolUse,
+            HookSource::User,
+            /*plugin_id*/ None,
+            "/tmp/pre-tool-use.sh",
+            /*enabled*/ true,
+            /*is_managed*/ false,
+            /*display_order*/ 0,
+        );
+        configured_hook.additional_context_limit = Some(0);
+        let mut view = HooksBrowserView::new(
+            vec![configured_hook],
+            Vec::new(),
+            Vec::new(),
+            AppEventSender::new(tx_raw),
+        );
+
+        view.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+        assert_snapshot!(
+            "hooks_browser_additional_context_limit",
+            render_lines(&view, /*width*/ 112)
+        );
     }
 
     #[test]

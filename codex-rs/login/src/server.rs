@@ -4,13 +4,12 @@
 //!
 //! The callback flow has two competing responsibilities:
 //!
-//! - preserve enough backend and transport detail for developers, sysadmins, and support
+//! - preserve safe status and error-code detail for developers, sysadmins, and support
 //!   engineers to diagnose failed sign-ins
 //! - avoid persisting secrets or sensitive URL/query data into normal application logs
 //!
-//! This module therefore keeps the user-facing error path and the structured-log path separate.
-//! Returned `io::Error` values still carry the detail needed by CLI/browser callers, while
-//! structured logs only emit explicitly reviewed fields plus redacted URL/error values.
+//! Returned errors and structured logs emit only explicitly reviewed fields plus
+//! redacted URL/error values.
 use std::io::Cursor;
 use std::io::Read;
 use std::io::Write;
@@ -26,9 +25,14 @@ use std::time::Duration;
 
 use crate::auth::AuthDotJson;
 use crate::auth::AuthKeyringBackendKind;
+use crate::auth::load_auth_dot_json;
+use crate::auth::revoke_auth_tokens_if_superseded;
 use crate::auth::save_auth;
 use crate::default_client::create_raw_auth_client;
 use crate::default_client::originator;
+use crate::http_body::MAX_AUTH_ERROR_BODY_BYTES;
+use crate::http_body::MAX_AUTH_SUCCESS_BODY_BYTES;
+use crate::http_body::read_response_text_limited;
 use crate::outbound_proxy::AuthRouteConfig;
 use crate::pkce::PkceCodes;
 use crate::pkce::generate_pkce;
@@ -37,6 +41,7 @@ use crate::success_page::LoginSuccessRedirect;
 use crate::success_page::compose_success_url;
 use crate::success_page::jwt_auth_claims;
 use crate::token_data::TokenData;
+use crate::token_data::derive_pool_account_id;
 use crate::token_data::parse_chatgpt_jwt_claims;
 use base64::Engine;
 use chrono::Utc;
@@ -77,7 +82,7 @@ pub struct ServerOptions {
     pub login_success_page: LoginSuccessPage,
     pub cli_auth_credentials_store_mode: AuthCredentialsStoreMode,
     pub auth_keyring_backend_kind: AuthKeyringBackendKind,
-    pub auth_route_config: Option<AuthRouteConfig>,
+    pub auth_route_config: AuthRouteConfig,
 }
 
 impl ServerOptions {
@@ -88,7 +93,7 @@ impl ServerOptions {
         forced_chatgpt_workspace_id: Option<Vec<String>>,
         cli_auth_credentials_store_mode: AuthCredentialsStoreMode,
         auth_keyring_backend_kind: AuthKeyringBackendKind,
-        auth_route_config: Option<AuthRouteConfig>,
+        auth_route_config: AuthRouteConfig,
     ) -> Self {
         Self {
             codex_home,
@@ -141,6 +146,10 @@ pub struct ShutdownHandle {
 }
 
 impl ShutdownHandle {
+    pub(crate) fn new(shutdown_notify: Arc<tokio::sync::Notify>) -> Self {
+        Self { shutdown_notify }
+    }
+
     /// Signals the login loop to terminate.
     pub fn shutdown(&self) {
         self.shutdown_notify.notify_one();
@@ -290,7 +299,7 @@ pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
         auth_url,
         actual_port,
         server_handle,
-        shutdown_handle: ShutdownHandle { shutdown_notify },
+        shutdown_handle: ShutdownHandle::new(shutdown_notify),
     })
 }
 
@@ -387,7 +396,7 @@ async fn process_request(
                 redirect_uri,
                 pkce,
                 &code,
-                opts.auth_route_config.as_ref(),
+                &opts.auth_route_config,
             )
             .await
             {
@@ -404,23 +413,14 @@ async fn process_request(
                             /*error_description*/ None,
                         );
                     }
-                    // Obtain API key via token-exchange and persist
-                    let api_key = obtain_api_key(
-                        &opts.issuer,
-                        &opts.client_id,
-                        &tokens.id_token,
-                        opts.auth_route_config.as_ref(),
-                    )
-                    .await
-                    .ok();
                     if let Err(err) = persist_tokens_async(
                         &opts.codex_home,
-                        api_key.clone(),
                         tokens.id_token.clone(),
                         tokens.access_token.clone(),
                         tokens.refresh_token.clone(),
                         opts.cli_auth_credentials_store_mode,
                         opts.auth_keyring_backend_kind,
+                        &opts.auth_route_config,
                     )
                     .await
                     {
@@ -515,7 +515,7 @@ async fn process_request(
 /// and always appends `Connection: close`, ensuring the socket is closed from
 /// the server side. Ideally, tiny_http would provide an API to control
 /// server-side connection persistence, but it does not.
-fn send_response_with_disconnect(
+pub(crate) fn send_response_with_disconnect(
     req: Request,
     status: StatusCode,
     mut headers: Vec<Header>,
@@ -550,7 +550,7 @@ fn send_response_with_disconnect(
     writer.flush()
 }
 
-fn build_authorize_url(
+pub(crate) fn build_authorize_url(
     issuer: &str,
     client_id: &str,
     redirect_uri: &str,
@@ -588,7 +588,7 @@ fn build_authorize_url(
     format!("{issuer}/oauth/authorize?{qs}")
 }
 
-fn generate_state() -> String {
+pub(crate) fn generate_state() -> String {
     let mut bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut bytes);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
@@ -611,7 +611,7 @@ fn send_cancel_request(port: u16) -> io::Result<()> {
     Ok(())
 }
 
-fn bind_server(port: u16) -> io::Result<Server> {
+pub(crate) fn bind_server(port: u16) -> io::Result<Server> {
     let preferred_bind_address = format!("127.0.0.1:{port}");
     let fallback_bind_address = format!("127.0.0.1:{FALLBACK_PORT}");
     let mut bind_address = preferred_bind_address.clone();
@@ -681,7 +681,6 @@ pub(crate) struct ExchangedTokens {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TokenEndpointErrorDetail {
     error_code: Option<String>,
-    error_message: Option<String>,
     display_message: String,
 }
 
@@ -754,8 +753,10 @@ fn redact_sensitive_url_parts(url: &mut url::Url) {
     url.set_query(Some(&redacted_query));
 }
 
-/// Redacts any URL attached to a reqwest transport error before it is logged or returned.
-fn redact_sensitive_error_url(mut err: reqwest::Error) -> reqwest::Error {
+/// Redacts any URL attached to an HTTP transport error before it is logged or returned.
+fn redact_sensitive_error_url(
+    mut err: codex_http_client::HttpError,
+) -> codex_http_client::HttpError {
     if let Some(url) = err.url_mut() {
         redact_sensitive_url_parts(url);
     }
@@ -787,7 +788,7 @@ pub(crate) async fn exchange_code_for_tokens(
     redirect_uri: &str,
     pkce: &PkceCodes,
     code: &str,
-    auth_route_config: Option<&AuthRouteConfig>,
+    auth_route_config: &AuthRouteConfig,
 ) -> io::Result<ExchangedTokens> {
     #[derive(serde::Deserialize)]
     struct TokenResponse {
@@ -835,12 +836,11 @@ pub(crate) async fn exchange_code_for_tokens(
 
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().await.map_err(io::Error::other)?;
+        let body = read_response_text_limited(resp, MAX_AUTH_ERROR_BODY_BYTES).await?;
         let detail = parse_token_endpoint_error(&body);
         warn!(
             %status,
             error_code = detail.error_code.as_deref().unwrap_or("unknown"),
-            error_message = detail.error_message.as_deref().unwrap_or("unknown"),
             "oauth token exchange returned non-success status"
         );
         return Err(io::Error::other(format!(
@@ -848,7 +848,8 @@ pub(crate) async fn exchange_code_for_tokens(
         )));
     }
 
-    let tokens: TokenResponse = resp.json().await.map_err(io::Error::other)?;
+    let body = read_response_text_limited(resp, MAX_AUTH_SUCCESS_BODY_BYTES).await?;
+    let tokens: TokenResponse = serde_json::from_str(&body).map_err(io::Error::other)?;
     info!(%status, "oauth token exchange succeeded");
     Ok(ExchangedTokens {
         id_token: tokens.id_token,
@@ -860,16 +861,27 @@ pub(crate) async fn exchange_code_for_tokens(
 /// Persists exchanged credentials using the configured local auth store.
 pub(crate) async fn persist_tokens_async(
     codex_home: &Path,
-    api_key: Option<String>,
     id_token: String,
     access_token: String,
     refresh_token: String,
     auth_credentials_store_mode: AuthCredentialsStoreMode,
     keyring_backend_kind: AuthKeyringBackendKind,
+    auth_route_config: &AuthRouteConfig,
 ) -> io::Result<()> {
     // Reuse existing synchronous logic but run it off the async runtime.
     let codex_home = codex_home.to_path_buf();
-    tokio::task::spawn_blocking(move || {
+    let (previous_auth, auth) = tokio::task::spawn_blocking(move || {
+        let previous_auth = match load_auth_dot_json(
+            &codex_home,
+            auth_credentials_store_mode,
+            keyring_backend_kind,
+        ) {
+            Ok(auth) => auth,
+            Err(err) => {
+                warn!("failed to load previous auth before saving new login: {err}");
+                None
+            }
+        };
         let mut tokens = TokenData {
             id_token: parse_chatgpt_jwt_claims(&id_token).map_err(io::Error::other)?,
             access_token,
@@ -882,24 +894,40 @@ pub(crate) async fn persist_tokens_async(
         {
             tokens.account_id = Some(acc.to_string());
         }
+        let pool_account_id = tokens
+            .account_id
+            .as_deref()
+            .filter(|workspace_account_id| !workspace_account_id.is_empty())
+            .map(|workspace_account_id| {
+                derive_pool_account_id(
+                    workspace_account_id,
+                    tokens.id_token.member_identity_key().as_deref(),
+                )
+            });
         let auth = AuthDotJson {
             auth_mode: Some(AuthMode::Chatgpt),
-            openai_api_key: api_key,
             tokens: Some(tokens),
+            pool_account_id,
             last_refresh: Some(Utc::now()),
             agent_identity: None,
-            personal_access_token: None,
-            bedrock_api_key: None,
         };
         save_auth(
             &codex_home,
             &auth,
             auth_credentials_store_mode,
             keyring_backend_kind,
-        )
+        )?;
+        Ok::<_, io::Error>((previous_auth, auth))
     })
     .await
-    .map_err(|e| io::Error::other(format!("persist task failed: {e}")))?
+    .map_err(|e| io::Error::other(format!("persist task failed: {e}")))??;
+
+    if let Err(err) =
+        revoke_auth_tokens_if_superseded(previous_auth.as_ref(), &auth, auth_route_config).await
+    {
+        warn!("failed to revoke superseded auth tokens after login: {err}");
+    }
+    Ok(())
 }
 
 /// Validates the ID token against an optional workspace restriction.
@@ -984,17 +1012,16 @@ fn oauth_callback_error_message(error_code: &str, error_description: Option<&str
     format!("Sign-in failed: {error_code}")
 }
 
-/// Extracts token endpoint error detail for both structured logging and caller-visible errors.
+/// Extracts a bounded, allow-listed token endpoint error code.
 ///
-/// Parsed JSON fields are safe to log individually. If the response is not JSON, the raw body is
-/// preserved only for the returned error path so the CLI/browser can still surface the backend
-/// detail, while the structured log path continues to use the explicitly parsed safe fields above.
+/// OAuth response bodies are upstream-controlled and may echo submitted codes
+/// or credentials. Neither structured logs nor caller-visible errors retain
+/// arbitrary body text.
 fn parse_token_endpoint_error(body: &str) -> TokenEndpointErrorDetail {
     let trimmed = body.trim();
     if trimmed.is_empty() {
         return TokenEndpointErrorDetail {
             error_code: None,
-            error_message: None,
             display_message: "unknown error".to_string(),
         };
     }
@@ -1005,51 +1032,43 @@ fn parse_token_endpoint_error(body: &str) -> TokenEndpointErrorDetail {
             .get("error")
             .and_then(JsonValue::as_str)
             .filter(|error_code| !error_code.trim().is_empty())
-            .map(ToString::to_string)
+            .and_then(recognized_token_endpoint_error_code)
             .or_else(|| {
                 json.get("error")
                     .and_then(JsonValue::as_object)
                     .and_then(|error_obj| error_obj.get("code"))
                     .and_then(JsonValue::as_str)
                     .filter(|code| !code.trim().is_empty())
-                    .map(ToString::to_string)
+                    .and_then(recognized_token_endpoint_error_code)
             });
-        if let Some(description) = json.get("error_description").and_then(JsonValue::as_str)
-            && !description.trim().is_empty()
-        {
-            return TokenEndpointErrorDetail {
-                error_code,
-                error_message: Some(description.to_string()),
-                display_message: description.to_string(),
-            };
-        }
-        if let Some(error_obj) = json.get("error")
-            && let Some(message) = error_obj.get("message").and_then(JsonValue::as_str)
-            && !message.trim().is_empty()
-        {
-            return TokenEndpointErrorDetail {
-                error_code,
-                error_message: Some(message.to_string()),
-                display_message: message.to_string(),
-            };
-        }
         if let Some(error_code) = error_code {
             return TokenEndpointErrorDetail {
-                display_message: error_code.clone(),
+                display_message: format!("OAuth error: {error_code}"),
                 error_code: Some(error_code),
-                error_message: None,
             };
         }
     }
 
-    // Preserve non-JSON token-endpoint bodies for the returned error so CLI/browser flows still
-    // surface the backend detail users and admins need, but keep that text out of structured logs
-    // by only logging explicitly parsed fields above and avoiding `%err` logging at the callback
-    // layer.
     TokenEndpointErrorDetail {
         error_code: None,
-        error_message: None,
-        display_message: trimmed.to_string(),
+        display_message: "unknown error".to_string(),
+    }
+}
+
+fn recognized_token_endpoint_error_code(value: &str) -> Option<String> {
+    let code = value.trim().to_ascii_lowercase();
+    match code.as_str() {
+        "access_denied"
+        | "invalid_client"
+        | "invalid_grant"
+        | "invalid_request"
+        | "invalid_scope"
+        | "proxy_auth_required"
+        | "server_error"
+        | "temporarily_unavailable"
+        | "unauthorized_client"
+        | "unsupported_grant_type" => Some(code),
+        _ => None,
     }
 }
 
@@ -1107,58 +1126,217 @@ fn html_escape(input: &str) -> String {
     escaped
 }
 
-/// Exchanges an authenticated ID token for an API-key style access token.
-pub(crate) async fn obtain_api_key(
-    issuer: &str,
-    client_id: &str,
-    id_token: &str,
-    auth_route_config: Option<&AuthRouteConfig>,
-) -> io::Result<String> {
-    // Token exchange for an API key access token
-    #[derive(serde::Deserialize)]
-    struct ExchangeResp {
-        access_token: String,
-    }
-    let token_endpoint = format!("{}/oauth/token", issuer.trim_end_matches('/'));
-    let client = create_raw_auth_client(&token_endpoint, auth_route_config)?;
-    let resp = client
-        .post(token_endpoint)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .body(format!(
-            "grant_type={}&client_id={}&requested_token={}&subject_token={}&subject_token_type={}",
-            urlencoding::encode("urn:ietf:params:oauth:grant-type:token-exchange"),
-            urlencoding::encode(client_id),
-            urlencoding::encode("openai-api-key"),
-            urlencoding::encode(id_token),
-            urlencoding::encode("urn:ietf:params:oauth:token-type:id_token")
-        ))
-        .send()
-        .await
-        .map_err(io::Error::other)?;
-    if !resp.status().is_success() {
-        return Err(io::Error::other(format!(
-            "api key exchange failed with status {}",
-            resp.status()
-        )));
-    }
-    let body: ExchangeResp = resp.json().await.map_err(io::Error::other)?;
-    Ok(body.access_token)
-}
 #[cfg(test)]
 mod tests {
+    use anyhow::Context;
+    use base64::Engine;
+    use core_test_support::skip_if_no_network;
     use pretty_assertions::assert_eq;
+    use serde_json::Value;
+    use serde_json::json;
+    use std::ffi::OsString;
+    use tempfile::tempdir;
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
 
+    use super::AuthCredentialsStoreMode;
+    use super::AuthDotJson;
+    use super::AuthKeyringBackendKind;
+    use super::AuthMode;
+    use super::TokenData;
     use super::TokenEndpointErrorDetail;
     use super::html_escape;
     use super::is_missing_codex_entitlement_error;
+    use super::load_auth_dot_json;
+    use super::parse_chatgpt_jwt_claims;
     use super::parse_token_endpoint_error;
+    use super::persist_tokens_async;
     use super::redact_sensitive_query_value;
     use super::redact_sensitive_url_parts;
     use super::render_login_error_page;
     use super::sanitize_url_for_logging;
+    use super::save_auth;
+    use crate::auth::REVOKE_TOKEN_URL_OVERRIDE_ENV_VAR;
 
+    #[serial_test::serial(logout_revoke)]
+    #[tokio::test]
+    async fn persist_tokens_async_revokes_previous_auth_without_failing_login() -> anyhow::Result<()>
+    {
+        skip_if_no_network!(Ok(()));
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/revoke"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+                "error": {
+                    "message": "revoke failed"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let _env_guard = EnvGuard::set(
+            REVOKE_TOKEN_URL_OVERRIDE_ENV_VAR,
+            format!("{}/oauth/revoke", server.uri()),
+        );
+
+        let codex_home = tempdir()?;
+        save_auth(
+            codex_home.path(),
+            &chatgpt_auth("old-access", "old-refresh", "old-account"),
+            AuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::default(),
+        )?;
+
+        persist_tokens_async(
+            codex_home.path(),
+            jwt_for_account("new-account"),
+            "new-access".to_string(),
+            "new-refresh".to_string(),
+            AuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::default(),
+            &crate::test_support::transport_default_auth_route_config(),
+        )
+        .await?;
+
+        let auth = load_auth_dot_json(
+            codex_home.path(),
+            AuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::default(),
+        )?
+        .context("auth.json should exist after login")?;
+        assert_eq!(
+            auth.tokens.context("new tokens should be persisted")?,
+            TokenData {
+                id_token: parse_chatgpt_jwt_claims(&jwt_for_account("new-account"))
+                    .expect("new JWT should parse"),
+                access_token: "new-access".to_string(),
+                refresh_token: "new-refresh".to_string(),
+                account_id: Some("new-account".to_string()),
+            }
+        );
+
+        let requests = server
+            .received_requests()
+            .await
+            .context("failed to fetch revoke requests")?;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]
+                .body_json::<Value>()
+                .context("revoke request should be JSON")?,
+            json!({
+                "token": "old-refresh",
+                "token_type_hint": "refresh_token",
+                "client_id": crate::auth::CLIENT_ID,
+            })
+        );
+        server.verify().await;
+        Ok(())
+    }
+
+    #[serial_test::serial(logout_revoke)]
+    #[tokio::test]
+    async fn persist_tokens_async_does_not_revoke_reused_refresh_token() -> anyhow::Result<()> {
+        skip_if_no_network!(Ok(()));
+
+        let server = MockServer::start().await;
+        let _env_guard = EnvGuard::set(
+            REVOKE_TOKEN_URL_OVERRIDE_ENV_VAR,
+            format!("{}/oauth/revoke", server.uri()),
+        );
+
+        let codex_home = tempdir()?;
+        save_auth(
+            codex_home.path(),
+            &chatgpt_auth("old-access", "shared-refresh", "old-account"),
+            AuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::default(),
+        )?;
+
+        persist_tokens_async(
+            codex_home.path(),
+            jwt_for_account("new-account"),
+            "new-access".to_string(),
+            "shared-refresh".to_string(),
+            AuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::default(),
+            &crate::test_support::transport_default_auth_route_config(),
+        )
+        .await?;
+
+        let requests = server
+            .received_requests()
+            .await
+            .context("failed to fetch revoke requests")?;
+        assert_eq!(requests.len(), 0);
+        Ok(())
+    }
+
+    fn chatgpt_auth(access_token: &str, refresh_token: &str, account_id: &str) -> AuthDotJson {
+        AuthDotJson {
+            auth_mode: Some(AuthMode::Chatgpt),
+            tokens: Some(TokenData {
+                id_token: parse_chatgpt_jwt_claims(&jwt_for_account(account_id))
+                    .expect("test JWT should parse"),
+                access_token: access_token.to_string(),
+                refresh_token: refresh_token.to_string(),
+                account_id: Some(account_id.to_string()),
+            }),
+            pool_account_id: Some(account_id.to_string()),
+            last_refresh: None,
+            agent_identity: None,
+        }
+    }
+
+    fn jwt_for_account(account_id: &str) -> String {
+        let encode = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        let header_b64 = encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let payload_b64 = encode(
+            serde_json::to_string(&json!({
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": account_id,
+                }
+            }))
+            .expect("payload should serialize")
+            .as_bytes(),
+        );
+        let signature_b64 = encode(b"sig");
+        format!("{header_b64}.{payload_b64}.{signature_b64}")
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: String) -> Self {
+            let original = std::env::var_os(key);
+            // SAFETY: this test executes serially with other revoke tests.
+            unsafe {
+                std::env::set_var(key, &value);
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: the guard restores the original environment before other revoke tests run.
+            unsafe {
+                match &self.original {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
     #[test]
-    fn parse_token_endpoint_error_prefers_error_description() {
+    fn parse_token_endpoint_error_keeps_code_but_redacts_description() {
         let detail = parse_token_endpoint_error(
             r#"{"error":"invalid_grant","error_description":"refresh token expired"}"#,
         );
@@ -1167,14 +1345,13 @@ mod tests {
             detail,
             TokenEndpointErrorDetail {
                 error_code: Some("invalid_grant".to_string()),
-                error_message: Some("refresh token expired".to_string()),
-                display_message: "refresh token expired".to_string(),
+                display_message: "OAuth error: invalid_grant".to_string(),
             }
         );
     }
 
     #[test]
-    fn parse_token_endpoint_error_reads_nested_error_message_and_code() {
+    fn parse_token_endpoint_error_keeps_nested_code_but_redacts_message() {
         let detail = parse_token_endpoint_error(
             r#"{"error":{"code":"proxy_auth_required","message":"proxy authentication required"}}"#,
         );
@@ -1183,8 +1360,7 @@ mod tests {
             detail,
             TokenEndpointErrorDetail {
                 error_code: Some("proxy_auth_required".to_string()),
-                error_message: Some("proxy authentication required".to_string()),
-                display_message: "proxy authentication required".to_string(),
+                display_message: "OAuth error: proxy_auth_required".to_string(),
             }
         );
     }
@@ -1197,24 +1373,26 @@ mod tests {
             detail,
             TokenEndpointErrorDetail {
                 error_code: Some("temporarily_unavailable".to_string()),
-                error_message: None,
-                display_message: "temporarily_unavailable".to_string(),
+                display_message: "OAuth error: temporarily_unavailable".to_string(),
             }
         );
     }
 
     #[test]
-    fn parse_token_endpoint_error_preserves_plain_text_for_display() {
-        let detail = parse_token_endpoint_error("service unavailable");
+    fn parse_token_endpoint_error_redacts_unrecognized_body_content() {
+        const SENTINEL: &str = "secret-authorization-code-echo";
+        let detail = parse_token_endpoint_error(&format!(
+            r#"{{"error":"{SENTINEL}","message":"{SENTINEL}"}}"#
+        ));
 
         assert_eq!(
             detail,
             TokenEndpointErrorDetail {
                 error_code: None,
-                error_message: None,
-                display_message: "service unavailable".to_string(),
+                display_message: "unknown error".to_string(),
             }
         );
+        assert!(!detail.to_string().contains(SENTINEL));
     }
 
     #[test]

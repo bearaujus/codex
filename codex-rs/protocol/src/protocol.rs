@@ -111,6 +111,8 @@ pub const SKILLS_INSTRUCTIONS_OPEN_TAG: &str = "<skills_instructions>";
 pub const SKILLS_INSTRUCTIONS_CLOSE_TAG: &str = "</skills_instructions>";
 pub const PLUGINS_INSTRUCTIONS_OPEN_TAG: &str = "<plugins_instructions>";
 pub const PLUGINS_INSTRUCTIONS_CLOSE_TAG: &str = "</plugins_instructions>";
+pub const TOOLS_OPEN_TAG: &str = "<tools>";
+pub const TOOLS_CLOSE_TAG: &str = "</tools>";
 pub const COLLABORATION_MODE_OPEN_TAG: &str = "<collaboration_mode>";
 pub const COLLABORATION_MODE_CLOSE_TAG: &str = "</collaboration_mode>";
 pub const MULTI_AGENT_MODE_OPEN_TAG: &str = "<multi_agent_mode>";
@@ -180,6 +182,8 @@ pub struct Submission {
     pub client_user_message_id: Option<String>,
     /// Optional W3C trace carrier propagated across async submission handoffs.
     pub trace: Option<W3cTraceContext>,
+    /// Core-provided ID of the parent turn that directly initiated this submission.
+    pub parent_turn_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -192,20 +196,13 @@ pub struct W3cTraceContext {
     pub tracestate: Option<String>,
 }
 
-/// Config payload for refreshing MCP servers.
-#[derive(Debug, Clone, PartialEq)]
-pub struct McpServerRefreshConfig {
-    /// Complete runtime server map after source and thread-scoped resolution.
-    pub mcp_servers: Value,
-    /// OAuth credential store mode to use with this server snapshot.
-    pub mcp_oauth_credentials_store_mode: Value,
-    pub auth_keyring_backend_kind: Value,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConversationStartParams {
     /// Whether Codex response handoffs are managed through explicit client append calls.
     pub client_managed_handoffs: bool,
+    /// Whether a realtime V3 delegation produces an acknowledgement filler.
+    /// `None` preserves the Realtime API's default behavior.
+    pub delegation_ack_filler: Option<bool>,
     /// Whether to route any remaining transcript tail through Codex when the session ends.
     /// TODO: Remove this rollout knob once transcript-tail flushing is always enabled.
     pub flush_transcript_tail_on_session_end: bool,
@@ -216,6 +213,8 @@ pub struct ConversationStartParams {
     /// Selects how automatic Codex handoffs are routed in Frameless Bidi sessions.
     /// Realtime V1 and V2 ignore this setting.
     pub codex_response_handoff_mode: CodexResponseHandoffMode,
+    /// Optional client-selected BEM prefixes keyed by `analysis`, `commentary`, and `final`.
+    pub codex_response_handoff_channel_prefixes: Option<BTreeMap<String, Vec<String>>>,
     /// Overrides the configured realtime model for this session only.
     pub model: Option<String>,
     /// Selects whether the realtime session should produce text or audio output.
@@ -224,6 +223,10 @@ pub struct ConversationStartParams {
     pub include_startup_context: bool,
     /// Complete role-bearing text items to include in the initial realtime session history.
     pub initial_items: Vec<ConversationTextParams>,
+    /// Developer instructions given to Codex when this realtime session starts.
+    pub realtime_start_instructions: Option<String>,
+    /// Developer instructions given to Codex when this realtime session ends.
+    pub realtime_end_instructions: Option<String>,
     pub prompt: Option<Option<String>>,
     pub realtime_session_id: Option<String>,
     pub transport: Option<ConversationStartTransport>,
@@ -639,7 +642,7 @@ pub enum Op {
     },
 
     /// Request MCP servers to reinitialize and refresh cached tool lists.
-    RefreshMcpServers { config: McpServerRefreshConfig },
+    RefreshMcpServers,
 
     /// Reload user config layer overrides for the active session.
     ///
@@ -880,7 +883,7 @@ impl Op {
             Self::UserInputAnswer { .. } => "user_input_answer",
             Self::RequestPermissionsResponse { .. } => "request_permissions_response",
             Self::DynamicToolResponse { .. } => "dynamic_tool_response",
-            Self::RefreshMcpServers { .. } => "refresh_mcp_servers",
+            Self::RefreshMcpServers => "refresh_mcp_servers",
             Self::ReloadUserConfig => "reload_user_config",
             Self::Compact => "compact",
             Self::SetThreadMemoryMode { .. } => "set_thread_memory_mode",
@@ -1845,6 +1848,9 @@ pub struct ItemCompletedEvent {
     pub thread_id: ThreadId,
     pub turn_id: String,
     pub item: TurnItem,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub started_at_ms: Option<i64>,
     // Old rollout files may contain ItemCompleted events for PlanItem without
     // this field. Default to 0 so those persisted rollouts still deserialize
     // after tightening the core event contract.
@@ -2033,7 +2039,7 @@ pub struct ThreadSettingsAppliedEvent {
     pub thread_settings: ThreadSettingsSnapshot,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
 pub struct ThreadSettingsSnapshot {
     pub model: String,
     pub model_provider_id: String,
@@ -2345,6 +2351,15 @@ pub struct UserMessageEvent {
     /// imply default image detail behavior.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub local_image_details: Vec<Option<ImageDetail>>,
+    /// Audio URLs sourced from `UserInput::Audio`. These are safe to replay in
+    /// legacy UI history events and correspond to audio sent to the model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio: Option<Vec<String>>,
+    /// Local file paths sourced from `UserInput::LocalAudio`. These are kept so
+    /// clients can reattach audio when editing history and should not be
+    /// treated as API-ready URLs.
+    #[serde(default)]
+    pub local_audio: Vec<std::path::PathBuf>,
     /// UI-defined spans within `message` used to render or persist special elements.
     #[serde(default)]
     pub text_elements: Vec<crate::user_input::TextElement>,
@@ -2363,6 +2378,9 @@ pub fn user_message_preview(user: &UserMessageEvent) -> Option<String> {
         || !user.local_images.is_empty()
     {
         return Some("[Image]".to_string());
+    }
+    if user.audio.as_ref().is_some_and(|audio| !audio.is_empty()) || !user.local_audio.is_empty() {
+        return Some("[Audio]".to_string());
     }
     None
 }
@@ -2419,6 +2437,10 @@ pub struct McpToolCallBeginEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub plugin_id: Option<String>,
+    /// Whether the selected tool is annotated as read-only, not its execution outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub read_only_hint: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS, PartialEq)]
@@ -2444,6 +2466,9 @@ pub struct McpToolCallEndEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub plugin_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub read_only_hint: Option<bool>,
     #[ts(type = "string")]
     pub duration: Duration,
     /// Result of the tool call. Note this could be an error.
@@ -2670,28 +2695,6 @@ impl InitialHistory {
                 .map(|meta| meta.history_mode)
                 .unwrap_or(default_history_mode),
         }
-    }
-
-    pub fn get_latest_effective_multi_agent_mode(&self) -> Option<MultiAgentMode> {
-        let items = match self {
-            InitialHistory::New | InitialHistory::Cleared => return None,
-            InitialHistory::Resumed(resumed) => &resumed.history,
-            InitialHistory::Forked(items) => items,
-        };
-        items
-            .iter()
-            .rev()
-            .find_map(|item| match item {
-                RolloutItem::TurnContext(turn_context) => Some(turn_context),
-                RolloutItem::SessionMeta(_)
-                | RolloutItem::ResponseItem(_)
-                | RolloutItem::InterAgentCommunication(_)
-                | RolloutItem::InterAgentCommunicationMetadata { .. }
-                | RolloutItem::Compacted(_)
-                | RolloutItem::WorldState(_)
-                | RolloutItem::EventMsg(_) => None,
-            })
-            .and_then(|turn_context| turn_context.multi_agent_mode.clone())
     }
 
     pub fn get_resumed_session_sources(&self) -> Option<(SessionSource, Option<ThreadSource>)> {
@@ -3304,7 +3307,7 @@ pub struct TurnContextItem {
     pub collaboration_mode: Option<CollaborationMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multi_agent_version: Option<MultiAgentVersion>,
-    /// Effective model-visible mode used as the durable context-diff baseline.
+    /// Legacy effective model-visible mode retained to deserialize older rollouts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multi_agent_mode: Option<MultiAgentMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3522,6 +3525,14 @@ pub enum ExecCommandStatus {
 pub struct ExecCommandBeginEvent {
     /// Identifier so this can be paired with the ExecCommandEnd event.
     pub call_id: String,
+    /// Trusted first-party plugin attributed to this command, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub plugin_id: Option<String>,
+    /// Safe plugin-relative path attributed to this command, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub script_path: Option<String>,
     /// Identifier for the underlying PTY process (when available).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -3548,6 +3559,14 @@ pub struct ExecCommandBeginEvent {
 pub struct ExecCommandEndEvent {
     /// Identifier for the ExecCommandBegin that finished.
     pub call_id: String,
+    /// Trusted first-party plugin attributed to this command, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub plugin_id: Option<String>,
+    /// Safe plugin-relative path attributed to this command, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub script_path: Option<String>,
     /// Identifier for the underlying PTY process (when available).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -3765,6 +3784,7 @@ pub struct McpStartupFailure {
 #[serde(rename_all = "snake_case")]
 #[ts(rename_all = "snake_case")]
 pub enum McpAuthStatus {
+    Unknown,
     Unsupported,
     NotLoggedIn,
     BearerToken,
@@ -3774,6 +3794,7 @@ pub enum McpAuthStatus {
 impl fmt::Display for McpAuthStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let text = match self {
+            McpAuthStatus::Unknown => "Unknown",
             McpAuthStatus::Unsupported => "Unsupported",
             McpAuthStatus::NotLoggedIn => "Not logged in",
             McpAuthStatus::BearerToken => "Bearer token",
@@ -4089,7 +4110,7 @@ pub struct ThreadGoalUpdatedEvent {
 }
 
 /// User's decision in response to an ExecApprovalRequest.
-#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq, Display, JsonSchema, TS)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Display, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewDecision {
     /// User has approved this command and the agent should execute it.
@@ -4114,8 +4135,7 @@ pub enum ReviewDecision {
 
     /// User has denied this command and the agent should not execute it, but
     /// it should continue the session and try something else.
-    #[default]
-    Denied,
+    Denied { rejection: String },
 
     /// Automatic approval review timed out before reaching a decision.
     TimedOut,
@@ -4125,7 +4145,21 @@ pub enum ReviewDecision {
     Abort,
 }
 
+impl Default for ReviewDecision {
+    fn default() -> Self {
+        Self::Denied {
+            rejection: "denied".to_string(),
+        }
+    }
+}
+
 impl ReviewDecision {
+    pub fn denied(rejection: impl Into<String>) -> Self {
+        Self::Denied {
+            rejection: rejection.into(),
+        }
+    }
+
     /// Returns an opaque version of the decision without PII. We can't use an ignored flag
     /// on `serde` because the serialization is required by some surfaces.
     pub fn to_opaque_string(&self) -> &'static str {
@@ -4139,7 +4173,7 @@ impl ReviewDecision {
                 NetworkPolicyRuleAction::Allow => "approved_with_network_policy_allow",
                 NetworkPolicyRuleAction::Deny => "denied_with_network_policy_deny",
             },
-            ReviewDecision::Denied => "denied",
+            ReviewDecision::Denied { .. } => "denied",
             ReviewDecision::TimedOut => "timed_out",
             ReviewDecision::Abort => "abort",
         }
@@ -4457,6 +4491,18 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::NamedTempFile;
     use tempfile::TempDir;
+
+    #[test]
+    fn review_decision_denied_round_trip() -> Result<()> {
+        let decision = ReviewDecision::Denied {
+            rejection: "denied reason".to_string(),
+        };
+        let value = json!({"denied": {"rejection": "denied reason"}});
+
+        assert_eq!(serde_json::to_value(&decision)?, value);
+        assert_eq!(serde_json::from_value::<ReviewDecision>(value)?, decision);
+        Ok(())
+    }
 
     #[test]
     fn feature_thread_source_serializes_as_its_app_owned_label() -> Result<()> {
@@ -4893,6 +4939,7 @@ mod tests {
                 value: FileSystemSpecialPath::Root,
             },
             access: FileSystemAccessMode::Read,
+            missing_path_behavior: None,
         }]);
         assert!(read_only.has_full_disk_read_access());
         assert!(!read_only.has_full_disk_write_access());
@@ -4903,6 +4950,7 @@ mod tests {
                 value: FileSystemSpecialPath::Root,
             },
             access: FileSystemAccessMode::Write,
+            missing_path_behavior: None,
         }]);
         assert!(writable.has_full_disk_read_access());
         assert!(writable.has_full_disk_write_access());
@@ -4933,10 +4981,12 @@ mod tests {
                     value: FileSystemSpecialPath::Root,
                 },
                 access: FileSystemAccessMode::Write,
+                missing_path_behavior: None,
             },
             FileSystemSandboxEntry {
                 path: FileSystemPath::Path { path: blocked },
                 access: FileSystemAccessMode::Deny,
+                missing_path_behavior: None,
             },
         ]);
 
@@ -4984,16 +5034,19 @@ mod tests {
                     value: FileSystemSpecialPath::Minimal,
                 },
                 access: FileSystemAccessMode::Read,
+                missing_path_behavior: None,
             },
             FileSystemSandboxEntry {
                 path: FileSystemPath::Special {
                     value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
                 },
                 access: FileSystemAccessMode::Write,
+                missing_path_behavior: None,
             },
             FileSystemSandboxEntry {
                 path: FileSystemPath::Path { path: secret },
                 access: FileSystemAccessMode::Deny,
+                missing_path_behavior: None,
             },
         ]);
 
@@ -5052,14 +5105,17 @@ mod tests {
                     value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
                 },
                 access: FileSystemAccessMode::Write,
+                missing_path_behavior: None,
             },
             FileSystemSandboxEntry {
                 path: FileSystemPath::Path { path: docs },
                 access: FileSystemAccessMode::Read,
+                missing_path_behavior: None,
             },
             FileSystemSandboxEntry {
                 path: FileSystemPath::Path { path: docs_public },
                 access: FileSystemAccessMode::Write,
+                missing_path_behavior: None,
             },
         ]);
 
@@ -5096,6 +5152,7 @@ mod tests {
                 path: external_write_path,
             },
             access: FileSystemAccessMode::Write,
+            missing_path_behavior: None,
         }]);
 
         let err = policy
@@ -5265,6 +5322,7 @@ mod tests {
                 app_name: Some("Calendar".into()),
                 action_name: Some("create_event".into()),
                 plugin_id: Some("sample@test".into()),
+                read_only_hint: Some(false),
                 status: McpToolCallStatus::InProgress,
                 result: None,
                 error: None,
@@ -5288,6 +5346,7 @@ mod tests {
                 assert_eq!(event.app_name.as_deref(), Some("Calendar"));
                 assert_eq!(event.action_name.as_deref(), Some("create_event"));
                 assert_eq!(event.plugin_id.as_deref(), Some("sample@test"));
+                assert_eq!(event.read_only_hint, Some(false));
             }
             _ => panic!("expected McpToolCallBegin event"),
         }
@@ -5305,6 +5364,7 @@ mod tests {
                 result: "Zm9v".into(),
                 saved_path: Some(test_path_buf("/tmp/ig-1.png").abs()),
             }),
+            started_at_ms: Some(0),
             completed_at_ms: 0,
         };
 
@@ -5330,6 +5390,7 @@ mod tests {
         let event = ItemCompletedEvent {
             thread_id: ThreadId::new(),
             turn_id: "turn-1".into(),
+            started_at_ms: Some(0),
             completed_at_ms: 0,
             item: TurnItem::FileChange(FileChangeItem {
                 id: "patch-1".into(),
@@ -5368,6 +5429,7 @@ mod tests {
         let event = ItemCompletedEvent {
             thread_id: ThreadId::new(),
             turn_id: "turn-1".into(),
+            started_at_ms: Some(0),
             completed_at_ms: 0,
             item: TurnItem::McpToolCall(McpToolCallItem {
                 id: "mcp-1".into(),
@@ -5380,6 +5442,7 @@ mod tests {
                 app_name: Some("Calendar".into()),
                 action_name: Some("create_event".into()),
                 plugin_id: Some("sample@test".into()),
+                read_only_hint: None,
                 status: McpToolCallStatus::Completed,
                 result: Some(CallToolResult {
                     content: vec![json!({"type": "text", "text": "ok"})],
@@ -5424,6 +5487,8 @@ mod tests {
             started_at_ms: 10,
             item: TurnItem::CommandExecution(CommandExecutionItem {
                 id: "exec-1".into(),
+                plugin_id: Some("sample@openai-curated".into()),
+                script_path: Some("scripts/run.py".into()),
                 process_id: Some("pid-1".into()),
                 command: vec!["echo".into(), "done".into()],
                 cwd: cwd.clone(),
@@ -5444,9 +5509,12 @@ mod tests {
         let completed = ItemCompletedEvent {
             thread_id: ThreadId::new(),
             turn_id: "turn-1".into(),
+            started_at_ms: Some(10),
             completed_at_ms: 20,
             item: TurnItem::CommandExecution(CommandExecutionItem {
                 id: "exec-1".into(),
+                plugin_id: Some("sample@openai-curated".into()),
+                script_path: Some("scripts/run.py".into()),
                 process_id: Some("pid-1".into()),
                 command: vec!["echo".into(), "done".into()],
                 cwd,
@@ -5469,10 +5537,15 @@ mod tests {
             started.as_legacy_events(/*show_raw_agent_reasoning*/ false).as_slice(),
             [EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
                 call_id,
+                plugin_id,
+                script_path,
                 turn_id,
                 started_at_ms: 10,
                 ..
-            })] if call_id == "exec-1" && turn_id == "turn-1"
+            })] if call_id == "exec-1"
+                && plugin_id.as_deref() == Some("sample@openai-curated")
+                && script_path.as_deref() == Some("scripts/run.py")
+                && turn_id == "turn-1"
         ));
         assert!(matches!(
             completed
@@ -5480,11 +5553,17 @@ mod tests {
                 .as_slice(),
             [EventMsg::ExecCommandEnd(ExecCommandEndEvent {
                 call_id,
+                plugin_id,
+                script_path,
                 turn_id,
                 completed_at_ms: 20,
                 aggregated_output,
                 ..
-            })] if call_id == "exec-1" && turn_id == "turn-1" && aggregated_output == "done\n"
+            })] if call_id == "exec-1"
+                && plugin_id.as_deref() == Some("sample@openai-curated")
+                && script_path.as_deref() == Some("scripts/run.py")
+                && turn_id == "turn-1"
+                && aggregated_output == "done\n"
         ));
     }
 
@@ -5509,6 +5588,7 @@ mod tests {
         let completed = ItemCompletedEvent {
             thread_id: ThreadId::new(),
             turn_id: "turn-1".into(),
+            started_at_ms: Some(10),
             completed_at_ms: 20,
             item: TurnItem::DynamicToolCall(DynamicToolCallItem {
                 id: "dynamic-1".into(),
@@ -5553,6 +5633,7 @@ mod tests {
         let entered = ItemCompletedEvent {
             thread_id: ThreadId::new(),
             turn_id: "turn-1".into(),
+            started_at_ms: Some(0),
             completed_at_ms: 0,
             item: TurnItem::EnteredReviewMode(EnteredReviewModeItem {
                 id: "entered-review".into(),
@@ -5565,6 +5646,7 @@ mod tests {
         let exited = ItemCompletedEvent {
             thread_id: ThreadId::new(),
             turn_id: "turn-1".into(),
+            started_at_ms: Some(0),
             completed_at_ms: 0,
             item: TurnItem::ExitedReviewMode(ExitedReviewModeItem {
                 id: "exited-review".into(),
@@ -5625,12 +5707,14 @@ mod tests {
             thread_id: ThreadId::new(),
             turn_id: "turn-1".into(),
             item: TurnItem::UserMessage(UserMessageItem::new(&[])),
+            started_at_ms: None,
             completed_at_ms: 123,
         })
         .unwrap();
         value.as_object_mut().unwrap().remove("completed_at_ms");
 
         let event = serde_json::from_value::<ItemCompletedEvent>(value).unwrap();
+        assert_eq!(event.started_at_ms, None);
         assert_eq!(event.completed_at_ms, 0);
     }
 
@@ -5771,6 +5855,7 @@ mod tests {
             json!({
                 "message": "hello",
                 "local_images": [],
+                "local_audio": [],
                 "text_elements": [],
             })
         );
@@ -5795,14 +5880,17 @@ mod tests {
         assert_eq!(event.image_details, Vec::<Option<ImageDetail>>::new());
         assert_eq!(event.local_images, vec![PathBuf::from("/tmp/local.png")]);
         assert_eq!(event.local_image_details, Vec::<Option<ImageDetail>>::new());
+        assert_eq!(event.audio, None);
+        assert_eq!(event.local_audio, Vec::<PathBuf>::new());
         assert_eq!(event.text_elements, Vec::new());
 
         Ok(())
     }
 
     #[test]
-    fn user_message_item_legacy_event_preserves_image_details() {
+    fn user_message_item_legacy_event_preserves_attachments() {
         let local_path = PathBuf::from("/tmp/local.png");
+        let local_audio_path = PathBuf::from("/tmp/local.wav");
         let mut item = UserMessageItem::new(&[
             crate::user_input::UserInput::Image {
                 image_url: "https://example.com/first.png".to_string(),
@@ -5815,6 +5903,12 @@ mod tests {
             crate::user_input::UserInput::LocalImage {
                 path: local_path.clone(),
                 detail: Some(ImageDetail::Original),
+            },
+            crate::user_input::UserInput::Audio {
+                audio_url: "https://example.com/remote.mp3".to_string(),
+            },
+            crate::user_input::UserInput::LocalAudio {
+                path: local_audio_path.clone(),
             },
         ]);
         item.client_id = Some("client-message-1".to_string());
@@ -5834,6 +5928,21 @@ mod tests {
         assert_eq!(event.image_details, vec![Some(ImageDetail::Original)]);
         assert_eq!(event.local_images, vec![local_path]);
         assert_eq!(event.local_image_details, vec![Some(ImageDetail::Original)]);
+        assert_eq!(
+            event.audio,
+            Some(vec!["https://example.com/remote.mp3".to_string()])
+        );
+        assert_eq!(event.local_audio, vec![local_audio_path]);
+    }
+
+    #[test]
+    fn audio_only_user_message_has_placeholder_preview() {
+        let event = UserMessageEvent {
+            audio: Some(vec!["https://example.com/remote.mp3".to_string()]),
+            ..Default::default()
+        };
+
+        assert_eq!(user_message_preview(&event), Some("[Audio]".to_string()));
     }
 
     #[test]
@@ -5988,50 +6097,6 @@ mod tests {
     }
 
     #[test]
-    fn latest_effective_multi_agent_mode_uses_latest_turn_context_even_when_unset() -> Result<()> {
-        let turn_context_item = |multi_agent_mode| -> Result<RolloutItem> {
-            let mut value = json!({
-                "cwd": test_path_buf("/tmp"),
-                "approval_policy": "never",
-                "sandbox_policy": { "type": "danger-full-access" },
-                "model": "gpt-5",
-                "summary": "auto",
-            });
-            value["multi_agent_mode"] = serde_json::to_value(multi_agent_mode)?;
-            Ok(RolloutItem::TurnContext(serde_json::from_value(value)?))
-        };
-
-        assert_eq!(
-            InitialHistory::Forked(vec![
-                turn_context_item(Some(MultiAgentMode::Proactive))?,
-                turn_context_item(/*multi_agent_mode*/ None)?,
-            ])
-            .get_latest_effective_multi_agent_mode(),
-            None
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn latest_effective_multi_agent_mode_maps_legacy_none_to_empty_custom() -> Result<()> {
-        let value = json!({
-            "cwd": test_path_buf("/tmp"),
-            "approval_policy": "never",
-            "sandbox_policy": { "type": "danger-full-access" },
-            "model": "gpt-5",
-            "multi_agent_mode": "none",
-            "summary": "auto",
-        });
-        let item = RolloutItem::TurnContext(serde_json::from_value(value)?);
-
-        assert_eq!(
-            InitialHistory::Forked(vec![item]).get_latest_effective_multi_agent_mode(),
-            Some(MultiAgentMode::Custom(String::new()))
-        );
-        Ok(())
-    }
-
-    #[test]
     fn turn_context_item_serializes_network_when_present() -> Result<()> {
         let item = TurnContextItem {
             turn_id: None,
@@ -6053,6 +6118,7 @@ mod tests {
                         pattern: "/tmp/private/**/*.txt".to_string(),
                     },
                     access: FileSystemAccessMode::Deny,
+                    missing_path_behavior: None,
                 },
             ])),
             model: "gpt-5".to_string(),

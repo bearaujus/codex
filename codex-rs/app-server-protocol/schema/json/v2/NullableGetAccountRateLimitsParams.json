@@ -1,0 +1,27 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "anyOf": [
+    {
+      "$ref": "#/definitions/GetAccountRateLimitsParams"
+    },
+    {
+      "type": "null"
+    }
+  ],
+  "definitions": {
+    "GetAccountRateLimitsParams": {
+      "properties": {
+        "includeResetCredits": {
+          "default": null,
+          "description": "Whether the server should also make the online request for reset-credit details. Callers that only need the locally cached usage snapshots can disable this to avoid coupling UI hydration to network latency. Defaults to `true` when omitted.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    }
+  },
+  "title": "Nullable_GetAccountRateLimitsParams"
+}

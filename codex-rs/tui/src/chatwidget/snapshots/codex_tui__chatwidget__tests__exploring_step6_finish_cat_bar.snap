@@ -1,7 +1,9 @@
 ---
-source: tui/src/chatwidget/tests.rs
+source: tui/src/chatwidget/tests/exec_flow.rs
+assertion_line: 1131
 expression: active_blob(&chat)
 ---
-• Explored
-  └ List ls -la
-    Read foo.txt, bar.txt
+• Explored · 2 files · 4 operations
+  ├ Listed ls -la · 0 entries
+  ├ Read foo.txt ×2 · 2 lines · 19 chars
+  └ Read bar.txt · 1 line · 14 chars

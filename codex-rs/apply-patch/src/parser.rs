@@ -8,9 +8,10 @@
 //! environment_id: "*** Environment ID: " filename LF
 //! end_patch: "*** End Patch" LF?
 //!
-//! hunk: add_hunk | delete_hunk | update_hunk
+//! hunk: add_hunk | delete_hunk | replace_hunk | update_hunk
 //! add_hunk: "*** Add File: " filename LF add_line+
 //! delete_hunk: "*** Delete File: " filename LF
+//! replace_hunk: "*** Replace File: " filename LF add_line*
 //! update_hunk: "*** Update File: " filename LF change_move? change?
 //! filename: /(.+)/
 //! add_line: "+" /(.+)/ LF -> line
@@ -38,6 +39,7 @@ pub(crate) const BEGIN_PATCH_MARKER: &str = "*** Begin Patch";
 pub(crate) const END_PATCH_MARKER: &str = "*** End Patch";
 pub(crate) const ADD_FILE_MARKER: &str = "*** Add File: ";
 pub(crate) const DELETE_FILE_MARKER: &str = "*** Delete File: ";
+pub(crate) const REPLACE_FILE_MARKER: &str = "*** Replace File: ";
 pub(crate) const UPDATE_FILE_MARKER: &str = "*** Update File: ";
 pub(crate) const MOVE_TO_MARKER: &str = "*** Move to: ";
 pub(crate) const EOF_MARKER: &str = "*** End of File";
@@ -71,6 +73,10 @@ pub enum Hunk {
     DeleteFile {
         path: PathBuf,
     },
+    ReplaceFile {
+        path: PathBuf,
+        contents: String,
+    },
     UpdateFile {
         path: PathBuf,
         move_path: Option<PathBuf>,
@@ -85,7 +91,9 @@ impl Hunk {
     pub fn resolve_path(&self, cwd: &PathUri) -> Result<PathUri, PathUriParseError> {
         let path = match self {
             Hunk::UpdateFile { path, .. } => path,
-            Hunk::AddFile { .. } | Hunk::DeleteFile { .. } => self.path(),
+            Hunk::AddFile { .. } | Hunk::DeleteFile { .. } | Hunk::ReplaceFile { .. } => {
+                self.path()
+            }
         };
         cwd.join(&path.to_string_lossy())
     }
@@ -95,6 +103,7 @@ impl Hunk {
         match self {
             Hunk::AddFile { path, .. } => path,
             Hunk::DeleteFile { path } => path,
+            Hunk::ReplaceFile { path, .. } => path,
             Hunk::UpdateFile {
                 move_path: Some(path),
                 ..

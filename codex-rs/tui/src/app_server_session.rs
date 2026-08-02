@@ -32,10 +32,10 @@ use codex_app_server_protocol::ExternalAgentConfigImportParams;
 use codex_app_server_protocol::ExternalAgentConfigImportResponse;
 use codex_app_server_protocol::ExternalAgentConfigMigrationItem;
 use codex_app_server_protocol::GetAccountParams;
+use codex_app_server_protocol::GetAccountRateLimitsParams;
 use codex_app_server_protocol::GetAccountRateLimitsResponse;
 use codex_app_server_protocol::GetAccountResponse;
 use codex_app_server_protocol::JSONRPCErrorError;
-use codex_app_server_protocol::LogoutAccountResponse;
 use codex_app_server_protocol::MemoryResetResponse;
 use codex_app_server_protocol::Model as ApiModel;
 use codex_app_server_protocol::ModelListParams;
@@ -162,11 +162,11 @@ fn is_thread_settings_update_unsupported(source: &JSONRPCErrorError) -> bool {
 }
 
 /// Data collected during the TUI bootstrap phase that the main event loop
-/// needs to configure the UI, telemetry, and initial rate-limit prefetch.
+/// needs to configure the UI, telemetry, and initial rate-limit refresh.
 ///
-/// Rate-limit snapshots are intentionally **not** included here; they are
-/// fetched asynchronously after bootstrap returns so that the TUI can render
-/// its first frame without waiting for the rate-limit round-trip.
+/// For an embedded app-server, locally cached account-pool rate-limit snapshots
+/// are included so the first frame can show usage. Reset-credit details still
+/// refresh asynchronously because they require a network request.
 pub(crate) struct AppServerBootstrap {
     pub(crate) duration: Duration,
     pub(crate) account_email: Option<String>,
@@ -181,6 +181,7 @@ pub(crate) struct AppServerBootstrap {
     pub(crate) feedback_audience: FeedbackAudience,
     pub(crate) has_chatgpt_account: bool,
     pub(crate) available_models: Vec<ModelPreset>,
+    pub(crate) initial_rate_limit_snapshots: Vec<RateLimitSnapshot>,
 }
 
 pub(crate) struct AppServerSession {
@@ -302,36 +303,47 @@ impl AppServerSession {
     pub(crate) async fn bootstrap(&mut self, config: &Config) -> Result<AppServerBootstrap> {
         let started_at = Instant::now();
         let account = self.read_account().await?;
+        // `hooks/list` holds the global config queue during startup. Submit models and config
+        // requirements together so an uncached model fetch can overlap both config requests.
+        let model_request_id = self.next_request_id();
         let requirements_request_id = self.next_request_id();
-        let requirements: ConfigRequirementsReadResponse = self
-            .client
-            .request_typed(ClientRequest::ConfigRequirementsRead {
-                request_id: requirements_request_id,
-                params: None,
-            })
-            .await
-            .map_err(|err| {
-                bootstrap_request_error("configRequirements/read failed during TUI bootstrap", err)
-            })?;
+        let (models, requirements) = tokio::try_join!(
+            async {
+                self.client
+                    .request_typed::<ModelListResponse>(ClientRequest::ModelList {
+                        request_id: model_request_id,
+                        params: ModelListParams {
+                            cursor: None,
+                            limit: None,
+                            include_hidden: Some(true),
+                        },
+                    })
+                    .await
+                    .map_err(|err| {
+                        bootstrap_request_error("model/list failed during TUI bootstrap", err)
+                    })
+            },
+            async {
+                self.client
+                    .request_typed::<ConfigRequirementsReadResponse>(
+                        ClientRequest::ConfigRequirementsRead {
+                            request_id: requirements_request_id,
+                            params: None,
+                        },
+                    )
+                    .await
+                    .map_err(|err| {
+                        bootstrap_request_error(
+                            "configRequirements/read failed during TUI bootstrap",
+                            err,
+                        )
+                    })
+            },
+        )?;
         self.managed_new_thread_defaults = requirements
             .requirements
             .and_then(|requirements| requirements.models)
             .and_then(|models| models.new_thread);
-        let model_request_id = self.next_request_id();
-        let models: ModelListResponse = self
-            .client
-            .request_typed(ClientRequest::ModelList {
-                request_id: model_request_id,
-                params: ModelListParams {
-                    cursor: None,
-                    limit: None,
-                    include_hidden: Some(true),
-                },
-            })
-            .await
-            .map_err(|err| {
-                bootstrap_request_error("model/list failed during TUI bootstrap", err)
-            })?;
         let available_models = models
             .data
             .into_iter()
@@ -350,6 +362,23 @@ impl AppServerSession {
             .wrap_err("model/list returned no models for TUI bootstrap")?;
         self.default_model = Some(default_model.clone());
         self.available_models = available_models.clone();
+        let initial_rate_limit_snapshots = if self.uses_embedded_app_server()
+            && account.requires_openai_auth
+            && matches!(account.account.as_ref(), Some(Account::Chatgpt { .. }))
+        {
+            match self.read_cached_account_rate_limits().await {
+                Ok(response) => app_server_rate_limit_snapshots(response),
+                Err(err) => {
+                    // A newly added account can legitimately have no cached sample yet.
+                    tracing::debug!(
+                        "cached account rate limits unavailable during TUI bootstrap: {err}"
+                    );
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
 
         let (
             account_email,
@@ -359,14 +388,6 @@ impl AppServerSession {
             feedback_audience,
             has_chatgpt_account,
         ) = match account.account {
-            Some(Account::ApiKey {}) => (
-                None,
-                Some(TelemetryAuthMode::ApiKey),
-                Some(StatusAccountDisplay::ApiKey),
-                None,
-                FeedbackAudience::External,
-                false,
-            ),
             Some(Account::Chatgpt { email, plan_type }) => {
                 let feedback_audience = if email
                     .as_deref()
@@ -388,9 +409,6 @@ impl AppServerSession {
                     true,
                 )
             }
-            Some(Account::AmazonBedrock { .. }) => {
-                (None, None, None, None, FeedbackAudience::External, false)
-            }
             None => (None, None, None, None, FeedbackAudience::External, false),
         };
         Ok(AppServerBootstrap {
@@ -404,6 +422,7 @@ impl AppServerSession {
             feedback_audience,
             has_chatgpt_account,
             available_models,
+            initial_rate_limit_snapshots,
         })
     }
 
@@ -426,6 +445,24 @@ impl AppServerSession {
             })
             .await
             .map_err(|err| bootstrap_request_error("account/read failed during TUI bootstrap", err))
+    }
+
+    async fn read_cached_account_rate_limits(&mut self) -> Result<GetAccountRateLimitsResponse> {
+        let request_id = self.next_request_id();
+        self.client
+            .request_typed(ClientRequest::GetAccountRateLimits {
+                request_id,
+                params: Some(GetAccountRateLimitsParams {
+                    include_reset_credits: Some(false),
+                }),
+            })
+            .await
+            .map_err(|err| {
+                bootstrap_request_error(
+                    "account/rateLimits/read cached hydration failed during TUI bootstrap",
+                    err,
+                )
+            })
     }
 
     pub(crate) async fn external_agent_config_detect(
@@ -460,6 +497,7 @@ impl AppServerSession {
                 params: ExternalAgentConfigImportParams {
                     migration_items,
                     source: Some("cli".to_string()),
+                    provider_id: Some(migration_source.clone()),
                     migration_source: Some(migration_source),
                 },
             })
@@ -1084,19 +1122,6 @@ impl AppServerSession {
             .wrap_err("thread/goal/clear failed in TUI")
     }
 
-    pub(crate) async fn logout_account(&mut self) -> Result<()> {
-        let request_id = self.next_request_id();
-        let _: LogoutAccountResponse = self
-            .client
-            .request_typed(ClientRequest::LogoutAccount {
-                request_id,
-                params: None,
-            })
-            .await
-            .wrap_err("account/logout failed in TUI")?;
-        Ok(())
-    }
-
     pub(crate) async fn thread_unsubscribe(&mut self, thread_id: ThreadId) -> Result<()> {
         let request_id = self.next_request_id();
         let _: ThreadUnsubscribeResponse = self
@@ -1258,7 +1283,7 @@ impl AppServerSession {
         self.client.request_handle()
     }
 
-    fn next_request_id(&mut self) -> RequestId {
+    pub(crate) fn next_request_id(&mut self) -> RequestId {
         let request_id = self.next_request_id;
         self.next_request_id += 1;
         RequestId::Integer(request_id)
@@ -1289,18 +1314,16 @@ pub(crate) async fn start_thread_with_request_handle(
 pub(crate) fn status_account_display_from_auth_mode(
     auth_mode: Option<AuthMode>,
     plan_type: Option<codex_protocol::account::PlanType>,
+    account_email: Option<String>,
 ) -> Option<StatusAccountDisplay> {
     match auth_mode {
-        Some(AuthMode::ApiKey) => Some(StatusAccountDisplay::ApiKey),
-        Some(AuthMode::Chatgpt)
-        | Some(AuthMode::ChatgptAuthTokens)
-        | Some(AuthMode::AgentIdentity)
-        | Some(AuthMode::PersonalAccessToken) => Some(StatusAccountDisplay::ChatGpt {
-            email: None,
-            plan: plan_type.map(plan_type_display_name),
-        }),
-        Some(AuthMode::Headers) | Some(AuthMode::BedrockApiKey) => None,
-        None => None,
+        Some(AuthMode::Chatgpt) | Some(AuthMode::AgentIdentity) => {
+            Some(StatusAccountDisplay::ChatGpt {
+                email: account_email,
+                plan: plan_type.map(plan_type_display_name),
+            })
+        }
+        Some(AuthMode::Headers) | None => None,
     }
 }
 
@@ -1921,6 +1944,7 @@ mod tests {
         RateLimitSnapshot {
             limit_id: Some(limit_id.to_string()),
             limit_name: None,
+            fetched_at: None,
             primary: Some(codex_app_server_protocol::RateLimitWindow {
                 used_percent: 0,
                 window_duration_mins: Some(10_080),
@@ -2218,10 +2242,12 @@ mod tests {
                             value: FileSystemSpecialPath::Root,
                         },
                         access: FileSystemAccessMode::Read,
+                        missing_path_behavior: None,
                     },
                     FileSystemSandboxEntry {
                         path: FileSystemPath::Path { path: extra_root },
                         access: FileSystemAccessMode::Write,
+                        missing_path_behavior: None,
                     },
                 ],
                 glob_scan_max_depth: None,
@@ -2246,12 +2272,14 @@ mod tests {
                             value: FileSystemSpecialPath::Root,
                         },
                         access: FileSystemAccessMode::Read,
+                        missing_path_behavior: None,
                     },
                     FileSystemSandboxEntry {
                         path: FileSystemPath::Special {
                             value: FileSystemSpecialPath::ProjectRoots { subpath: None },
                         },
                         access: FileSystemAccessMode::Write,
+                        missing_path_behavior: None,
                     },
                 ],
                 glob_scan_max_depth: None,
@@ -2662,6 +2690,8 @@ mod tests {
                 parent_thread_id: None,
                 preview: "hello".to_string(),
                 ephemeral: false,
+                section: None,
+                section_entered_at: None,
                 history_mode: Default::default(),
                 model_provider: "openai".to_string(),
                 created_at: 1,
@@ -2906,6 +2936,7 @@ mod tests {
         let business = status_account_display_from_auth_mode(
             Some(AuthMode::Chatgpt),
             Some(codex_protocol::account::PlanType::EnterpriseCbpUsageBased),
+            /*account_email*/ None,
         );
         assert!(matches!(
             business,
@@ -2918,9 +2949,23 @@ mod tests {
         let team = status_account_display_from_auth_mode(
             Some(AuthMode::Chatgpt),
             Some(codex_protocol::account::PlanType::SelfServeBusinessUsageBased),
+            /*account_email*/ None,
         );
         assert!(matches!(
             team,
+            Some(StatusAccountDisplay::ChatGpt {
+                email: None,
+                plan: Some(ref plan),
+            }) if plan == "Business"
+        ));
+
+        let business_prolite = status_account_display_from_auth_mode(
+            Some(AuthMode::Chatgpt),
+            Some(codex_protocol::account::PlanType::SelfServeBusinessProLite),
+            /*account_email*/ None,
+        );
+        assert!(matches!(
+            business_prolite,
             Some(StatusAccountDisplay::ChatGpt {
                 email: None,
                 plan: Some(ref plan),

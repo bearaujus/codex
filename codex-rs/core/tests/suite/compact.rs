@@ -34,6 +34,7 @@ use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::responses;
 use core_test_support::responses::ev_reasoning_item;
 use core_test_support::responses::mount_models_once;
+use core_test_support::responses::strip_response_item_ids_from_json;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
@@ -178,7 +179,8 @@ fn read_hook_inputs(path: &Path) -> Vec<Value> {
 }
 
 fn python_hook_command(script_path: &Path) -> String {
-    format!("python3 \"{}\"", script_path.display())
+    let interpreter = if cfg!(windows) { "python" } else { "python3" };
+    format!("{interpreter} \"{}\"", script_path.display())
 }
 
 fn write_unsupported_blocking_pre_compact_hook(home: &Path) {
@@ -1225,6 +1227,7 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
         values
             .iter()
             .filter_map(|value| {
+                let value = strip_response_item_ids_from_json(value.clone());
                 if value
                     .get("type")
                     .and_then(|ty| ty.as_str())
@@ -1251,9 +1254,9 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
                     return None;
                 }
                 if role == Some("user") {
-                    return strip_agents_parts_from_user_message(value);
+                    return strip_agents_parts_from_user_message(&value);
                 }
-                Some(value.clone())
+                Some(value)
             })
             .collect()
     }
@@ -2039,12 +2042,6 @@ async fn auto_compact_runs_after_resume_when_token_usage_is_over_limit() {
         let _ = config.features.disable(Feature::RemoteCompactionV2);
     });
     let initial = builder.build(&server).await.unwrap();
-    let home = initial.home.clone();
-    let rollout_path = initial
-        .session_configured
-        .rollout_path
-        .clone()
-        .expect("rollout path");
 
     // A single over-limit completion should not auto-compact until the next user message.
     mount_sse_once(
@@ -2067,10 +2064,7 @@ async fn auto_compact_runs_after_resume_when_token_usage_is_over_limit() {
         config.model_auto_compact_token_limit = Some(limit);
         let _ = config.features.disable(Feature::RemoteCompactionV2);
     });
-    let resumed = resume_builder
-        .resume(&server, home, rollout_path)
-        .await
-        .unwrap();
+    let resumed = resume_builder.restart(&server, &initial).await.unwrap();
 
     let follow_up_user = "AFTER_RESUME_USER";
     let sse_follow_up = sse(vec![
@@ -2795,7 +2789,7 @@ async fn pre_sampling_legacy_remote_compact_falls_back_after_previous_model_inva
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pre_sampling_compact_keeps_unknown_previous_model_for_api_key_auth_and_custom_provider() {
+async fn pre_sampling_compact_keeps_unknown_previous_model_for_custom_provider() {
     skip_if_no_network!();
 
     let server = MockServer::start().await;
@@ -2832,7 +2826,7 @@ async fn pre_sampling_compact_keeps_unknown_previous_model_for_api_key_auth_and_
 
     let model_provider = non_openai_model_provider(&server);
     let mut builder = test_codex()
-        .with_auth(CodexAuth::from_api_key("Test API Key"))
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_model(previous_model)
         .with_config(move |config| {
             config.model_provider = model_provider;
@@ -3707,9 +3701,6 @@ async fn manual_compact_retries_after_context_window_error() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-// TODO(ccunningham): Re-enable after the follow-up compaction behavior PR lands.
-// Current main behavior around non-context manual /compact failures is known-incorrect.
-#[ignore = "behavior change covered in follow-up compaction PR"]
 async fn manual_compact_non_context_failure_retries_then_emits_task_error() {
     skip_if_no_network!();
 
@@ -3783,6 +3774,147 @@ async fn manual_compact_non_context_failure_retries_then_emits_task_error() {
         "expected local compact task error prefix, got {task_error_message}"
     );
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_manual_compact_does_not_commit_partial_summary_output() {
+    skip_if_no_network!();
+
+    const PARTIAL_SUMMARY: &str = "PARTIAL_SUMMARY_MUST_NOT_ENTER_HISTORY";
+    let server = start_mock_server().await;
+    let user_turn = sse(vec![
+        ev_assistant_message("m1", FIRST_REPLY),
+        ev_completed("r1"),
+    ]);
+    let compact_failure = sse(vec![
+        ev_assistant_message("m-partial", PARTIAL_SUMMARY),
+        json!({
+            "type": "response.failed",
+            "response": {
+                "id": "resp-partial-compact",
+                "error": {
+                    "code": "server_error",
+                    "message": "compact stream failed after partial output"
+                }
+            }
+        }),
+    ]);
+    let follow_up = sse(vec![
+        ev_assistant_message("m2", FINAL_REPLY),
+        ev_completed("r2"),
+    ]);
+    let request_log =
+        mount_sse_sequence(&server, vec![user_turn, compact_failure, follow_up]).await;
+
+    let mut model_provider = non_openai_model_provider(&server);
+    model_provider.stream_max_retries = Some(0);
+    let codex = test_codex()
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            set_test_compact_prompt(config);
+        })
+        .build(&server)
+        .await
+        .expect("build codex")
+        .codex;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "first turn".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await
+        .expect("submit first turn");
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    codex.submit(Op::Compact).await.expect("trigger compact");
+    wait_for_event(&codex, |event| matches!(event, EventMsg::Error(_))).await;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "follow up".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await
+        .expect("submit follow-up turn");
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    let requests = request_log.requests();
+    assert_eq!(requests.len(), 3);
+    let follow_up_body = requests[2].body_json().to_string();
+    assert!(
+        !body_contains_text(&follow_up_body, PARTIAL_SUMMARY),
+        "a failed compaction attempt must not leak its partial summary into later prompts"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_compact_does_not_retry_a_non_retryable_request_error() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let user_turn = sse(vec![
+        ev_assistant_message("m1", FIRST_REPLY),
+        ev_completed("r1"),
+    ]);
+    let request_log = mount_response_sequence(
+        &server,
+        vec![
+            sse_response(user_turn),
+            invalid_request_response("compact request is invalid"),
+        ],
+    )
+    .await;
+
+    let mut model_provider = non_openai_model_provider(&server);
+    model_provider.stream_max_retries = Some(3);
+    let codex = test_codex()
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            set_test_compact_prompt(config);
+        })
+        .build(&server)
+        .await
+        .expect("build codex")
+        .codex;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "first turn".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await
+        .expect("submit first turn");
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    codex.submit(Op::Compact).await.expect("trigger compact");
+    wait_for_event(&codex, |event| matches!(event, EventMsg::Error(_))).await;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    assert_eq!(
+        request_log.requests().len(),
+        2,
+        "a 400 invalid request must not consume the transient stream retry budget"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4078,7 +4210,8 @@ async fn auto_compact_allows_multiple_attempts_when_interleaved_with_other_turn_
     let mut builder = test_codex().with_config(move |config| {
         config.model_provider = model_provider;
         set_test_compact_prompt(config);
-        config.model_auto_compact_token_limit = Some(200);
+        // Leave enough headroom for per-item request metadata before the second compaction.
+        config.model_auto_compact_token_limit = Some(300);
     });
     let codex = builder.build(&server).await.unwrap().codex;
 

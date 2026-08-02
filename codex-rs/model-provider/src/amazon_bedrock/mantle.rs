@@ -1,5 +1,4 @@
 use codex_aws_auth::AwsAuthConfig;
-use codex_login::auth::BedrockApiKeyAuth;
 use codex_model_provider_info::ModelProviderAwsAuthInfo;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
@@ -55,20 +54,15 @@ pub(super) fn base_url(region: &str) -> Result<String> {
 }
 
 pub(super) async fn bedrock_mantle_runtime_base_url(
-    managed_auth: Option<&BedrockApiKeyAuth>,
     aws: &ModelProviderAwsAuthInfo,
 ) -> Result<String> {
-    let region = resolve_region(managed_auth, aws).await?;
+    let region = resolve_region(aws).await?;
     base_url(&region)
 }
 
-async fn resolve_region(
-    managed_auth: Option<&BedrockApiKeyAuth>,
-    aws: &ModelProviderAwsAuthInfo,
-) -> Result<String> {
-    match resolve_auth_method(managed_auth, aws).await? {
-        BedrockAuthMethod::ManagedBearerToken { region, .. }
-        | BedrockAuthMethod::EnvBearerToken { region, .. } => Ok(region),
+async fn resolve_region(aws: &ModelProviderAwsAuthInfo) -> Result<String> {
+    match resolve_auth_method(aws).await? {
+        BedrockAuthMethod::EnvBearerToken { region, .. } => Ok(region),
         BedrockAuthMethod::AwsSdkAuth { context } => Ok(context.region().to_string()),
     }
 }

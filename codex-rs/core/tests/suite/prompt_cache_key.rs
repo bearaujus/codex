@@ -37,7 +37,7 @@ fn request_has_input_type(request: &wiremock::Request, input_type: &str) -> bool
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn api_key_subagent_uses_session_id_as_prompt_cache_key() -> Result<()> {
+async fn chatgpt_subagent_uses_session_id_as_prompt_cache_key() -> Result<()> {
     let server = start_mock_server().await;
     let spawn_args = serde_json::to_string(&json!({
         "message": CHILD_TASK,
@@ -86,7 +86,7 @@ async fn api_key_subagent_uses_session_id_as_prompt_cache_key() -> Result<()> {
     .await;
 
     let mut builder = test_codex()
-        .with_auth(CodexAuth::from_api_key("dummy"))
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_config(|config| {
             config
                 .features

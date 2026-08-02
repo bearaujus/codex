@@ -1,5 +1,7 @@
 // Aggregates all former standalone integration tests as modules.
 use codex_apply_patch::CODEX_CORE_APPLY_PATCH_ARG1;
+#[cfg(unix)]
+use codex_exec_server::CODEX_ARG0_EXEC_HELPER_ARG1;
 use codex_exec_server::CODEX_FS_HELPER_ARG1;
 use codex_sandboxing::landlock::CODEX_LINUX_SANDBOX_ARG0;
 use codex_test_binary_support::TestBinaryDispatchGuard;
@@ -17,6 +19,10 @@ pub static CODEX_ALIASES_TEMP_DIR: Option<TestBinaryDispatchGuard> = {
         if argv1 == Some(CODEX_CORE_APPLY_PATCH_ARG1) {
             return TestBinaryDispatchMode::DispatchArg0Only;
         }
+        #[cfg(unix)]
+        if argv1 == Some(CODEX_ARG0_EXEC_HELPER_ARG1) {
+            return TestBinaryDispatchMode::DispatchArg0Only;
+        }
         if argv1 == Some(CODEX_FS_HELPER_ARG1) {
             return TestBinaryDispatchMode::DispatchArg0Only;
         }
@@ -29,14 +35,15 @@ pub static CODEX_ALIASES_TEMP_DIR: Option<TestBinaryDispatchGuard> = {
 
 #[cfg(not(target_os = "windows"))]
 mod abort_tasks;
+mod account_pool_failover;
 mod additional_context;
 mod agent_execution;
-mod agent_jobs;
 mod agent_websocket;
 mod agents_md;
 mod apply_patch_cli;
 #[cfg(not(target_os = "windows"))]
 mod approvals;
+mod audio_truncation;
 mod auto_review;
 mod catalog_permission_messages;
 mod cli_stream;
@@ -58,6 +65,7 @@ mod exec_policy;
 mod extension_sandbox;
 mod external_auth;
 mod fork_thread;
+mod git_enrichment;
 #[cfg(not(target_os = "windows"))]
 mod guardian_review;
 #[cfg(not(target_os = "windows"))]
@@ -69,9 +77,9 @@ mod items;
 mod json_result;
 mod live_cli;
 mod mcp_auth_elicitation;
-mod mcp_auth_refresh;
 #[cfg(unix)]
 mod mcp_refresh_cleanup;
+mod mcp_startup_refresh_http_proxy;
 mod mcp_tool_cache;
 mod mcp_tool_exposure;
 mod mcp_turn_metadata;
@@ -110,6 +118,8 @@ mod request_plugin_install;
 mod request_user_input;
 mod responses_api_proxy_headers;
 mod responses_lite;
+#[cfg(target_os = "linux")]
+mod responses_system_proxy;
 mod resume;
 mod resume_warning;
 mod review;
@@ -124,6 +134,7 @@ mod shell_serialization;
 mod shell_snapshot;
 mod skill_approval;
 mod skills;
+mod skills_extension;
 mod spawn_agent_description;
 mod sqlite_state;
 mod stream_error_allows_next_turn;
@@ -140,6 +151,7 @@ mod unified_exec_process_events;
 #[cfg(unix)]
 mod unified_exec_zsh_fork_approvals;
 mod unstable_features_warning;
+mod user_message_admission;
 mod user_notification;
 mod user_shell_cmd;
 mod view_image;

@@ -2047,3 +2047,47 @@ fn parse_tool_input_schema_drops_malformed_definition_tables() {
         }
     );
 }
+
+/// Build an object schema nested `depth` levels deep:
+/// `{ properties: { p: { properties: { p: ... } } } }`.
+fn deeply_nested_object_schema(depth: usize) -> serde_json::Value {
+    let mut schema = serde_json::json!({ "type": "string" });
+    for _ in 0..depth {
+        schema = serde_json::json!({
+            "type": "object",
+            "properties": { "p": schema },
+        });
+    }
+    schema
+}
+
+#[test]
+fn parse_tool_input_schema_rejects_pathologically_deep_schema() {
+    // A schema nested beyond the supported limit must be rejected with an error
+    // rather than recursing through the sanitize/prune/deserialize passes until
+    // the thread stack overflows and the process aborts with
+    // STATUS_STACK_OVERFLOW. Use a depth that clears the limit but is still safe
+    // to construct and drop here; the guard short-circuits well before any of the
+    // recursive passes run.
+    let schema = deeply_nested_object_schema(super::MAX_TOOL_SCHEMA_NESTING_DEPTH * 2);
+
+    let err = parse_tool_input_schema(&schema)
+        .expect_err("deeply nested schema should be rejected, not overflow the stack");
+    assert!(
+        err.to_string()
+            .contains("nests deeper than the supported limit"),
+        "unexpected error: {err}"
+    );
+
+    parse_tool_input_schema_without_compaction(&schema)
+        .expect_err("deeply nested schema should be rejected on the no-compaction path too");
+}
+
+#[test]
+fn parse_tool_input_schema_accepts_schema_within_depth_limit() {
+    // Realistically-nested schemas (each wrapper adds two JSON levels) keep
+    // parsing successfully; the depth guard only rejects pathological input.
+    let schema = deeply_nested_object_schema(16);
+    assert!(parse_tool_input_schema(&schema).is_ok());
+    assert!(parse_tool_input_schema_without_compaction(&schema).is_ok());
+}

@@ -5,6 +5,8 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use codex_apply_patch::CODEX_CORE_APPLY_PATCH_ARG1;
+#[cfg(unix)]
+use codex_exec_server::CODEX_ARG0_EXEC_HELPER_ARG1;
 use codex_exec_server::CODEX_FS_HELPER_ARG1;
 use codex_install_context::InstallContext;
 use codex_sandboxing::landlock::CODEX_LINUX_SANDBOX_ARG0;
@@ -98,6 +100,10 @@ pub fn arg0_dispatch() -> Option<Arg0PathEntryGuard> {
     }
 
     let argv1 = args.next().unwrap_or_default();
+    #[cfg(unix)]
+    if argv1 == CODEX_ARG0_EXEC_HELPER_ARG1 {
+        codex_exec_server::run_arg0_exec_helper_main();
+    }
     if argv1 == CODEX_FS_HELPER_ARG1 {
         codex_exec_server::run_fs_helper_main();
     }
@@ -213,16 +219,26 @@ where
     // Retain the TempDir so it exists for the lifetime of the invocation of
     // this executable. Admittedly, we could invoke `keep()` on it, but it
     // would be nice to avoid leaving temporary directories behind, if possible.
+    //
+    // arg0 dispatch mutates the `PATH` environment variable, so it must run on
+    // the initial thread before we spawn any additional threads.
     let path_entry_guard = arg0_dispatch();
     let current_exe = std::env::current_exe().ok();
 
-    // Regular invocation. Run the async entry point on a thread with the same
-    // stack budget as Tokio workers; `Runtime::block_on` otherwise runs the
-    // top-level future on the caller's OS stack.
-    let handle = std::thread::Builder::new()
+    // `runtime.block_on` drives the root future on the thread that calls it. On
+    // Windows the process main thread is created with the default (~1 MiB)
+    // stack, which the deeply nested async state machines in the TUI can
+    // overflow (e.g. the `/new` flow), crashing with "thread 'main' has
+    // overflowed its stack". Tokio worker threads already get
+    // `TOKIO_WORKER_STACK_SIZE_BYTES`; run the runtime and the root future on a
+    // dedicated thread with the same large stack so every async task has
+    // consistent headroom regardless of platform.
+    let worker = std::thread::Builder::new()
         .name("codex-main".to_string())
         .stack_size(TOKIO_WORKER_STACK_SIZE_BYTES)
-        .spawn(move || {
+        .spawn(move || -> anyhow::Result<()> {
+            // Regular invocation – create a Tokio runtime and execute the
+            // provided async entry-point.
             let runtime = build_runtime()?;
             runtime.block_on(run_main_with_arg0_guard(
                 path_entry_guard,
@@ -230,9 +246,12 @@ where
                 main_fn,
             ))
         })?;
-    match handle.join() {
+
+    match worker.join() {
         Ok(result) => result,
-        Err(payload) => std::panic::resume_unwind(payload),
+        // Preserve the original panic so the standard panic hook output and exit
+        // behavior are unchanged.
+        Err(panic) => std::panic::resume_unwind(panic),
     }
 }
 

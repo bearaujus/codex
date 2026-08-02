@@ -33,8 +33,8 @@ async fn contributes_hosted_plugin_runtime_without_an_executor() -> TestResult {
     let servers = manager.effective_servers(&config, Some(&auth)).await;
     let server = servers
         .get(CODEX_APPS_MCP_SERVER_NAME)
-        .and_then(|server| server.configured_config())
-        .ok_or("hosted plugin runtime should be contributed as a configured server")?;
+        .ok_or("hosted plugin runtime should be contributed as a configured server")?
+        .config();
     let McpServerTransportConfig::StreamableHttp { url, .. } = &server.transport else {
         panic!("hosted plugin runtime should use streamable HTTP");
     };
@@ -72,7 +72,7 @@ async fn runtime_overlay_preserves_disabled_server() -> TestResult {
 }
 
 #[tokio::test]
-async fn legacy_fallback_overwrites_reserved_config_without_an_extension() -> TestResult {
+async fn default_fallback_overwrites_reserved_config_without_an_extension() -> TestResult {
     let codex_home = tempfile::tempdir()?;
     let config = ConfigBuilder::default()
         .codex_home(codex_home.path().to_path_buf())
@@ -94,12 +94,12 @@ async fn legacy_fallback_overwrites_reserved_config_without_an_extension() -> Te
     let servers = manager.effective_servers(&config, Some(&auth)).await;
     let server = servers
         .get(CODEX_APPS_MCP_SERVER_NAME)
-        .and_then(|server| server.configured_config())
-        .ok_or("legacy Apps MCP should be present")?;
+        .ok_or("default Apps MCP should be present")?
+        .config();
     let McpServerTransportConfig::StreamableHttp { url, .. } = &server.transport else {
-        panic!("legacy Apps MCP should use streamable HTTP");
+        panic!("default Apps MCP should use streamable HTTP");
     };
-    assert_eq!(url, "https://chatgpt.com/backend-api/wham/apps");
+    assert_eq!(url, "https://chatgpt.com/backend-api/ps/mcp");
 
     Ok(())
 }
@@ -126,24 +126,6 @@ async fn later_extension_can_remove_same_name_registration() -> TestResult {
     let servers = manager.effective_servers(&config, Some(&auth)).await;
 
     assert!(!servers.contains_key(CODEX_APPS_MCP_SERVER_NAME));
-    Ok(())
-}
-
-#[tokio::test]
-async fn hosted_apps_mcp_requires_chatgpt_auth() -> TestResult {
-    let codex_home = tempfile::tempdir()?;
-    let config = ConfigBuilder::default()
-        .codex_home(codex_home.path().to_path_buf())
-        .fallback_cwd(Some(codex_home.path().to_path_buf()))
-        .cli_overrides(vec![("features.apps".to_string(), true.into())])
-        .build()
-        .await?;
-    let auth = CodexAuth::from_api_key("test");
-    let manager = installed_manager(&config);
-
-    let servers = manager.effective_servers(&config, Some(&auth)).await;
-    assert!(!servers.contains_key(CODEX_APPS_MCP_SERVER_NAME));
-
     Ok(())
 }
 

@@ -44,12 +44,11 @@ async fn auth_manager_with_replacement(
     .expect("stale auth should save");
     let auth_manager = AuthManager::shared(
         codex_home.path().to_path_buf(),
-        /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
         /*forced_chatgpt_workspace_id*/ None,
         /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::default(),
-        /*auth_route_config*/ None,
+        codex_login::test_support::transport_default_auth_route_config(),
     )
     .await;
     let mut replacement_auth = remote_control_auth_dot_json(Some(replacement_account_id));
@@ -1082,12 +1081,11 @@ async fn remote_control_handle_discards_pairing_response_after_auth_change() {
     .expect("initial auth should save");
     let auth_manager = AuthManager::shared(
         codex_home.path().to_path_buf(),
-        /*enable_codex_api_key_env*/ false,
         AuthCredentialsStoreMode::File,
         /*forced_chatgpt_workspace_id*/ None,
         /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::default(),
-        /*auth_route_config*/ None,
+        codex_login::test_support::transport_default_auth_route_config(),
     )
     .await;
     let remote_handle =

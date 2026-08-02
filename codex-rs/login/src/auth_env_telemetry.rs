@@ -1,9 +1,10 @@
 use codex_model_provider_info::ModelProviderInfo;
 use codex_otel::AuthEnvTelemetryMetadata;
 
-use crate::CODEX_API_KEY_ENV_VAR;
-use crate::OPENAI_API_KEY_ENV_VAR;
 use crate::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
+
+const OPENAI_API_KEY_ENV_VAR: &str = "OPENAI_API_KEY";
+const CODEX_API_KEY_ENV_VAR: &str = "CODEX_API_KEY";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AuthEnvTelemetry {
@@ -76,6 +77,7 @@ mod tests {
             websocket_connect_timeout_ms: None,
             requires_openai_auth: false,
             supports_websockets: false,
+            supports_standalone_web_search: false,
         };
 
         let telemetry =

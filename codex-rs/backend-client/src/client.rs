@@ -1,5 +1,6 @@
 use crate::types::AccountsCheckResponse;
 use crate::types::CodeTaskDetailsResponse;
+use crate::types::CodexUserSettingsResponse;
 use crate::types::CodexWorkspaceMessagesResponse;
 use crate::types::ConfigBundleResponse;
 use crate::types::PaginatedListTaskListItem;
@@ -9,8 +10,10 @@ use crate::types::TokenUsageProfile;
 use crate::types::TurnAttemptsSiblingTurnsResponse;
 use anyhow::Result;
 use codex_api::SharedAuthProvider;
-use codex_http_client::build_reqwest_client_with_custom_ca;
-use codex_http_client::with_chatgpt_cloudflare_cookie_store;
+use codex_http_client::ClientRouteClass;
+use codex_http_client::HttpClientFactory;
+use codex_http_client::RouteAwareClientPool;
+use codex_http_client::RouteAwareRequestBuilder;
 use codex_login::CodexAuth;
 use codex_login::default_client::get_codex_user_agent;
 use codex_protocol::account::PlanType as AccountPlanType;
@@ -19,18 +22,26 @@ use codex_protocol::protocol::RateLimitReachedType;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::RateLimitWindow;
 use codex_protocol::protocol::SpendControlLimitSnapshot;
-use reqwest::StatusCode;
-use reqwest::header::CACHE_CONTROL;
-use reqwest::header::CONTENT_TYPE;
-use reqwest::header::HeaderMap;
-use reqwest::header::HeaderName;
-use reqwest::header::HeaderValue;
-use reqwest::header::USER_AGENT;
+use http::Method;
+use http::StatusCode;
+use http::header::CACHE_CONTROL;
+use http::header::CONTENT_TYPE;
+use http::header::HeaderMap;
+use http::header::HeaderName;
+use http::header::HeaderValue;
+use http::header::USER_AGENT;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::fmt;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 mod rate_limit_resets;
+
+struct RateLimitIdentity {
+    id: Option<String>,
+    name: Option<String>,
+}
 
 #[derive(Debug)]
 pub enum RequestError {
@@ -123,7 +134,7 @@ impl PathStyle {
 #[derive(Clone)]
 pub struct Client {
     base_url: String,
-    http: reqwest::Client,
+    http: RouteAwareClientPool,
     auth_provider: SharedAuthProvider,
     user_agent: Option<HeaderValue>,
     chatgpt_account_id: Option<String>,
@@ -148,7 +159,7 @@ impl fmt::Debug for Client {
 }
 
 impl Client {
-    pub fn new(base_url: impl Into<String>) -> Result<Self> {
+    pub fn new(base_url: impl Into<String>, http_client_factory: HttpClientFactory) -> Self {
         let mut base_url = base_url.into();
         // Normalize common ChatGPT hostnames to include /backend-api so we hit the WHAM paths.
         // Also trim trailing slashes for consistent URL building.
@@ -161,11 +172,12 @@ impl Client {
         {
             base_url = format!("{base_url}/backend-api");
         }
-        let http = build_reqwest_client_with_custom_ca(with_chatgpt_cloudflare_cookie_store(
-            reqwest::Client::builder(),
-        ))?;
+        let http = RouteAwareClientPool::with_chatgpt_cloudflare_cookies_without_request_logging(
+            http_client_factory,
+            ClientRouteClass::Api,
+        );
         let path_style = PathStyle::from_base_url(&base_url);
-        Ok(Self {
+        Self {
             base_url,
             http,
             auth_provider: codex_model_provider::unauthenticated_auth_provider(),
@@ -173,13 +185,17 @@ impl Client {
             chatgpt_account_id: None,
             chatgpt_account_is_fedramp: false,
             path_style,
-        })
+        }
     }
 
-    pub fn from_auth(base_url: impl Into<String>, auth: &CodexAuth) -> Result<Self> {
-        Ok(Self::new(base_url)?
+    pub fn from_auth(
+        base_url: impl Into<String>,
+        auth: &CodexAuth,
+        http_client_factory: HttpClientFactory,
+    ) -> Self {
+        Self::new(base_url, http_client_factory)
             .with_user_agent(get_codex_user_agent())
-            .with_auth_provider(codex_model_provider::auth_provider_from_auth(auth)))
+            .with_auth_provider(codex_model_provider::auth_provider_from_auth(auth))
     }
 
     pub fn with_auth_provider(mut self, auth: SharedAuthProvider) -> Self {
@@ -231,9 +247,13 @@ impl Client {
         h
     }
 
+    fn request(&self, method: Method, url: &str) -> RouteAwareRequestBuilder {
+        self.http.request(method, url)
+    }
+
     async fn exec_request(
         &self,
-        req: reqwest::RequestBuilder,
+        req: RouteAwareRequestBuilder,
         method: &str,
         url: &str,
     ) -> Result<(String, String)> {
@@ -254,7 +274,7 @@ impl Client {
 
     async fn exec_request_detailed(
         &self,
-        req: reqwest::RequestBuilder,
+        req: RouteAwareRequestBuilder,
         method: &str,
         url: &str,
     ) -> std::result::Result<(String, String), RequestError> {
@@ -306,14 +326,14 @@ impl Client {
             PathStyle::CodexApi => format!("{}/api/codex/accounts/check", self.base_url),
             PathStyle::ChatGptApi => format!("{}/wham/accounts/check", self.base_url),
         };
-        let req = self.http.get(&url).headers(self.headers());
+        let req = self.request(Method::GET, &url).headers(self.headers());
         let (body, ct) = self.exec_request(req, "GET", &url).await?;
         self.decode_json(&url, &ct, &body)
     }
 
     pub async fn get_token_usage_profile(&self) -> Result<TokenUsageProfile> {
         let url = self.token_usage_profile_url();
-        let req = self.http.get(&url).headers(self.headers());
+        let req = self.request(Method::GET, &url).headers(self.headers());
         let (body, ct) = self.exec_request(req, "GET", &url).await?;
         self.decode_json(&url, &ct, &body)
     }
@@ -331,8 +351,7 @@ impl Client {
     ) -> std::result::Result<(), RequestError> {
         let url = self.send_add_credits_nudge_email_url();
         let req = self
-            .http
-            .post(&url)
+            .request(Method::POST, &url)
             .headers(self.headers())
             .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
             .json(&SendAddCreditsNudgeEmailRequest { credit_type });
@@ -347,33 +366,44 @@ impl Client {
         environment_id: Option<&str>,
         cursor: Option<&str>,
     ) -> Result<PaginatedListTaskListItem> {
+        let url = self.list_tasks_url(limit, task_filter, environment_id, cursor)?;
+        let req = self.request(Method::GET, &url).headers(self.headers());
+        let (body, ct) = self.exec_request(req, "GET", &url).await?;
+        self.decode_json::<PaginatedListTaskListItem>(&url, &ct, &body)
+    }
+
+    fn list_tasks_url(
+        &self,
+        limit: Option<i32>,
+        task_filter: Option<&str>,
+        environment_id: Option<&str>,
+        cursor: Option<&str>,
+    ) -> Result<String> {
         let url = match self.path_style {
             PathStyle::CodexApi => format!("{}/api/codex/tasks/list", self.base_url),
             PathStyle::ChatGptApi => format!("{}/wham/tasks/list", self.base_url),
         };
-        let req = self.http.get(&url).headers(self.headers());
-        let req = if let Some(lim) = limit {
-            req.query(&[("limit", lim)])
-        } else {
-            req
-        };
-        let req = if let Some(tf) = task_filter {
-            req.query(&[("task_filter", tf)])
-        } else {
-            req
-        };
-        let req = if let Some(c) = cursor {
-            req.query(&[("cursor", c)])
-        } else {
-            req
-        };
-        let req = if let Some(id) = environment_id {
-            req.query(&[("environment_id", id)])
-        } else {
-            req
-        };
-        let (body, ct) = self.exec_request(req, "GET", &url).await?;
-        self.decode_json::<PaginatedListTaskListItem>(&url, &ct, &body)
+        if limit.is_none() && task_filter.is_none() && environment_id.is_none() && cursor.is_none()
+        {
+            return Ok(url);
+        }
+        let mut url = url::Url::parse(&url)?;
+        {
+            let mut query = url.query_pairs_mut();
+            if let Some(limit) = limit {
+                query.append_pair("limit", &limit.to_string());
+            }
+            if let Some(task_filter) = task_filter {
+                query.append_pair("task_filter", task_filter);
+            }
+            if let Some(cursor) = cursor {
+                query.append_pair("cursor", cursor);
+            }
+            if let Some(environment_id) = environment_id {
+                query.append_pair("environment_id", environment_id);
+            }
+        }
+        Ok(url.to_string())
     }
 
     pub async fn get_task_details(&self, task_id: &str) -> Result<CodeTaskDetailsResponse> {
@@ -389,7 +419,7 @@ impl Client {
             PathStyle::CodexApi => format!("{}/api/codex/tasks/{}", self.base_url, task_id),
             PathStyle::ChatGptApi => format!("{}/wham/tasks/{}", self.base_url, task_id),
         };
-        let req = self.http.get(&url).headers(self.headers());
+        let req = self.request(Method::GET, &url).headers(self.headers());
         let (body, ct) = self.exec_request(req, "GET", &url).await?;
         let parsed: CodeTaskDetailsResponse = self.decode_json(&url, &ct, &body)?;
         Ok((parsed, body, ct))
@@ -410,7 +440,7 @@ impl Client {
                 self.base_url, task_id, turn_id
             ),
         };
-        let req = self.http.get(&url).headers(self.headers());
+        let req = self.request(Method::GET, &url).headers(self.headers());
         let (body, ct) = self.exec_request(req, "GET", &url).await?;
         self.decode_json::<TurnAttemptsSiblingTurnsResponse>(&url, &ct, &body)
     }
@@ -426,9 +456,29 @@ impl Client {
             PathStyle::CodexApi => format!("{}/api/codex/config/bundle", self.base_url),
             PathStyle::ChatGptApi => format!("{}/wham/config/bundle", self.base_url),
         };
-        let req = self.http.get(&url).headers(self.headers());
+        let req = self.request(Method::GET, &url).headers(self.headers());
         let (body, ct) = self.exec_request_detailed(req, "GET", &url).await?;
         self.decode_json::<ConfigBundleResponse>(&url, &ct, &body)
+            .map_err(RequestError::from)
+    }
+
+    /// Fetch authenticated Codex user settings from the active backend route.
+    ///
+    /// Uses `GET /api/codex/settings/user` for Codex API hosts and
+    /// `GET /wham/settings/user` for ChatGPT `backend-api` hosts.
+    pub async fn get_user_settings(
+        &self,
+    ) -> std::result::Result<CodexUserSettingsResponse, RequestError> {
+        let url = self.user_settings_url();
+        let req = self
+            .request(Method::GET, &url)
+            .headers(self.headers())
+            .header(
+                CACHE_CONTROL,
+                HeaderValue::from_static("no-cache, no-store"),
+            );
+        let (body, ct) = self.exec_request_detailed(req, "GET", &url).await?;
+        self.decode_json::<CodexUserSettingsResponse>(&url, &ct, &body)
             .map_err(RequestError::from)
     }
 
@@ -437,8 +487,7 @@ impl Client {
     ) -> std::result::Result<CodexWorkspaceMessagesResponse, RequestError> {
         let url = self.workspace_messages_url();
         let req = self
-            .http
-            .get(&url)
+            .request(Method::GET, &url)
             .headers(self.headers())
             .header(CACHE_CONTROL, HeaderValue::from_static("no-store"));
         let (body, ct) = self.exec_request_detailed(req, "GET", &url).await?;
@@ -454,8 +503,7 @@ impl Client {
             PathStyle::ChatGptApi => format!("{}/wham/tasks", self.base_url),
         };
         let req = self
-            .http
-            .post(&url)
+            .request(Method::POST, &url)
             .headers(self.headers())
             .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
             .json(&request_body);
@@ -485,30 +533,43 @@ impl Client {
     fn rate_limit_snapshots_from_payload(
         payload: RateLimitStatusPayload,
     ) -> Vec<RateLimitSnapshot> {
+        Self::rate_limit_snapshots_from_payload_at(payload, unix_timestamp_now())
+    }
+
+    fn rate_limit_snapshots_from_payload_at(
+        payload: RateLimitStatusPayload,
+        captured_at: i64,
+    ) -> Vec<RateLimitSnapshot> {
         let plan_type = Some(Self::map_plan_type(payload.plan_type));
         let rate_limit_reached_type = payload
             .rate_limit_reached_type
             .flatten()
             .and_then(|details| Self::map_rate_limit_reached_type(details.kind));
         let mut snapshots = vec![Self::make_rate_limit_snapshot(
-            Some("codex".to_string()),
-            /*limit_name*/ None,
+            RateLimitIdentity {
+                id: Some("codex".to_string()),
+                name: None,
+            },
             payload.rate_limit.flatten().map(|details| *details),
             payload.credits.flatten().map(|details| *details),
             payload.spend_control.flatten().map(|details| *details),
             plan_type,
             rate_limit_reached_type,
+            captured_at,
         )];
         if let Some(additional) = payload.additional_rate_limits.flatten() {
             snapshots.extend(additional.into_iter().map(|details| {
                 Self::make_rate_limit_snapshot(
-                    Some(details.metered_feature),
-                    Some(details.limit_name),
+                    RateLimitIdentity {
+                        id: Some(details.metered_feature),
+                        name: Some(details.limit_name),
+                    },
                     details.rate_limit.flatten().map(|rate_limit| *rate_limit),
                     /*credits*/ None,
                     /*spend_control*/ None,
                     plan_type,
                     /*rate_limit_reached_type*/ None,
+                    captured_at,
                 )
             }));
         }
@@ -516,28 +577,37 @@ impl Client {
     }
 
     fn make_rate_limit_snapshot(
-        limit_id: Option<String>,
-        limit_name: Option<String>,
+        identity: RateLimitIdentity,
         rate_limit: Option<crate::types::RateLimitStatusDetails>,
         credits: Option<crate::types::CreditStatusDetails>,
         spend_control: Option<codex_backend_openapi_models::models::SpendControlStatusDetails>,
         plan_type: Option<AccountPlanType>,
         rate_limit_reached_type: Option<RateLimitReachedType>,
+        captured_at: i64,
     ) -> RateLimitSnapshot {
+        // Percentages are display data, not the authoritative admission
+        // decision: the backend can allow requests at 100% while overdrive or
+        // credits remain available. Preserve a more specific top-level reached
+        // type, otherwise derive the generic signal from the required flags.
+        let access_blocked = rate_limit
+            .as_ref()
+            .is_some_and(|details| !details.allowed || details.limit_reached);
+        let rate_limit_reached_type = rate_limit_reached_type
+            .or(access_blocked.then_some(RateLimitReachedType::RateLimitReached));
         let (primary, secondary) = match rate_limit {
             Some(details) => (
-                Self::map_rate_limit_window(details.primary_window),
-                Self::map_rate_limit_window(details.secondary_window),
+                Self::map_rate_limit_window(details.primary_window, captured_at),
+                Self::map_rate_limit_window(details.secondary_window, captured_at),
             ),
             None => (None, None),
         };
         let spend_control_reached = spend_control.as_ref().map(|details| details.reached);
         let individual_limit = spend_control
             .and_then(|details| details.individual_limit.flatten())
-            .map(|details| Self::map_individual_limit(*details));
+            .map(|details| Self::map_individual_limit(*details, captured_at));
         RateLimitSnapshot {
-            limit_id,
-            limit_name,
+            limit_id: identity.id,
+            limit_name: identity.name,
             primary,
             secondary,
             credits: Self::map_credits(credits),
@@ -593,14 +663,23 @@ impl Client {
         }
     }
 
+    fn user_settings_url(&self) -> String {
+        match self.path_style {
+            PathStyle::CodexApi => format!("{}/api/codex/settings/user", self.base_url),
+            PathStyle::ChatGptApi => format!("{}/wham/settings/user", self.base_url),
+        }
+    }
+
     fn map_rate_limit_window(
         window: Option<Option<Box<crate::types::RateLimitWindowSnapshot>>>,
+        captured_at: i64,
     ) -> Option<RateLimitWindow> {
         let snapshot = window.flatten().map(|details| *details)?;
 
         let used_percent = f64::from(snapshot.used_percent);
         let window_minutes = Self::window_minutes_from_seconds(snapshot.limit_window_seconds);
-        let resets_at = Some(i64::from(snapshot.reset_at));
+        let resets_at =
+            reset_at_from_backend(snapshot.reset_at, snapshot.reset_after_seconds, captured_at);
         Some(RateLimitWindow {
             used_percent,
             window_minutes,
@@ -620,12 +699,18 @@ impl Client {
 
     fn map_individual_limit(
         details: crate::types::SpendControlLimitDetails,
+        captured_at: i64,
     ) -> SpendControlLimitSnapshot {
         SpendControlLimitSnapshot {
             limit: details.limit,
             used: details.used,
             remaining_percent: details.remaining_percent,
-            resets_at: i64::from(details.reset_at),
+            resets_at: reset_at_from_backend(
+                details.reset_at,
+                details.reset_after_seconds,
+                captured_at,
+            )
+            .unwrap_or_default(),
         }
     }
 
@@ -637,10 +722,17 @@ impl Client {
             crate::types::PlanType::Pro => AccountPlanType::Pro,
             crate::types::PlanType::ProLite => AccountPlanType::ProLite,
             crate::types::PlanType::Team => AccountPlanType::Team,
+            crate::types::PlanType::SelfServeBusinessProLite => {
+                AccountPlanType::SelfServeBusinessProLite
+            }
             crate::types::PlanType::SelfServeBusinessUsageBased => {
                 AccountPlanType::SelfServeBusinessUsageBased
             }
             crate::types::PlanType::Business => AccountPlanType::Business,
+            crate::types::PlanType::Ent26 => AccountPlanType::Ent26,
+            crate::types::PlanType::EnterpriseCbpAutomation => {
+                AccountPlanType::EnterpriseCbpAutomation
+            }
             crate::types::PlanType::EnterpriseCbpUsageBased => {
                 AccountPlanType::EnterpriseCbpUsageBased
             }
@@ -664,16 +756,96 @@ impl Client {
     }
 }
 
+fn reset_at_from_backend(reset_at: i32, reset_after_seconds: i32, captured_at: i64) -> Option<i64> {
+    if reset_at > 0 {
+        return Some(i64::from(reset_at));
+    }
+    (reset_after_seconds > 0).then(|| captured_at.saturating_add(i64::from(reset_after_seconds)))
+}
+
+fn unix_timestamp_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+#[path = "client_request_tests.rs"]
+mod request_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_api::AuthProvider;
     use codex_backend_openapi_models::models::AdditionalRateLimitDetails;
     use codex_backend_openapi_models::models::RateLimitReachedKind;
     use codex_backend_openapi_models::models::RateLimitReachedType as BackendRateLimitReachedType;
     use pretty_assertions::assert_eq;
+    use std::sync::Arc;
+
+    struct TestBearerAuth;
+
+    impl AuthProvider for TestBearerAuth {
+        fn add_auth_headers(&self, headers: &mut HeaderMap) {
+            headers.insert(
+                "authorization",
+                HeaderValue::from_static("Bearer access-token"),
+            );
+        }
+    }
 
     #[test]
-    fn map_plan_type_supports_usage_based_business_variants() {
+    fn authenticated_headers_match_chatgpt_backend_contract() {
+        let client = test_client("https://chatgpt.com/backend-api", PathStyle::ChatGptApi)
+            .with_auth_provider(Arc::new(TestBearerAuth))
+            .with_user_agent("codex_cli_rs/test")
+            .with_chatgpt_account_id("workspace-1")
+            .with_fedramp_routing_header();
+
+        let headers = client.headers();
+        assert_eq!(
+            headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer access-token")
+        );
+        assert_eq!(
+            headers
+                .get("ChatGPT-Account-Id")
+                .and_then(|value| value.to_str().ok()),
+            Some("workspace-1")
+        );
+        assert_eq!(
+            headers
+                .get("X-OpenAI-Fedramp")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+        assert_eq!(
+            headers
+                .get(USER_AGENT)
+                .and_then(|value| value.to_str().ok()),
+            Some("codex_cli_rs/test")
+        );
+    }
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::header_regex;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
+
+    #[test]
+    fn map_plan_type_supports_business_variants() {
+        let business_prolite =
+            serde_json::from_str::<crate::types::PlanType>("\"self_serve_business_prolite\"")
+                .expect("business ProLite should deserialize");
+        assert_eq!(
+            Client::map_plan_type(business_prolite),
+            AccountPlanType::SelfServeBusinessProLite
+        );
         assert_eq!(
             Client::map_plan_type(crate::types::PlanType::SelfServeBusinessUsageBased),
             AccountPlanType::SelfServeBusinessUsageBased
@@ -682,6 +854,13 @@ mod tests {
             Client::map_plan_type(crate::types::PlanType::EnterpriseCbpUsageBased),
             AccountPlanType::EnterpriseCbpUsageBased
         );
+        assert_eq!(
+            Client::map_plan_type(crate::types::PlanType::EnterpriseCbpAutomation),
+            AccountPlanType::EnterpriseCbpAutomation
+        );
+        let ent26 = serde_json::from_str::<crate::types::PlanType>("\"ent26\"")
+            .expect("ent26 backend plan should deserialize");
+        assert_eq!(Client::map_plan_type(ent26), AccountPlanType::Ent26);
     }
 
     #[test]
@@ -689,6 +868,8 @@ mod tests {
         let payload = RateLimitStatusPayload {
             plan_type: crate::types::PlanType::Pro,
             rate_limit: Some(Some(Box::new(crate::types::RateLimitStatusDetails {
+                allowed: true,
+                limit_reached: false,
                 primary_window: Some(Some(Box::new(crate::types::RateLimitWindowSnapshot {
                     used_percent: 42,
                     limit_window_seconds: 300,
@@ -701,12 +882,13 @@ mod tests {
                     reset_after_seconds: 0,
                     reset_at: 456,
                 }))),
-                ..Default::default()
             }))),
             additional_rate_limits: Some(Some(vec![AdditionalRateLimitDetails {
                 limit_name: "codex_other".to_string(),
                 metered_feature: "codex_other".to_string(),
                 rate_limit: Some(Some(Box::new(crate::types::RateLimitStatusDetails {
+                    allowed: true,
+                    limit_reached: false,
                     primary_window: Some(Some(Box::new(crate::types::RateLimitWindowSnapshot {
                         used_percent: 70,
                         limit_window_seconds: 900,
@@ -714,7 +896,6 @@ mod tests {
                         reset_at: 789,
                     }))),
                     secondary_window: None,
-                    ..Default::default()
                 }))),
             }])),
             credits: Some(Some(Box::new(crate::types::CreditStatusDetails {
@@ -793,6 +974,92 @@ mod tests {
         assert_eq!(snapshots[1].spend_control_reached, None);
         assert_eq!(snapshots[1].plan_type, Some(AccountPlanType::Pro));
         assert_eq!(snapshots[1].rate_limit_reached_type, None);
+    }
+
+    #[test]
+    fn usage_payload_falls_back_to_relative_reset_times() {
+        let payload = RateLimitStatusPayload {
+            plan_type: crate::types::PlanType::Business,
+            rate_limit: Some(Some(Box::new(crate::types::RateLimitStatusDetails {
+                allowed: false,
+                limit_reached: true,
+                primary_window: Some(Some(Box::new(crate::types::RateLimitWindowSnapshot {
+                    used_percent: 100,
+                    limit_window_seconds: 300,
+                    reset_after_seconds: 120,
+                    reset_at: 0,
+                }))),
+                ..Default::default()
+            }))),
+            spend_control: Some(Some(Box::new(
+                codex_backend_openapi_models::models::SpendControlStatusDetails {
+                    reached: true,
+                    individual_limit: Some(Some(Box::new(
+                        crate::types::SpendControlLimitDetails {
+                            source: None,
+                            limit: "100".to_string(),
+                            used: "100".to_string(),
+                            remaining: "0".to_string(),
+                            used_percent: 100,
+                            remaining_percent: 0,
+                            reset_after_seconds: 3_600,
+                            reset_at: 0,
+                        },
+                    ))),
+                },
+            ))),
+            credits: None,
+            additional_rate_limits: None,
+            rate_limit_reached_type: None,
+        };
+
+        let snapshots = Client::rate_limit_snapshots_from_payload_at(payload, 10_000);
+
+        assert_eq!(
+            snapshots[0]
+                .primary
+                .as_ref()
+                .and_then(|window| window.resets_at),
+            Some(10_120)
+        );
+        assert_eq!(
+            snapshots[0]
+                .individual_limit
+                .as_ref()
+                .map(|limit| limit.resets_at),
+            Some(13_600)
+        );
+        assert_eq!(
+            snapshots[0].rate_limit_reached_type,
+            Some(RateLimitReachedType::RateLimitReached),
+            "blocked access flags must supply the generic reached type"
+        );
+    }
+
+    #[test]
+    fn usage_payload_does_not_infer_blocking_from_percentage_when_access_is_allowed() {
+        let payload = RateLimitStatusPayload {
+            plan_type: crate::types::PlanType::Pro,
+            rate_limit: Some(Some(Box::new(crate::types::RateLimitStatusDetails {
+                allowed: true,
+                limit_reached: false,
+                primary_window: Some(Some(Box::new(crate::types::RateLimitWindowSnapshot {
+                    used_percent: 100,
+                    limit_window_seconds: 300,
+                    reset_after_seconds: 120,
+                    reset_at: 10_120,
+                }))),
+                secondary_window: None,
+            }))),
+            credits: None,
+            spend_control: None,
+            additional_rate_limits: None,
+            rate_limit_reached_type: None,
+        };
+
+        let snapshots = Client::rate_limit_snapshots_from_payload_at(payload, 10_000);
+
+        assert_eq!(snapshots[0].rate_limit_reached_type, None);
     }
 
     #[test]
@@ -1001,10 +1268,97 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn user_settings_request_uses_expected_paths_and_revalidates_cached_responses() {
+        let server = MockServer::start().await;
+        for (request_path, commit_attribution_enabled) in [
+            ("/api/codex/settings/user", true),
+            ("/backend-api/wham/settings/user", false),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(request_path))
+                .and(header_regex("cache-control", "^no-cache, no-store$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "commit_attribution_enabled": commit_attribution_enabled,
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+
+        let codex_response = Client::new(
+            server.uri(),
+            HttpClientFactory::new(codex_http_client::OutboundProxyPolicy::ReqwestDefault),
+        )
+        .get_user_settings()
+        .await
+        .unwrap();
+        let chatgpt_response = Client::new(
+            format!("{}/backend-api", server.uri()),
+            HttpClientFactory::new(codex_http_client::OutboundProxyPolicy::ReqwestDefault),
+        )
+        .get_user_settings()
+        .await
+        .unwrap();
+
+        assert_eq!(
+            [codex_response, chatgpt_response],
+            [
+                CodexUserSettingsResponse {
+                    commit_attribution_enabled: true,
+                },
+                CodexUserSettingsResponse {
+                    commit_attribution_enabled: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn user_settings_missing_attribution_policy_defaults_to_disabled() {
+        assert_eq!(
+            serde_json::from_value::<CodexUserSettingsResponse>(serde_json::json!({})).unwrap(),
+            CodexUserSettingsResponse {
+                commit_attribution_enabled: false,
+            }
+        );
+    }
+
+    #[test]
+    fn authenticated_user_settings_client_uses_active_workspace_headers() {
+        let auth = CodexAuth::from_external_chatgpt_tokens(
+            "e30.e30.c2ln",
+            "workspace-123",
+            Some("enterprise"),
+        )
+        .unwrap();
+        let client = Client::from_auth(
+            "https://chatgpt.com/backend-api",
+            &auth,
+            HttpClientFactory::new(codex_http_client::OutboundProxyPolicy::ReqwestDefault),
+        );
+        let headers = client.headers();
+
+        assert_eq!(
+            [
+                headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok()),
+                headers
+                    .get("chatgpt-account-id")
+                    .and_then(|value| value.to_str().ok()),
+            ],
+            [Some("Bearer e30.e30.c2ln"), Some("workspace-123")]
+        );
+    }
+
     fn test_client(base_url: &str, path_style: PathStyle) -> Client {
         Client {
             base_url: base_url.to_string(),
-            http: reqwest::Client::new(),
+            http: RouteAwareClientPool::new(
+                HttpClientFactory::new(codex_http_client::OutboundProxyPolicy::ReqwestDefault),
+                ClientRouteClass::Api,
+            ),
             auth_provider: codex_model_provider::unauthenticated_auth_provider(),
             user_agent: None,
             chatgpt_account_id: None,

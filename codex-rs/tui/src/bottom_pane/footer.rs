@@ -43,6 +43,7 @@
 //! `FooterProps` mapping.
 use crate::key_hint;
 use crate::key_hint::KeyBinding;
+use crate::key_hint::ShortcutHint;
 use crate::render::line_utils::prefix_lines;
 use crate::status::format_tokens_compact;
 use crate::ui_consts::FOOTER_INDENT_COLS;
@@ -53,6 +54,8 @@ use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::widgets::Paragraph;
+
+use super::STATUS_LINE_SEPARATOR;
 use ratatui::widgets::Widget;
 
 /// The rendering inputs for the footer area under the composer.
@@ -82,7 +85,7 @@ pub(crate) struct FooterProps {
     /// instructional hint.
     ///
     /// When both this label and the configured status line are available, they are rendered on the
-    /// same row separated by ` · `.
+    /// same row separated by `  ·  `.
     pub(crate) active_agent_label: Option<String>,
 }
 
@@ -106,30 +109,34 @@ const FOOTER_CONTEXT_GAP_COLS: u16 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FooterKeyHints {
-    pub(crate) toggle_shortcuts: Option<KeyBinding>,
-    pub(crate) queue: Option<KeyBinding>,
-    pub(crate) insert_newline: Option<KeyBinding>,
-    pub(crate) external_editor: Option<KeyBinding>,
-    pub(crate) edit_previous: Option<KeyBinding>,
-    pub(crate) show_transcript: Option<KeyBinding>,
-    pub(crate) history_search: Option<KeyBinding>,
-    pub(crate) reasoning_down: Option<KeyBinding>,
-    pub(crate) reasoning_up: Option<KeyBinding>,
+    pub(crate) toggle_shortcuts: Option<ShortcutHint>,
+    pub(crate) queue: Option<ShortcutHint>,
+    pub(crate) insert_newline: Option<ShortcutHint>,
+    pub(crate) external_editor: Option<ShortcutHint>,
+    pub(crate) edit_previous: Option<ShortcutHint>,
+    pub(crate) show_transcript: Option<ShortcutHint>,
+    /// Contextual footer hint; unlike `show_transcript`, this is present only
+    /// when the current turn has hidden transcript detail.
+    pub(crate) transcript_context: Option<ShortcutHint>,
+    pub(crate) history_search: Option<ShortcutHint>,
+    pub(crate) reasoning_down: Option<ShortcutHint>,
+    pub(crate) reasoning_up: Option<ShortcutHint>,
 }
 
 impl FooterKeyHints {
     #[cfg(test)]
     pub(crate) fn default_bindings() -> Self {
         Self {
-            toggle_shortcuts: Some(key_hint::plain(KeyCode::Char('?'))),
-            queue: Some(key_hint::plain(KeyCode::Tab)),
-            insert_newline: Some(key_hint::ctrl(KeyCode::Char('j'))),
-            external_editor: Some(key_hint::ctrl(KeyCode::Char('g'))),
-            edit_previous: Some(key_hint::plain(KeyCode::Esc)),
-            show_transcript: Some(key_hint::ctrl(KeyCode::Char('t'))),
-            history_search: Some(key_hint::ctrl(KeyCode::Char('r'))),
-            reasoning_down: Some(key_hint::alt(KeyCode::Char(','))),
-            reasoning_up: Some(key_hint::alt(KeyCode::Char('.'))),
+            toggle_shortcuts: Some(key_hint::plain(KeyCode::Char('?')).into()),
+            queue: Some(key_hint::plain(KeyCode::Tab).into()),
+            insert_newline: Some(key_hint::ctrl(KeyCode::Char('j')).into()),
+            external_editor: Some(key_hint::ctrl(KeyCode::Char('g')).into()),
+            edit_previous: Some(key_hint::plain(KeyCode::Esc).into()),
+            show_transcript: Some(key_hint::ctrl(KeyCode::Char('t')).into()),
+            transcript_context: None,
+            history_search: Some(key_hint::ctrl(KeyCode::Char('r')).into()),
+            reasoning_down: Some(key_hint::alt(KeyCode::Char(',')).into()),
+            reasoning_up: Some(key_hint::alt(KeyCode::Char('.')).into()),
         }
     }
 }
@@ -293,6 +300,7 @@ pub(crate) fn left_fits(area: Rect, left_width: u16) -> bool {
 enum SummaryHintKind {
     None,
     Shortcuts,
+    Transcript,
     QueueMessage,
     QueueShort,
 }
@@ -315,6 +323,12 @@ fn left_side_line(
             if let Some(key) = key_hints.toggle_shortcuts {
                 line.push_span(key);
                 line.push_span(" for shortcuts".dim());
+            }
+        }
+        SummaryHintKind::Transcript => {
+            if let Some(key) = key_hints.transcript_context {
+                line.push_span(key);
+                line.push_span(" transcript".dim());
             }
         }
         SummaryHintKind::QueueMessage => {
@@ -360,6 +374,8 @@ pub(crate) fn single_line_footer_layout(
 ) -> (SummaryLeft, bool) {
     let hint_kind = if show_queue_hint {
         SummaryHintKind::QueueMessage
+    } else if key_hints.transcript_context.is_some() {
+        SummaryHintKind::Transcript
     } else if show_shortcuts_hint {
         SummaryHintKind::Shortcuts
     } else {
@@ -540,7 +556,7 @@ pub(crate) fn goal_status_indicator_line(
             }
         }
         GoalStatusIndicator::Paused => "Goal paused (/goal resume)".to_string(),
-        GoalStatusIndicator::Blocked => "Goal blocked (/goal resume)".to_string(),
+        GoalStatusIndicator::Blocked => "Goal stalled (/goal resume)".to_string(),
         GoalStatusIndicator::UsageLimited => "Goal hit usage limits (/goal resume)".to_string(),
         GoalStatusIndicator::BudgetLimited { usage } => {
             if let Some(usage) = usage {
@@ -577,7 +593,7 @@ pub(crate) fn status_line_right_indicator_line(
         .flatten()
     {
         if let Some(line) = line.as_mut() {
-            line.push_span(" · ".dim());
+            line.push_span(STATUS_LINE_SEPARATOR.dim());
             for span in indicator.spans {
                 line.push_span(span);
             }
@@ -593,7 +609,7 @@ pub(crate) fn side_conversation_context_line(label: &str) -> Line<'static> {
     if let Some(rest) = label.strip_prefix("Side ") {
         Line::from(vec!["Side".magenta().bold(), format!(" {rest}").magenta()])
     } else {
-        Line::from(label.to_string()).magenta()
+        Line::from(vec![Span::from(label.to_string()).magenta()])
     }
 }
 
@@ -635,8 +651,11 @@ pub(crate) fn max_left_width_for_right(area: Rect, right_width: u16) -> Option<u
 }
 
 pub(crate) fn can_show_left_with_context(area: Rect, left_width: u16, context_width: u16) -> bool {
+    if context_width == 0 {
+        return left_fits(area, left_width);
+    }
     let Some(context_x) = right_aligned_x(area, context_width) else {
-        return true;
+        return false;
     };
     if left_width == 0 {
         return true;
@@ -716,7 +735,9 @@ fn footer_from_props_lines(
         FooterMode::HistorySearch => vec![Line::from("reverse-i-search: ").dim()],
         FooterMode::ComposerEmpty => {
             let state = LeftSideState {
-                hint: if show_shortcuts_hint {
+                hint: if key_hints.transcript_context.is_some() {
+                    SummaryHintKind::Transcript
+                } else if show_shortcuts_hint {
                     SummaryHintKind::Shortcuts
                 } else {
                     SummaryHintKind::None
@@ -746,6 +767,8 @@ fn footer_from_props_lines(
             let state = LeftSideState {
                 hint: if show_queue_hint {
                     SummaryHintKind::QueueMessage
+                } else if key_hints.transcript_context.is_some() {
+                    SummaryHintKind::Transcript
                 } else if show_shortcuts_hint {
                     SummaryHintKind::Shortcuts
                 } else {
@@ -780,10 +803,20 @@ pub(crate) fn passive_footer_status_line(props: &FooterProps) -> Option<Line<'st
 
     if let Some(active_agent_label) = props.active_agent_label.as_ref() {
         if let Some(existing) = line.as_mut() {
-            existing.spans.push(" · ".dim());
+            existing.spans.push(STATUS_LINE_SEPARATOR.dim());
             existing.spans.push(active_agent_label.clone().dim());
         } else {
             line = Some(Line::from(active_agent_label.clone()).dim());
+        }
+    }
+
+    if let Some(key) = props.key_hints.transcript_context {
+        if let Some(existing) = line.as_mut() {
+            existing.spans.push(STATUS_LINE_SEPARATOR.dim());
+            existing.spans.push(key.into());
+            existing.spans.push(" transcript".dim());
+        } else {
+            line = Some(Line::from(vec![key.into(), " transcript".dim()]));
         }
     }
 
@@ -1087,7 +1120,9 @@ impl ShortcutDescriptor {
             | ShortcutId::FilePaths
             | ShortcutId::PasteImage
             | ShortcutId::Quit
-            | ShortcutId::ChangeMode => self.binding_for(state).map(|binding| binding.key),
+            | ShortcutId::ChangeMode => self
+                .binding_for(state)
+                .map(|binding| ShortcutHint::Single(binding.key)),
         }?;
         let mut line = Line::from(vec![self.prefix.into(), key.into()]);
         match self.id {
@@ -1576,7 +1611,7 @@ mod tests {
                 status_line_value: None,
                 status_line_enabled: false,
                 key_hints: FooterKeyHints {
-                    insert_newline: Some(key_hint::shift(KeyCode::Enter)),
+                    insert_newline: Some(key_hint::shift(KeyCode::Enter).into()),
                     ..FooterKeyHints::default_bindings()
                 },
                 active_agent_label: None,
@@ -2028,6 +2063,48 @@ mod tests {
             screen.contains('…'),
             "status line should be truncated with ellipsis to keep mode indicator"
         );
+    }
+
+    #[test]
+    fn transcript_detail_uses_one_contextual_footer_hint() {
+        let mut key_hints = FooterKeyHints::default_bindings();
+        key_hints.transcript_context = key_hints.show_transcript;
+        let props = FooterProps {
+            mode: FooterMode::ComposerEmpty,
+            esc_backtrack_hint: false,
+            use_shift_enter_hint: false,
+            is_task_running: true,
+            queue_submissions: true,
+            collaboration_modes_enabled: false,
+            is_wsl: false,
+            quit_shortcut_key: key_hint::ctrl(KeyCode::Char('c')),
+            status_line_value: None,
+            status_line_enabled: false,
+            key_hints,
+            active_agent_label: None,
+        };
+
+        let rendered = footer_from_props_lines(
+            &props, /*collaboration_mode_indicator*/ None, /*show_cycle_hint*/ false,
+            /*show_shortcuts_hint*/ true, /*show_queue_hint*/ false,
+        )
+        .into_iter()
+        .flat_map(|line| line.spans)
+        .map(|span| span.content.into_owned())
+        .collect::<String>();
+
+        assert_eq!(rendered.matches("transcript").count(), 1);
+        assert!(rendered.contains("ctrl + t"));
+        let (narrow, _) = single_line_footer_layout(
+            Rect::new(0, 0, 1, 1),
+            /*context_width*/ 0,
+            /*collaboration_mode_indicator*/ None,
+            /*show_cycle_hint*/ false,
+            /*show_shortcuts_hint*/ true,
+            /*show_queue_hint*/ false,
+            key_hints,
+        );
+        assert!(matches!(narrow, SummaryLeft::None));
     }
 
     #[test]

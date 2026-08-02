@@ -15,7 +15,10 @@ use codex_protocol::protocol::CodexResponseHandoffMode;
 use codex_protocol::protocol::RealtimeHandoffRequested;
 use codex_protocol::protocol::RealtimeTranscriptEntry;
 use pretty_assertions::assert_eq;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::Mutex;
 
 #[test]
 fn prefers_handoff_input_transcript_over_active_transcript() {
@@ -147,15 +150,18 @@ fn wraps_realtime_delegation_input_with_xml_escaping_without_transcript() {
 #[tokio::test]
 async fn clears_active_handoff_explicitly() {
     let (tx, _rx) = bounded(1);
-    let state = RealtimeHandoffState::new(
-        tx,
-        /*client_managed_handoffs*/ false,
-        /*codex_responses_as_items*/ false,
-        /*codex_response_item_prefix*/ None,
-        CodexResponseHandoffMode::Thinking,
-        RealtimeSessionKind::V1,
-        /*event_parser*/ RealtimeEventParser::V1,
-    );
+    let state = RealtimeHandoffState {
+        output_tx: tx,
+        last_output: Arc::new(Mutex::new(None)),
+        stream: Arc::new(Mutex::new(Default::default())),
+        client_managed_handoffs: false,
+        codex_responses_as_items: false,
+        codex_response_item_prefix: None,
+        codex_response_handoff_mode: CodexResponseHandoffMode::Thinking,
+        codex_response_handoff_channel_prefixes: Arc::new(BTreeMap::new()),
+        session_kind: RealtimeSessionKind::V1,
+        event_parser: RealtimeEventParser::V1,
+    };
 
     state.stream.lock().await.active_handoff = Some("handoff_1".to_string());
     assert_eq!(
@@ -221,6 +227,7 @@ fn uses_quicksilver_alpha_header_for_realtime_v1() {
     let headers = realtime_request_headers(
         Some("session_1"),
         Some("sk-test"),
+        None,
         RealtimeEventParser::V1,
         "codex_work_desktop",
     )
@@ -240,6 +247,7 @@ fn omits_quicksilver_alpha_header_for_realtime_v2() {
     let headers = realtime_request_headers(
         Some("session_1"),
         Some("sk-test"),
+        None,
         RealtimeEventParser::RealtimeV2,
         "codex_work_desktop",
     )
@@ -254,6 +262,7 @@ fn uses_frameless_alpha_header_for_realtime_v3() {
     let headers = realtime_request_headers(
         Some("session_1"),
         Some("sk-test"),
+        None,
         RealtimeEventParser::FramelessBidi,
         "codex_work_desktop",
     )
@@ -278,6 +287,7 @@ fn realtime_headers_include_only_non_default_originator() {
         let headers = realtime_request_headers(
             Some("session_1"),
             Some("sk-test"),
+            None,
             RealtimeEventParser::RealtimeV2,
             originator,
         )
@@ -291,4 +301,24 @@ fn realtime_headers_include_only_non_default_originator() {
             expected_header
         );
     }
+}
+
+#[test]
+fn realtime_headers_include_chatgpt_account_id() {
+    let headers = realtime_request_headers(
+        Some("session_1"),
+        Some("chatgpt-token"),
+        Some("workspace-1"),
+        RealtimeEventParser::RealtimeV2,
+        "codex_work_desktop",
+    )
+    .expect("headers")
+    .expect("headers");
+
+    assert_eq!(
+        headers
+            .get("ChatGPT-Account-ID")
+            .and_then(|value| value.to_str().ok()),
+        Some("workspace-1")
+    );
 }

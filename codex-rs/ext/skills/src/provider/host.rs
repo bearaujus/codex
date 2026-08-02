@@ -1,5 +1,7 @@
+use std::collections::HashMap;
+
 use codex_core_skills::SkillLoadOutcome;
-use codex_core_skills::SkillMetadata;
+use codex_skills::SkillMetadata;
 
 use crate::catalog::SkillAuthority;
 use crate::catalog::SkillCatalog;
@@ -82,6 +84,11 @@ impl SkillProvider for HostSkillProvider {
 }
 
 fn catalog_from_outcome(outcome: &SkillLoadOutcome) -> SkillCatalog {
+    let root_order_by_path = outcome
+        .skill_roots_in_discovery_order()
+        .enumerate()
+        .map(|(index, root)| (root.as_path(), index))
+        .collect::<HashMap<_, _>>();
     let mut catalog = SkillCatalog {
         entries: Vec::new(),
         warnings: outcome
@@ -98,7 +105,14 @@ fn catalog_from_outcome(outcome: &SkillLoadOutcome) -> SkillCatalog {
     };
 
     for (skill, enabled) in outcome.skills_with_enabled() {
-        catalog.push_entry(catalog_entry_from_skill(skill, enabled));
+        let mut entry = catalog_entry_from_skill(skill, enabled);
+        if let Some(root) = outcome.skill_root_for_path(&skill.path_to_skills_md) {
+            entry = entry.with_display_path_root(root.to_string_lossy().replace('\\', "/"));
+            if let Some(root_order) = root_order_by_path.get(root.as_path()) {
+                entry = entry.with_display_path_root_order(*root_order);
+            }
+        }
+        catalog.push_entry(entry);
     }
 
     catalog
@@ -116,6 +130,7 @@ fn catalog_entry_from_skill(skill: &SkillMetadata, enabled: bool) -> SkillCatalo
     )
     .with_short_description(skill.short_description.clone())
     .with_display_path(display_path)
+    .with_prompt_scope(skill.scope)
     .with_dependencies(skill.dependencies.clone());
 
     if !enabled {
@@ -127,3 +142,7 @@ fn catalog_entry_from_skill(skill: &SkillMetadata, enabled: bool) -> SkillCatalo
 
     entry
 }
+
+#[cfg(test)]
+#[path = "host_tests.rs"]
+mod tests;

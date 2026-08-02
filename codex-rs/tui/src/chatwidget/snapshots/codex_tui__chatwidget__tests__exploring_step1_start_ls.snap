@@ -1,6 +1,7 @@
 ---
-source: tui/src/chatwidget/tests.rs
+source: tui/src/chatwidget/tests/exec_flow.rs
+assertion_line: 1088
 expression: active_blob(&chat)
 ---
-• Exploring
-  └ List ls -la
+• Exploring · 1 active · 0 done
+  └ Listing ls -la

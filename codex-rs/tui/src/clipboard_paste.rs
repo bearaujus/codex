@@ -80,7 +80,21 @@ pub fn paste_image_as_png() -> Result<(Vec<u8>, PastedImageInfo), PasteImageErro
         let h = img.height as u32;
         tracing::debug!("clipboard image opened from image: {}x{}", w, h);
 
-        let Some(rgba_img) = image::RgbaImage::from_raw(w, h, img.bytes.into_owned()) else {
+        // arboard returns the clipboard bitmap as row-major RGBA. Some Windows
+        // sources (notably the Snipping Tool / Win+Shift+S) place a 32-bit DIB on
+        // the clipboard whose alpha channel is entirely zero. Encoding that buffer
+        // straight to PNG yields a fully transparent (blank) image, so the paste
+        // appears to do nothing. When the alpha channel is uniformly zero, treat
+        // the image as fully opaque so the screenshot is preserved.
+        let mut bytes = img.bytes.into_owned();
+        if bytes.len() >= 4 && bytes.iter().skip(3).step_by(4).all(|&a| a == 0) {
+            tracing::debug!("clipboard image alpha is uniformly zero; forcing opaque");
+            for alpha in bytes.iter_mut().skip(3).step_by(4) {
+                *alpha = 255;
+            }
+        }
+
+        let Some(rgba_img) = image::RgbaImage::from_raw(w, h, bytes) else {
             return Err(PasteImageError::EncodeFailed("invalid RGBA buffer".into()));
         };
 

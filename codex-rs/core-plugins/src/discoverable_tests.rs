@@ -73,17 +73,24 @@ remote_plugin = false
 #[tokio::test]
 async fn returns_api_curated_fallback_plugins_for_direct_provider_auth() {
     let codex_home = tempdir().expect("tempdir should succeed");
+    write_file(
+        &codex_home.path().join(CONFIG_TOML_FILE),
+        r#"model_provider = "amazon-bedrock"
+
+[features]
+plugins = true
+remote_plugin = false
+"#,
+    );
     let curated_root = curated_plugins_repo_path(codex_home.path());
     write_openai_api_curated_marketplace(&curated_root, &["sample", "slack", "openai-developers"]);
 
     let plugins = load_plugins_config(codex_home.path(), codex_home.path()).await;
     let plugins_manager = PluginsManager::new(codex_home.path().to_path_buf());
-    plugins_manager.set_auth_mode(Some(AuthMode::ApiKey));
-    let auth = CodexAuth::from_api_key("test-api-key");
     let discoverable_plugins = list_discoverable_plugins(
         &plugins_manager,
         discovery_input(plugins, &[], &[], &[]),
-        Some(&auth),
+        /*auth*/ None,
     )
     .await;
 
@@ -273,18 +280,17 @@ source = "/tmp/{marketplace_name}"
     };
     assert_eq!(chatgpt_projection, vec![expected.clone()]);
 
-    assert!(plugins_manager.set_auth_mode(Some(AuthMode::ApiKey)));
-    let api_key_projection = list_discoverable_plugins(
+    assert!(plugins_manager.set_auth_mode(/*auth_mode*/ None));
+    let unauthenticated_projection = list_discoverable_plugins(
         &plugins_manager,
         discovery_input(plugins, &[plugin_id.as_str()], &[], &[]),
         /*auth*/ None,
     )
     .await;
     assert_eq!(
-        api_key_projection,
+        unauthenticated_projection,
         vec![ToolSuggestDiscoverablePlugin {
             mcp_server_names: vec!["sample-docs".to_string()],
-            app_connector_ids: Vec::new(),
             ..expected
         }]
     );
@@ -851,9 +857,10 @@ plugins = true
     let plugins_manager = PluginsManager::new(codex_home.path().to_path_buf());
     fetch_and_cache_global_remote_plugin_catalog(
         codex_home.path(),
-        &RemotePluginServiceConfig {
-            chatgpt_base_url: plugins.chatgpt_base_url.clone(),
-        },
+        &RemotePluginServiceConfig::new(
+            plugins.chatgpt_base_url.clone(),
+            crate::test_support::test_http_client_factory(),
+        ),
         Some(&auth),
     )
     .await

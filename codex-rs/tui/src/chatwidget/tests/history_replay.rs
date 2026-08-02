@@ -76,6 +76,121 @@ async fn resumed_initial_messages_render_history() {
 }
 
 #[tokio::test]
+async fn resumed_completed_exploration_rebuilds_one_compact_card() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+    let replay_kind = ReplayKind::ResumeInitialMessages;
+    let cwd = chat.config.cwd.clone();
+
+    chat.replay_thread_item(
+        AppServerThreadItem::CommandExecution {
+            id: "list".to_string(),
+            command: "ls".to_string(),
+            cwd: cwd.clone().into(),
+            process_id: None,
+            plugin_id: None,
+            script_path: None,
+            source: ExecCommandSource::UnifiedExecStartup,
+            status: AppServerCommandExecutionStatus::Completed,
+            command_actions: vec![AppServerCommandAction::from_core_with_cwd(
+                ParsedCommand::ListFiles {
+                    cmd: "ls".to_string(),
+                    path: None,
+                },
+                &cwd,
+            )],
+            aggregated_output: Some("foo.txt\n".to_string()),
+            exit_code: Some(0),
+            duration_ms: Some(5),
+        },
+        "turn-1".to_string(),
+        replay_kind,
+    );
+    chat.replay_thread_item(
+        AppServerThreadItem::CommandExecution {
+            id: "read".to_string(),
+            command: "cat foo.txt".to_string(),
+            cwd: cwd.clone().into(),
+            process_id: None,
+            plugin_id: None,
+            script_path: None,
+            source: ExecCommandSource::Agent,
+            status: AppServerCommandExecutionStatus::Completed,
+            command_actions: vec![AppServerCommandAction::from_core_with_cwd(
+                ParsedCommand::Read {
+                    cmd: "cat foo.txt".to_string(),
+                    name: "foo.txt".to_string(),
+                    path: "foo.txt".into(),
+                },
+                &cwd,
+            )],
+            aggregated_output: Some("hello\n".to_string()),
+            exit_code: Some(0),
+            duration_ms: Some(5),
+        },
+        "turn-1".to_string(),
+        replay_kind,
+    );
+
+    let active = active_blob(&chat);
+    assert!(active.contains("• Explored · 1 file · 2 operations"));
+    assert!(active.contains("Listed ls · 1 entry"));
+    assert!(active.contains("Read foo.txt · 1 line · 6 chars"));
+
+    replay_agent_message(&mut chat, "assistant-1", "resume complete", replay_kind);
+    let history = drain_insert_history_text(&mut rx);
+    assert_eq!(history.matches("• Explored").count(), 1);
+    assert!(history.contains("resume complete"));
+}
+
+#[tokio::test]
+async fn replayed_failed_turns_preserve_overload_warnings_between_retries() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+    let prompt = "The workspace also looks super confusing with its separator.";
+    let error_message = "Selected model is at capacity. Please try a different model.";
+    let failed_turn = |turn_id: &str, item_id: &str| AppServerTurn {
+        items: vec![AppServerThreadItem::UserMessage {
+            id: item_id.to_string(),
+            client_id: None,
+            content: vec![AppServerUserInput::Text {
+                text: prompt.to_string(),
+                text_elements: Vec::new(),
+            }],
+        }],
+        ..app_server_turn(
+            turn_id,
+            AppServerTurnStatus::Failed,
+            /*duration_ms*/ None,
+            /*error*/
+            Some(AppServerTurnError {
+                message: error_message.to_string(),
+                codex_error_info: Some(CodexErrorInfo::ServerOverloaded),
+                additional_details: None,
+            }),
+        )
+    };
+
+    chat.replay_thread_turns(
+        vec![
+            failed_turn("turn-1", "user-1"),
+            failed_turn("turn-2", "user-2"),
+        ],
+        ReplayKind::ResumeInitialMessages,
+    );
+
+    let rendered = drain_insert_history(&mut rx)
+        .into_iter()
+        .map(|lines| lines_to_single_string(&lines))
+        .collect::<String>();
+
+    assert_eq!(rendered.matches(prompt).count(), 2);
+    assert_eq!(rendered.matches(error_message).count(), 2);
+    insta::assert_snapshot!(
+        "replayed_failed_turns_preserve_overload_warnings_between_retries",
+        rendered
+    );
+}
+
+#[tokio::test]
 async fn restored_conversation_ultra_remains_selected_after_switching_to_plan() {
     let (mut chat, _rx, _ops) = make_chatwidget_manual(Some("gpt-5.4")).await;
     chat.set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
@@ -481,12 +596,14 @@ async fn session_configured_syncs_widget_config_permissions_and_cwd() {
                         value: FileSystemSpecialPath::Root,
                     },
                     access: FileSystemAccessMode::Read,
+                    missing_path_behavior: None,
                 },
                 FileSystemSandboxEntry {
                     path: FileSystemPath::GlobPattern {
                         pattern: "**/.secret".to_string(),
                     },
                     access: FileSystemAccessMode::Deny,
+                    missing_path_behavior: None,
                 },
             ],
             glob_scan_max_depth: None,
@@ -1055,7 +1172,7 @@ async fn replayed_reasoning_item_preserves_summary_parts_and_hides_raw_reasoning
         }
         other => panic!("expected InsertHistoryCell, got {other:?}"),
     };
-    assert_eq!(rendered, "• done\n");
+    assert_eq!(rendered, "┊ done\n");
     assert!(!rendered.contains("Raw reasoning"));
 }
 
@@ -1121,6 +1238,7 @@ async fn replayed_in_progress_mcp_tool_call_stays_active() {
             app_context: None,
             mcp_app_resource_uri: None,
             plugin_id: None,
+            read_only_hint: None,
             result: None,
             error: None,
             duration_ms: None,
@@ -1136,9 +1254,135 @@ async fn replayed_in_progress_mcp_tool_call_stays_active() {
 }
 
 #[tokio::test]
-async fn live_reasoning_summary_is_not_rendered_twice_when_item_completes() {
+async fn resumed_consecutive_mcp_calls_group_without_losing_transcript_output() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let _ = drain_insert_history(&mut rx);
+
+    for (id, path, output) in [
+        ("mcp-1", "/workspace/first", "first output"),
+        ("mcp-2", "/workspace/second", "second output"),
+    ] {
+        chat.replay_thread_item(
+            AppServerThreadItem::McpToolCall {
+                id: id.to_string(),
+                server: "bmcptools".to_string(),
+                tool: "directory_tree".to_string(),
+                status: codex_app_server_protocol::McpToolCallStatus::Completed,
+                arguments: json!({"path": path, "max_depth": 3}),
+                app_context: None,
+                mcp_app_resource_uri: None,
+                plugin_id: None,
+                read_only_hint: None,
+                result: Some(Box::new(codex_app_server_protocol::McpToolCallResult {
+                    content: vec![json!({"type": "text", "text": output})],
+                    structured_content: (id == "mcp-2").then(|| json!({"entries": 2})),
+                    meta: None,
+                })),
+                error: None,
+                duration_ms: Some(10),
+            },
+            "turn-1".to_string(),
+            ReplayKind::ResumeInitialMessages,
+        );
+    }
+
+    assert!(drain_insert_history(&mut rx).is_empty());
+    let active = active_blob(&chat);
+    assert!(active.contains("bmcptools.directory_tree · 2 calls"));
+    assert!(active.contains("path=/workspace/first"));
+    assert!(active.contains("path=/workspace/second"));
+
+    chat.flush_active_cell();
+    let mut transcript = String::new();
+    while let Ok(event) = rx.try_recv() {
+        if let AppEvent::InsertHistoryCell(cell) = event {
+            transcript.push_str(&lines_to_single_string(
+                &cell.transcript_lines(/*width*/ 80),
+            ));
+        }
+    }
+    assert!(transcript.contains("first output"));
+    assert!(transcript.contains("second output"));
+    assert!(transcript.contains("Structured output"));
+    assert!(transcript.contains("\"entries\": 2"));
+}
+
+#[tokio::test]
+async fn deferred_mcp_lifecycle_events_keep_fifo_after_stream_finishes() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let cwd = chat.config.cwd.to_path_buf();
+    chat.stream_controller = Some(crate::streaming::controller::StreamController::new(
+        /*width*/ Some(80),
+        cwd.as_path(),
+        chat.history_render_mode(),
+    ));
+
+    chat.on_mcp_tool_call_started(AppServerThreadItem::McpToolCall {
+        id: "mcp-deferred".to_string(),
+        server: "copilot-bridge".to_string(),
+        tool: "copilot".to_string(),
+        status: codex_app_server_protocol::McpToolCallStatus::InProgress,
+        arguments: json!({"action": "wait"}),
+        app_context: None,
+        mcp_app_resource_uri: None,
+        plugin_id: None,
+        read_only_hint: None,
+        result: None,
+        error: None,
+        duration_ms: None,
+    });
+    assert!(!chat.interrupts.is_empty());
+
+    chat.stream_controller = None;
+    chat.on_mcp_tool_call_completed(AppServerThreadItem::McpToolCall {
+        id: "mcp-deferred".to_string(),
+        server: "copilot-bridge".to_string(),
+        tool: "copilot".to_string(),
+        status: codex_app_server_protocol::McpToolCallStatus::Completed,
+        arguments: json!({"action": "wait"}),
+        app_context: None,
+        mcp_app_resource_uri: None,
+        plugin_id: None,
+        read_only_hint: None,
+        result: Some(Box::new(codex_app_server_protocol::McpToolCallResult {
+            content: vec![json!({"type": "text", "text": "deferred result"})],
+            structured_content: None,
+            meta: None,
+        })),
+        error: None,
+        duration_ms: Some(5),
+    });
+
+    assert!(!chat.interrupts.is_empty());
+    assert!(drain_insert_history(&mut rx).is_empty());
+
+    chat.flush_interrupt_queue();
+
+    assert!(chat.interrupts.is_empty());
+    let active = chat
+        .transcript
+        .active_cell
+        .as_ref()
+        .expect("completed MCP call should remain available for grouping");
+    let active_transcript = lines_to_single_string(&active.transcript_lines(/*width*/ 80));
+    assert!(
+        active_transcript.contains("deferred result"),
+        "{active_transcript}"
+    );
+    chat.flush_active_cell();
+    assert!(chat.transcript.active_cell.is_none());
+    let rendered = drain_insert_history(&mut rx)
+        .into_iter()
+        .map(|lines| lines_to_single_string(&lines))
+        .collect::<String>();
+    assert!(rendered.contains("deferred result"), "{rendered}");
+}
+
+#[tokio::test]
+async fn completed_live_reasoning_moves_from_viewport_to_transcript() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.show_welcome_banner = false;
+    chat.config.stream_reasoning_live = true;
 
     chat.handle_server_notification(
         ServerNotification::TurnStarted(TurnStartedNotification {
@@ -1168,6 +1412,14 @@ async fn live_reasoning_summary_is_not_rendered_twice_when_item_completes() {
         }),
         /*replay_kind*/ None,
     );
+    // The stream controller remains newline-gated, but an unterminated summary
+    // must still be visible as the live status detail.
+    let status = chat
+        .bottom_pane
+        .status_widget()
+        .expect("reasoning status should be visible");
+    assert_eq!(status.header(), "Thinking");
+    assert_eq!(status.details(), Some("Summary only"));
 
     chat.handle_server_notification(
         ServerNotification::ItemCompleted(ItemCompletedNotification {
@@ -1182,14 +1434,148 @@ async fn live_reasoning_summary_is_not_rendered_twice_when_item_completes() {
         }),
         /*replay_kind*/ None,
     );
-
-    let rendered = match rx.try_recv() {
-        Ok(AppEvent::InsertHistoryCell(cell)) => {
-            lines_to_single_string(&cell.transcript_lines(/*width*/ 80))
+    let mut viewport = String::new();
+    let mut transcript = String::new();
+    while let Ok(event) = rx.try_recv() {
+        if let AppEvent::InsertHistoryCell(cell) = event {
+            viewport.push_str(&lines_to_single_string(&cell.display_lines(/*width*/ 80)));
+            transcript.push_str(&lines_to_single_string(
+                &cell.transcript_lines(/*width*/ 80),
+            ));
         }
-        other => panic!("expected InsertHistoryCell, got {other:?}"),
-    };
-    assert_eq!(rendered.matches("Summary only").count(), 1);
+    }
+    viewport.push_str(&active_blob_or_empty(&chat));
+
+    assert_eq!(viewport.matches("Summary only").count(), 0);
+    assert_eq!(transcript.matches("Summary only").count(), 1);
+    assert!(chat.transcript.active_cell.is_none());
+    assert_eq!(
+        chat.bottom_pane
+            .status_widget()
+            .and_then(|status| status.details()),
+        Some("Summary only"),
+        "the latest reasoning checkpoint should persist until the next activity"
+    );
+}
+
+#[tokio::test]
+async fn exec_output_is_preserved_while_reasoning_streams_live() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.show_welcome_banner = false;
+    chat.config.stream_reasoning_live = true;
+    handle_turn_started(&mut chat, "turn-1");
+    chat.bottom_pane.set_task_running(/*running*/ true);
+    let _ = drain_insert_history(&mut rx);
+
+    // Reasoning starts streaming live and takes the active cell.
+    handle_agent_reasoning_delta(&mut chat, "Thinking about the task.\n");
+
+    // A command runs; reasoning must yield the active slot so its output deltas
+    // land in the exec cell instead of being dropped (trimmed).
+    let _item = begin_exec_with_source(&mut chat, "exec-1", "echo hi", ExecCommandSource::Agent);
+    handle_exec_output_delta(&mut chat, "exec-1", "FIRST_OUTPUT");
+    // More reasoning arrives mid-exec; it must not steal the slot back.
+    handle_agent_reasoning_delta(&mut chat, "Still thinking.\n");
+    handle_exec_output_delta(&mut chat, "exec-1", "SECOND_OUTPUT");
+
+    // Streamed exec output is rendered from the active exec cell's display lines.
+    let rendered = format!(
+        "{}{}",
+        drain_insert_history_text(&mut rx),
+        active_blob(&chat)
+    );
+    assert!(
+        rendered.contains("FIRST_OUTPUT"),
+        "first exec output dropped: {rendered}"
+    );
+    assert!(
+        rendered.contains("SECOND_OUTPUT"),
+        "second exec output dropped: {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn unterminated_reasoning_after_completed_exec_remains_visible_as_status() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.show_welcome_banner = false;
+    chat.config.stream_reasoning_live = true;
+    handle_turn_started(&mut chat, "turn-1");
+    chat.bottom_pane.set_task_running(/*running*/ true);
+    let _ = drain_insert_history(&mut rx);
+
+    let item = begin_exec_with_source(
+        &mut chat,
+        "exec-1",
+        "go test ./internal/poolstore ./internal/tracker",
+        ExecCommandSource::Agent,
+    );
+    end_exec(
+        &mut chat,
+        item,
+        "ok  github.com/example/internal/poolstore  (cached)\n\
+         ok  github.com/example/internal/tracker  (cached)",
+        "",
+        /*exit_code*/ 0,
+    );
+
+    handle_agent_reasoning_delta(
+        &mut chat,
+        "Reviewing the cached test results before the final response",
+    );
+
+    let rendered = format!(
+        "{}{}",
+        drain_insert_history_text(&mut rx),
+        active_blob_or_empty(&chat)
+    );
+    assert!(
+        rendered.contains("internal/tracker"),
+        "completed command output disappeared: {rendered}"
+    );
+    let status = chat
+        .bottom_pane
+        .status_widget()
+        .expect("reasoning status should be visible");
+    assert_eq!(status.header(), "Thinking");
+    assert_eq!(
+        status.details(),
+        Some("Reviewing the cached test results before the final response")
+    );
+}
+
+#[tokio::test]
+async fn exec_output_reclaims_active_cell_when_a_non_exec_cell_holds_it() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.show_welcome_banner = false;
+    chat.config.stream_reasoning_live = true;
+    handle_turn_started(&mut chat, "turn-1");
+    chat.bottom_pane.set_task_running(/*running*/ true);
+
+    // Begin a command so it is tracked as running and owns the active exec cell.
+    let _item = begin_exec_with_source(&mut chat, "exec-1", "echo hi", ExecCommandSource::Agent);
+
+    // Force the pathological state the fix recovers from: a non-exec cell (here a
+    // live reasoning tail) has taken the active slot while the command still runs.
+    // The guards normally prevent reaching this state, so set it directly to prove
+    // the safety net re-homes the output instead of dropping (trimming) it.
+    chat.transcript.active_cell = Some(Box::new(history_cell::ReasoningStreamCell::live_preview(
+        Vec::new(),
+        Vec::new(),
+    )));
+    chat.transcript.active_cell_revision += 1;
+    let _ = drain_insert_history(&mut rx);
+
+    handle_exec_output_delta(&mut chat, "exec-1", "RECLAIMED_OUTPUT");
+
+    let rendered = format!(
+        "{}{}",
+        drain_insert_history_text(&mut rx),
+        active_blob(&chat)
+    );
+    assert!(
+        rendered.contains("RECLAIMED_OUTPUT"),
+        "exec output was not reclaimed: {rendered}"
+    );
 }
 
 #[tokio::test]
@@ -1265,7 +1651,7 @@ async fn live_reasoning_summary_drops_empty_parts_without_losing_content() {
         }
         other => panic!("expected InsertHistoryCell, got {other:?}"),
     };
-    assert_eq!(rendered, "• done\n");
+    assert_eq!(rendered, "┊ done\n");
 }
 
 #[tokio::test]
@@ -1330,6 +1716,45 @@ async fn replayed_stream_error_does_not_set_retry_status_or_status_indicator() {
     assert_eq!(chat.status_state.current_status.header, "Idle");
     assert!(chat.status_state.retry_status_header.is_none());
     assert!(chat.bottom_pane.status_widget().is_none());
+}
+
+#[tokio::test]
+async fn replayed_commentary_and_final_answer_are_both_visible() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    replay_agent_message_with_phase(
+        &mut chat,
+        "commentary-1",
+        "Historical progress update.",
+        Some(MessagePhase::Commentary),
+        ReplayKind::ThreadSnapshot,
+    );
+    replay_agent_message_with_phase(
+        &mut chat,
+        "final-1",
+        "Historical final answer.",
+        Some(MessagePhase::FinalAnswer),
+        ReplayKind::ThreadSnapshot,
+    );
+
+    let mut commentary_seen = false;
+    let mut final_seen = false;
+    while let Ok(event) = rx.try_recv() {
+        if let AppEvent::InsertHistoryCell(cell) = event {
+            let display = lines_to_single_string(&cell.display_lines(/*width*/ 80));
+            let transcript = lines_to_single_string(&cell.transcript_lines(/*width*/ 80));
+            if transcript.contains("Historical progress update.") {
+                commentary_seen = true;
+                assert!(display.contains("• Historical progress update."));
+            }
+            if display.contains("Historical final answer.") {
+                final_seen = true;
+            }
+        }
+    }
+
+    assert!(commentary_seen);
+    assert!(final_seen);
 }
 
 #[tokio::test]

@@ -1,340 +1,35 @@
-//! MCP tool-call, inventory, and output history cells.
+//! MCP inventory and status history cells.
 
 use super::*;
 
-#[derive(Debug)]
-struct McpImageOutputCell;
-
-impl HistoryCell for McpImageOutputCell {
-    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
-        vec!["tool result (image output)".into()]
-    }
-
-    fn raw_lines(&self) -> Vec<Line<'static>> {
-        vec![Line::from("tool result (image output)")]
-    }
-}
 fn mcp_auth_status_label(status: McpAuthStatus) -> &'static str {
     match status {
+        McpAuthStatus::Unknown => "Unknown",
         McpAuthStatus::Unsupported => "Unsupported",
         McpAuthStatus::NotLoggedIn => "Not logged in",
         McpAuthStatus::BearerToken => "Bearer token",
         McpAuthStatus::OAuth => "OAuth",
     }
 }
-#[derive(Debug)]
-pub(crate) struct McpToolCallCell {
-    call_id: String,
-    invocation: McpInvocation,
-    start_time: Instant,
-    duration: Option<Duration>,
-    result: Option<Result<codex_protocol::mcp::CallToolResult, String>>,
-    animations_enabled: bool,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct McpInvocation {
-    pub(crate) server: String,
-    pub(crate) tool: String,
-    pub(crate) arguments: Option<serde_json::Value>,
-}
-
-impl McpToolCallCell {
-    pub(crate) fn new(
-        call_id: String,
-        invocation: McpInvocation,
-        animations_enabled: bool,
-    ) -> Self {
-        Self {
-            call_id,
-            invocation,
-            start_time: Instant::now(),
-            duration: None,
-            result: None,
-            animations_enabled,
-        }
-    }
-
-    pub(crate) fn call_id(&self) -> &str {
-        &self.call_id
-    }
-
-    pub(crate) fn complete(
-        &mut self,
-        duration: Duration,
-        result: Result<codex_protocol::mcp::CallToolResult, String>,
-    ) -> Option<Box<dyn HistoryCell>> {
-        let image_cell = try_new_completed_mcp_tool_call_with_image_output(&result)
-            .map(|cell| Box::new(cell) as Box<dyn HistoryCell>);
-        self.duration = Some(duration);
-        self.result = Some(result);
-        image_cell
-    }
-
-    fn success(&self) -> Option<bool> {
-        match self.result.as_ref() {
-            Some(Ok(result)) => Some(!result.is_error.unwrap_or(false)),
-            Some(Err(_)) => Some(false),
-            None => None,
-        }
-    }
-
-    pub(crate) fn mark_failed(&mut self) {
-        let elapsed = self.start_time.elapsed();
-        self.duration = Some(elapsed);
-        self.result = Some(Err("interrupted".to_string()));
-    }
-
-    fn render_content_block(block: &serde_json::Value, width: usize) -> String {
-        let content = match serde_json::from_value::<rmcp::model::Content>(block.clone()) {
-            Ok(content) => content,
-            Err(_) => {
-                return format_and_truncate_tool_result(
-                    &block.to_string(),
-                    TOOL_CALL_MAX_LINES,
-                    width,
-                );
-            }
-        };
-
-        match content.raw {
-            rmcp::model::RawContent::Text(text) => {
-                format_and_truncate_tool_result(&text.text, TOOL_CALL_MAX_LINES, width)
-            }
-            rmcp::model::RawContent::Image(_) => "<image content>".to_string(),
-            rmcp::model::RawContent::Audio(_) => "<audio content>".to_string(),
-            rmcp::model::RawContent::Resource(resource) => {
-                let uri = match resource.resource {
-                    rmcp::model::ResourceContents::TextResourceContents { uri, .. } => uri,
-                    rmcp::model::ResourceContents::BlobResourceContents { uri, .. } => uri,
-                };
-                format!("embedded resource: {uri}")
-            }
-            rmcp::model::RawContent::ResourceLink(link) => format!("link: {}", link.uri),
-        }
-    }
-}
-
-impl HistoryCell for McpToolCallCell {
-    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        let status = self.success();
-        let bullet = match status {
-            Some(true) => "•".green().bold(),
-            Some(false) => "•".red().bold(),
-            None => activity_indicator(
-                Some(self.start_time),
-                MotionMode::from_animations_enabled(self.animations_enabled),
-                ReducedMotionIndicator::StaticBullet,
-            )
-            .unwrap_or_else(|| "•".dim()),
-        };
-        let header_text = if status.is_some() {
-            "Called"
-        } else {
-            "Calling"
-        };
-
-        let invocation_line = line_to_static(&format_mcp_invocation(self.invocation.clone()));
-        let mut compact_spans = vec![bullet.clone(), " ".into(), header_text.bold(), " ".into()];
-        let mut compact_header = Line::from(compact_spans.clone());
-        let reserved = compact_header.width();
-
-        let inline_invocation =
-            invocation_line.width() <= (width as usize).saturating_sub(reserved);
-
-        if inline_invocation {
-            compact_header.extend(invocation_line.spans.clone());
-            lines.push(compact_header);
-        } else {
-            compact_spans.pop(); // drop trailing space for standalone header
-            lines.push(Line::from(compact_spans));
-
-            let opts = RtOptions::new((width as usize).saturating_sub(4))
-                .initial_indent("".into())
-                .subsequent_indent("    ".into());
-            let wrapped = adaptive_wrap_line(&invocation_line, opts);
-            let body_lines: Vec<Line<'static>> = wrapped.iter().map(line_to_static).collect();
-            lines.extend(prefix_lines(body_lines, "  └ ".dim(), "    ".into()));
-        }
-
-        let mut detail_lines: Vec<Line<'static>> = Vec::new();
-        // Reserve four columns for the tree prefix ("  └ "/"    ") and ensure the wrapper still has at least one cell to work with.
-        let detail_wrap_width = (width as usize).saturating_sub(4).max(1);
-
-        if let Some(result) = &self.result {
-            match result {
-                Ok(codex_protocol::mcp::CallToolResult { content, .. }) => {
-                    if !content.is_empty() {
-                        for block in content {
-                            let text = Self::render_content_block(block, detail_wrap_width);
-                            for segment in text.split('\n') {
-                                let line = Line::from(segment.to_string().dim());
-                                let wrapped = adaptive_wrap_line(
-                                    &line,
-                                    RtOptions::new(detail_wrap_width)
-                                        .initial_indent("".into())
-                                        .subsequent_indent("    ".into()),
-                                );
-                                detail_lines.extend(wrapped.iter().map(line_to_static));
-                            }
-                        }
-                    }
-                }
-                Err(err) => {
-                    let err_text = format_and_truncate_tool_result(
-                        &format!("Error: {err}"),
-                        TOOL_CALL_MAX_LINES,
-                        width as usize,
-                    );
-                    let err_line = Line::from(err_text.dim());
-                    let wrapped = adaptive_wrap_line(
-                        &err_line,
-                        RtOptions::new(detail_wrap_width)
-                            .initial_indent("".into())
-                            .subsequent_indent("    ".into()),
-                    );
-                    detail_lines.extend(wrapped.iter().map(line_to_static));
-                }
-            }
-        }
-
-        if !detail_lines.is_empty() {
-            let initial_prefix: Span<'static> = if inline_invocation {
-                "  └ ".dim()
-            } else {
-                "    ".into()
-            };
-            lines.extend(prefix_lines(detail_lines, initial_prefix, "    ".into()));
-        }
-
-        lines
-    }
-
-    fn raw_lines(&self) -> Vec<Line<'static>> {
-        let header_text = if self.success().is_some() {
-            "Called"
-        } else {
-            "Calling"
-        };
-        let mut lines = vec![Line::from(format!(
-            "{header_text} {}",
-            format_mcp_invocation(self.invocation.clone())
-        ))];
-
-        if let Some(result) = &self.result {
-            match result {
-                Ok(codex_protocol::mcp::CallToolResult { content, .. }) => {
-                    for block in content {
-                        let text = Self::render_content_block(block, RAW_TOOL_OUTPUT_WIDTH);
-                        lines.extend(raw_lines_from_source(&text));
-                    }
-                }
-                Err(err) => lines.push(Line::from(format!("Error: {err}"))),
-            }
-        }
-
-        lines
-    }
-
-    fn transcript_animation_tick(&self) -> Option<u64> {
-        if !self.animations_enabled || self.result.is_some() {
-            return None;
-        }
-        Some((self.start_time.elapsed().as_millis() / 50) as u64)
-    }
-}
-
-pub(crate) fn new_active_mcp_tool_call(
-    call_id: String,
-    invocation: McpInvocation,
-    animations_enabled: bool,
-) -> McpToolCallCell {
-    McpToolCallCell::new(call_id, invocation, animations_enabled)
-}
-/// Returns an additional history cell if an MCP tool result includes a decodable image.
-///
-/// This intentionally returns at most one cell: the first image in `CallToolResult.content` that
-/// successfully base64-decodes and parses as an image. This is used as a lightweight “image output
-/// exists” affordance separate from the main MCP tool call cell.
-///
-/// Manual testing tip:
-/// - Run the rmcp stdio test server (`codex-rs/rmcp-client/src/bin/test_stdio_server.rs`) and
-///   register it as an MCP server via `codex mcp add`.
-/// - Use its `image_scenario` tool with cases like `text_then_image`,
-///   `invalid_base64_then_image`, or `invalid_image_bytes_then_image` to ensure this path triggers
-///   even when the first block is not a valid image.
-fn try_new_completed_mcp_tool_call_with_image_output(
-    result: &Result<codex_protocol::mcp::CallToolResult, String>,
-) -> Option<McpImageOutputCell> {
-    result
-        .as_ref()
-        .ok()?
-        .content
-        .iter()
-        .find_map(decode_mcp_image)?;
-
-    Some(McpImageOutputCell)
-}
-
-/// Decodes an MCP `ImageContent` block into an in-memory image.
-///
-/// Returns `None` when the block is not an image, when base64 decoding fails, when the format
-/// cannot be inferred, or when the image decoder rejects the bytes.
-fn decode_mcp_image(block: &serde_json::Value) -> Option<DynamicImage> {
-    let content = serde_json::from_value::<rmcp::model::Content>(block.clone()).ok()?;
-    let rmcp::model::RawContent::Image(image) = content.raw else {
-        return None;
-    };
-    let base64_data = if let Some(data_url) = image.data.strip_prefix("data:") {
-        data_url.split_once(',')?.1
-    } else {
-        image.data.as_str()
-    };
-    let raw_data = base64::engine::general_purpose::STANDARD
-        .decode(base64_data)
-        .map_err(|e| {
-            error!("Failed to decode image data: {e}");
-            e
-        })
-        .ok()?;
-    let reader = ImageReader::new(Cursor::new(raw_data))
-        .with_guessed_format()
-        .map_err(|e| {
-            error!("Failed to guess image format: {e}");
-            e
-        })
-        .ok()?;
-
-    reader
-        .decode()
-        .map_err(|e| {
-            error!("Image decoding failed: {e}");
-            e
-        })
-        .ok()
-}
 /// Render a summary of configured MCP servers from the current `Config`.
-pub(crate) fn empty_mcp_output() -> PlainHistoryCell {
-    let lines: Vec<Line<'static>> = vec![
-        "/mcp".magenta().into(),
-        "".into(),
-        vec!["🔌  ".into(), "MCP Tools".bold()].into(),
-        "".into(),
-        "  • No MCP servers configured.".italic().into(),
-        Line::from(vec![
-            "    See the ".into(),
-            crate::terminal_hyperlinks::osc8_hyperlink(
-                "https://developers.openai.com/codex/mcp",
-                "MCP docs",
-            )
-            .underlined(),
-            " to configure them.".into(),
-        ])
-        .style(Style::default().add_modifier(Modifier::DIM)),
+pub(crate) fn empty_mcp_output() -> WebHyperlinkHistoryCell {
+    let mut docs_line = HyperlinkLine::new(Line::from("    See the "));
+    docs_line.push_span(
+        "MCP docs".underlined(),
+        Some("https://developers.openai.com/codex/mcp"),
+    );
+    docs_line.push_span(" to configure them.".into(), /*destination*/ None);
+
+    let lines = vec![
+        HyperlinkLine::new("/mcp".magenta().into()),
+        HyperlinkLine::from(""),
+        HyperlinkLine::new(vec!["🔌  ".into(), "MCP Tools".bold()].into()),
+        HyperlinkLine::from(""),
+        HyperlinkLine::new("  • No MCP servers configured.".italic().into()),
+        docs_line.style(Style::default().add_modifier(Modifier::DIM)),
     ];
 
-    PlainHistoryCell::new(lines)
+    WebHyperlinkHistoryCell::new_hyperlink_lines(lines)
 }
 
 #[cfg(test)]
@@ -545,6 +240,7 @@ pub(crate) fn new_mcp_tools_output_from_statuses(
 
         lines.push(header.into());
         let auth_status = match status.auth_status {
+            codex_app_server_protocol::McpAuthStatus::Unknown => McpAuthStatus::Unknown,
             codex_app_server_protocol::McpAuthStatus::Unsupported => McpAuthStatus::Unsupported,
             codex_app_server_protocol::McpAuthStatus::NotLoggedIn => McpAuthStatus::NotLoggedIn,
             codex_app_server_protocol::McpAuthStatus::BearerToken => McpAuthStatus::BearerToken,
@@ -668,24 +364,4 @@ impl HistoryCell for McpInventoryLoadingCell {
 /// Convenience constructor for [`McpInventoryLoadingCell`].
 pub(crate) fn new_mcp_inventory_loading(animations_enabled: bool) -> McpInventoryLoadingCell {
     McpInventoryLoadingCell::new(animations_enabled)
-}
-fn format_mcp_invocation<'a>(invocation: McpInvocation) -> Line<'a> {
-    let args_str = invocation
-        .arguments
-        .as_ref()
-        .map(|v: &serde_json::Value| {
-            // Use compact form to keep things short but readable.
-            serde_json::to_string(v).unwrap_or_else(|_| v.to_string())
-        })
-        .unwrap_or_default();
-
-    let invocation_spans = vec![
-        invocation.server.clone().cyan(),
-        ".".into(),
-        invocation.tool.cyan(),
-        "(".into(),
-        args_str.dim(),
-        ")".into(),
-    ];
-    invocation_spans.into()
 }

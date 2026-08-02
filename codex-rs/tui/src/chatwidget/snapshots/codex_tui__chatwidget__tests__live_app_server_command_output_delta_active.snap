@@ -3,5 +3,5 @@ source: tui/src/chatwidget/tests/app_server.rs
 expression: active
 ---
 • Running printf 'stdout\nstderr\n'
-  └ stdout
-    stderr
+  │ stdout
+  └ stderr

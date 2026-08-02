@@ -45,26 +45,26 @@ impl ChatWidget {
     }
 
     pub(super) fn on_file_change_completed(&mut self, item: ThreadItem) {
-        let item2 = item.clone();
         self.defer_or_handle(
-            |q| q.push_item_completed(item),
-            |s| s.handle_file_change_completed_now(item2),
+            item,
+            InterruptManager::push_item_completed,
+            Self::handle_file_change_completed_now,
         );
     }
 
     pub(super) fn on_mcp_tool_call_started(&mut self, item: ThreadItem) {
-        let item2 = item.clone();
         self.defer_or_handle(
-            |q| q.push_item_started(item),
-            |s| s.handle_mcp_tool_call_started_now(item2),
+            item,
+            InterruptManager::push_item_started,
+            Self::handle_mcp_tool_call_started_now,
         );
     }
 
     pub(super) fn on_mcp_tool_call_completed(&mut self, item: ThreadItem) {
-        let item2 = item.clone();
         self.defer_or_handle(
-            |q| q.push_item_completed(item),
-            |s| s.handle_mcp_tool_call_completed_now(item2),
+            item,
+            InterruptManager::push_item_completed,
+            Self::handle_mcp_tool_call_completed_now,
         );
     }
 
@@ -176,16 +176,27 @@ impl ChatWidget {
             return;
         };
         self.flush_answer_stream_with_separator();
-        self.flush_active_cell();
-        self.transcript.active_cell = Some(Box::new(history_cell::new_active_mcp_tool_call(
-            id,
-            McpInvocation {
-                server,
-                tool,
-                arguments: Some(arguments),
-            },
-            self.config.animations,
-        )));
+        let invocation = McpInvocation {
+            server,
+            tool,
+            arguments: Some(arguments),
+        };
+        let grouped = self
+            .transcript
+            .active_cell
+            .as_mut()
+            .and_then(|cell| cell.as_any_mut().downcast_mut::<McpToolCallCell>())
+            .is_some_and(|cell| {
+                cell.tracks_call(&id) || cell.add_call(id.clone(), invocation.clone())
+            });
+        if !grouped {
+            self.flush_active_cell();
+            self.transcript.active_cell = Some(Box::new(history_cell::new_active_mcp_tool_call(
+                id,
+                invocation,
+                self.config.animations,
+            )));
+        }
         self.bump_active_cell_revision();
         self.request_redraw();
     }
@@ -197,6 +208,7 @@ impl ChatWidget {
             id,
             server,
             tool,
+            status,
             arguments,
             result,
             error,
@@ -219,34 +231,68 @@ impl ChatWidget {
                 Ok(codex_protocol::mcp::CallToolResult {
                     content: result.content,
                     structured_content: result.structured_content,
-                    is_error: Some(false),
+                    is_error: Some(matches!(
+                        status,
+                        codex_app_server_protocol::McpToolCallStatus::Failed
+                    )),
                     meta: None,
                 })
             }
             (None, None) => Err("MCP tool call completed without a result".to_string()),
         };
 
-        let extra_cell = match self
+        let mut pending_result = Some(result);
+        let mut extra_cell = None;
+        let mut completed_active_cell = false;
+        let mut has_hidden_output = false;
+        if let Some(cell) = self
             .transcript
             .active_cell
             .as_mut()
             .and_then(|cell| cell.as_any_mut().downcast_mut::<McpToolCallCell>())
         {
-            Some(cell) if cell.call_id() == id => cell.complete(duration, result),
-            _ => {
-                self.flush_active_cell();
-                let mut cell =
-                    history_cell::new_active_mcp_tool_call(id, invocation, self.config.animations);
-                let extra_cell = cell.complete(duration, result);
-                self.transcript.active_cell = Some(Box::new(cell));
-                extra_cell
+            let is_tracked = cell.tracks_call(&id) || cell.add_call(id.clone(), invocation.clone());
+            if is_tracked {
+                let result = match pending_result.take() {
+                    Some(result) => result,
+                    None => {
+                        tracing::error!(call_id = %id, "MCP result was already consumed");
+                        Err("MCP result was already consumed".to_string())
+                    }
+                };
+                extra_cell = cell.complete_call(&id, duration, result);
+                has_hidden_output = cell.has_hidden_transcript_detail();
+                completed_active_cell = true;
             }
-        };
+        }
 
-        self.flush_active_cell();
+        if !completed_active_cell {
+            self.flush_active_cell();
+            let mut cell =
+                history_cell::new_active_mcp_tool_call(id, invocation, self.config.animations);
+            let result = match pending_result {
+                Some(result) => result,
+                None => {
+                    tracing::error!("MCP result was consumed before creating its history cell");
+                    Err("MCP result was consumed before creating its history cell".to_string())
+                }
+            };
+            extra_cell = cell.complete(duration, result);
+            has_hidden_output = cell.has_hidden_transcript_detail();
+            self.transcript.active_cell = Some(Box::new(cell));
+        }
+        if has_hidden_output {
+            self.mark_hidden_transcript_detail();
+        }
+        if extra_cell.is_some() {
+            self.flush_active_cell();
+        } else {
+            self.bump_active_cell_revision();
+        }
         if let Some(extra) = extra_cell {
             self.add_boxed_history(extra);
         }
+        self.request_redraw();
         // Mark that actual work was done (MCP tool call)
         self.transcript.had_work_activity = true;
     }

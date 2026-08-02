@@ -23,9 +23,10 @@
 //! `update_task_running_state`.
 //!
 //! For preamble-capable models, assistant output may include commentary before
-//! the final answer. During streaming we hide the status row to avoid duplicate
-//! progress indicators; once commentary completes and stream queues drain, we
-//! re-show it so users still see turn-in-progress state between output bursts.
+//! the final answer. Its latest lines roll through the live status row, then the
+//! completed commentary is committed to primary history so tool activity keeps
+//! the explanation that preceded it. The final answer still owns the primary
+//! assistant response stream.
 //!
 //! Slash-command parsing lives in the bottom-pane composer, but slash-command acceptance lives
 //! here. That split lets the composer stage a recall entry before clearing input while this module
@@ -102,7 +103,7 @@ use codex_app_server_protocol::RequestId as AppServerRequestId;
 use codex_app_server_protocol::ReviewTarget;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
-use codex_app_server_protocol::SkillMetadata as ProtocolSkillMetadata;
+use codex_app_server_protocol::SkillMetadata;
 use codex_app_server_protocol::SkillsListResponse;
 use codex_app_server_protocol::ThreadGoal as AppThreadGoal;
 use codex_app_server_protocol::ThreadGoalStatus as AppThreadGoalStatus;
@@ -123,7 +124,6 @@ use codex_config::types::ApprovalsReviewer;
 use codex_config::types::Notifications;
 use codex_config::types::WindowsSandboxModeToml;
 use codex_connectors::AppInfo;
-use codex_core_skills::model::SkillMetadata;
 use codex_features::FEATURES;
 use codex_features::Feature;
 #[cfg(test)]
@@ -241,14 +241,24 @@ fn queued_message_edit_binding_for_terminal(terminal_info: TerminalInfo) -> KeyB
 }
 
 fn queued_message_edit_hint_binding(
-    bindings: &[KeyBinding],
+    keymap: &RuntimeKeymap,
     terminal_info: TerminalInfo,
-) -> Option<KeyBinding> {
+) -> Option<crate::key_hint::ShortcutHint> {
+    let configured = keymap.primary_hint(crate::keymap::KeymapContext::Chat, "edit_queued_message");
+    if matches!(
+        configured,
+        Some(crate::key_hint::ShortcutHint::Chord { .. })
+    ) {
+        return configured;
+    }
+
     let terminal_binding = queued_message_edit_binding_for_terminal(terminal_info);
-    bindings
+    keymap
+        .chat
+        .edit_queued_message
         .contains(&terminal_binding)
-        .then_some(terminal_binding)
-        .or_else(|| bindings.first().copied())
+        .then_some(crate::key_hint::ShortcutHint::Single(terminal_binding))
+        .or(configured)
 }
 
 fn normalize_thread_name(name: &str) -> Option<String> {
@@ -272,6 +282,7 @@ use crate::bottom_pane::BottomPaneParams;
 use crate::bottom_pane::CancellationEvent;
 use crate::bottom_pane::CollaborationModeIndicator;
 use crate::bottom_pane::ColumnWidthMode;
+use crate::bottom_pane::ComposerDraftSnapshot;
 use crate::bottom_pane::DOUBLE_PRESS_QUIT_SHORTCUT_ENABLED;
 use crate::bottom_pane::ExecApprovalRequest;
 use crate::bottom_pane::ExperimentalFeatureItem;
@@ -296,6 +307,7 @@ use crate::clipboard_paste::paste_image_to_temp_png;
 use crate::collaboration_modes;
 use crate::diff_render::display_path_for;
 use crate::exec_cell::CommandOutput;
+use crate::exec_cell::CommandPresentation;
 use crate::exec_cell::ExecCell;
 use crate::exec_cell::new_active_exec_command;
 use crate::exec_command::split_command_string;
@@ -308,6 +320,7 @@ use crate::history_cell::HookCell;
 use crate::history_cell::McpInvocation;
 use crate::history_cell::McpToolCallCell;
 use crate::history_cell::PlainHistoryCell;
+use crate::history_cell::ReasoningSummaryCell;
 use crate::history_cell::WebSearchCell;
 use crate::key_hint;
 use crate::key_hint::KeyBinding;
@@ -327,6 +340,7 @@ use crate::status_indicator_widget::STATUS_DETAILS_DEFAULT_MAX_LINES;
 use crate::status_indicator_widget::StatusDetailsCapitalization;
 use crate::text_formatting::truncate_text;
 use crate::tui::FrameRequester;
+mod command_display;
 mod command_lifecycle;
 mod connectors;
 mod constructor;
@@ -424,13 +438,17 @@ use self::transcript::TranscriptState;
 mod turn_lifecycle;
 mod turn_runtime;
 use self::turn_lifecycle::TurnLifecycleState;
+mod undo_send;
 mod usage;
+use self::undo_send::UndoSendState;
 mod user_messages;
 use self::user_messages::PendingSteer;
 use self::user_messages::PendingSteerCompareKey;
 use self::user_messages::QueueDrain;
 use self::user_messages::QueuedUserMessage;
 use self::user_messages::ShellEscapePolicy;
+use self::user_messages::StagedInputRoute;
+use self::user_messages::StagedUserMessage;
 use self::user_messages::ThreadComposerState;
 pub(crate) use self::user_messages::ThreadInputState;
 pub(crate) use self::user_messages::ThreadInputStateRestoreMode;
@@ -456,6 +474,7 @@ use crate::streaming::chunking::AdaptiveChunkingPolicy;
 use crate::streaming::commit_tick::CommitTickScope;
 use crate::streaming::commit_tick::run_commit_tick;
 use crate::streaming::controller::PlanStreamController;
+use crate::streaming::controller::ReasoningStreamController;
 use crate::streaming::controller::StreamController;
 use crate::workspace_command::WorkspaceCommandRunner;
 
@@ -557,6 +576,7 @@ pub(crate) struct ChatWidget {
     pub(crate) remote_connection: Option<RemoteConnectionStatus>,
     token_info: Option<TokenUsageInfo>,
     rate_limit_snapshots_by_limit_id: BTreeMap<String, RateLimitSnapshotDisplay>,
+    rate_limit_full_refresh_pending: bool,
     refreshing_status_outputs: Vec<(u64, StatusHistoryHandle)>,
     next_status_refresh_request_id: u64,
     refreshing_token_activity_output: Option<tokens::PendingTokenActivityOutput>,
@@ -582,6 +602,10 @@ pub(crate) struct ChatWidget {
     stream_controller: Option<StreamController>,
     // Stream lifecycle controller for proposed plan output.
     plan_stream_controller: Option<PlanStreamController>,
+    // Stream lifecycle controller for live reasoning summaries. Like the agent
+    // and plan controllers, it commits completed reasoning lines to scrollback
+    // while keeping only the in-progress tail in the active cell.
+    reasoning_stream_controller: Option<ReasoningStreamController>,
     pending_stream_consolidations: usize,
     /// Holds the platform clipboard lease so copied text remains available while supported.
     clipboard_lease: Option<crate::clipboard_copy::ClipboardLease>,
@@ -590,7 +614,7 @@ pub(crate) struct ChatWidget {
     collab_agent_metadata: HashMap<ThreadId, AgentMetadata>,
     pending_collab_spawn_requests: HashMap<String, multi_agents::SpawnRequestSummary>,
     suppressed_exec_calls: HashSet<String>,
-    skills_all: Vec<ProtocolSkillMetadata>,
+    skills_all: Vec<SkillMetadata>,
     skills_initial_state: Option<HashMap<AbsolutePathBuf, bool>>,
     last_unified_wait: Option<UnifiedExecWaitState>,
     unified_exec_wait_streak: Option<UnifiedExecWaitStreak>,
@@ -630,6 +654,14 @@ pub(crate) struct ChatWidget {
     interrupts: InterruptManager,
     // Accumulates the current reasoning block text to extract a header
     reasoning_buffer: String,
+    // Accumulates full reasoning content for transcript-only recording
+    full_reasoning_buffer: String,
+    // Tracks whether the active cell is rendering live reasoning content.
+    live_reasoning_active: bool,
+    // When set, `pre_draw_tick` recomputes the status surfaces at or after this
+    // instant so the rate-limit countdown stays live while the UI is otherwise
+    // idle. Cleared once no visible window still has a reset timestamp.
+    rate_limit_countdown_refresh_due: Option<Instant>,
     // Caches the first completed bold header so later deltas do not rescan the whole block.
     reasoning_header: Option<String>,
     // Preserves reasoning-summary part boundaries for transcript-only recording.
@@ -638,6 +670,8 @@ pub(crate) struct ChatWidget {
     review: ReviewState,
     // Active hook runs render in a dedicated live cell so they can run alongside tools.
     active_hook_cell: Option<HookCell>,
+    // Reused for built-in pet CDN requests so redirects remain route-aware.
+    pub(crate) pet_http_client: codex_http_client::RouteAwareClientPool,
     // Ambient companion rendered over the transcript area, never inside the footer rows.
     ambient_pet: Option<crate::pets::AmbientPet>,
     pet_picker_preview_state: crate::pets::PetPickerPreviewState,
@@ -674,13 +708,14 @@ pub(crate) struct ChatWidget {
     // order.
     suppress_initial_user_message_submit: bool,
     input_queue: InputQueueState,
+    undo_send: UndoSendState,
     safety_buffering_prompt: Option<UserMessage>,
     /// Main chat-surface bindings resolved from `tui.keymap.chat`.
     chat_keymap: ChatKeymap,
     /// Keybinding to show for popping the most-recently queued message back
     /// into the composer. This may differ from the first configured binding
     /// when the default set includes a terminal-specific fallback.
-    queued_message_edit_hint_binding: Option<KeyBinding>,
+    queued_message_edit_hint_binding: Option<crate::key_hint::ShortcutHint>,
     // Pending notification to show when unfocused on next Draw
     pending_notification: Option<Notification>,
     /// When `Some`, the user has pressed a quit shortcut and the second press
@@ -1137,14 +1172,25 @@ impl ChatWidget {
                 self.bottom_pane
                     .set_context_window(/*percent*/ None, /*used_tokens*/ None);
                 self.token_info = None;
+                if self.turn_lifecycle.agent_turn_running {
+                    self.bottom_pane.begin_turn_token_meter(None);
+                }
             }
         }
+        // The configurable status line derives several items (context
+        // remaining/used, context window size, used/input/output tokens) from
+        // `token_info`. Refresh the surfaces here so those values track token
+        // updates instead of only refreshing when some unrelated event happens
+        // to trigger a refresh.
+        self.refresh_status_surfaces();
     }
 
     fn apply_token_info(&mut self, info: TokenUsageInfo) {
         let percent = self.context_remaining_percent(&info);
         let used_tokens = self.context_used_tokens(&info, percent.is_some());
         self.bottom_pane.set_context_window(percent, used_tokens);
+        self.bottom_pane
+            .update_turn_token_meter(&info.total_token_usage, &info.last_token_usage);
         self.token_info = Some(info);
     }
 
@@ -1173,6 +1219,7 @@ impl ChatWidget {
                     self.token_info = None;
                 }
             }
+            self.refresh_status_surfaces();
         }
     }
 
@@ -1181,8 +1228,10 @@ impl ChatWidget {
     }
 
     pub(crate) fn pre_draw_tick(&mut self) {
+        self.tick_undo_send(Instant::now());
         self.update_due_hook_visibility();
         self.schedule_hook_timer_if_needed();
+        self.tick_rate_limit_countdown();
         self.bottom_pane.pre_draw_tick();
         if let Some(pet) = self.ambient_pet.as_ref() {
             pet.schedule_next_frame();
@@ -1201,10 +1250,32 @@ impl ChatWidget {
     }
 
     fn flush_active_cell(&mut self) {
+        if self.live_reasoning_active {
+            // Commit buffered reasoning to history before clearing the live cell so
+            // content the user already saw is not silently dropped from the transcript.
+            self.commit_pending_reasoning_to_history();
+            // clear_live_reasoning only nulls active_cell when it holds a ReasoningSummaryCell.
+            // If the invariant was violated and a non-reasoning cell is present, it is preserved
+            // in active_cell with live_reasoning_active set to false. Flush it below so it is
+            // not silently overwritten by the next active_cell assignment.
+            self.clear_live_reasoning();
+            if let Some(active) = self.transcript.active_cell.take() {
+                self.app_event_tx.send(AppEvent::InsertHistoryCell(active));
+            }
+            return;
+        }
         if let Some(active) = self.transcript.active_cell.take() {
-            self.transcript.needs_final_message_separator = true;
             self.app_event_tx.send(AppEvent::InsertHistoryCell(active));
             self.request_pending_usage_output_insertion();
+        }
+        // If a non-reasoning cell was just flushed (e.g., a tool spinner completing)
+        // and reasoning content accumulated in the buffers while it was active,
+        // recreate the live reasoning cell so that content becomes visible again.
+        // Guard on agent_turn_running: during teardown the turn is no longer active,
+        // so recreating here would leave an orphaned cell in active_cell that never
+        // gets committed to history.
+        if self.config.stream_reasoning_live && self.turn_lifecycle.agent_turn_running {
+            self.update_live_reasoning("");
         }
     }
 
@@ -1224,10 +1295,17 @@ impl ChatWidget {
 
         if !keep_placeholder_header_active && !cell.display_lines(u16::MAX).is_empty() {
             // Only break exec grouping if the cell renders visible lines.
-            if !self.has_active_stream_tail() {
+            //
+            // Guard on the controller, not on a materialized tail cell: a stream's live
+            // tail is empty whenever all rendered lines are queued for commit (the common
+            // case between deltas). Checking `has_active_stream_tail()` here would then see
+            // "no tail" during a commit tick and flush — which finalizes the in-progress
+            // reasoning/agent/plan stream mid-commit, reordering its lines (the freshly
+            // committed line is sent after the finalized remainder) and tearing down the
+            // controller. `has_active_stream_controller()` stays true across that window.
+            if !self.has_active_stream_controller() {
                 self.flush_active_cell();
             }
-            self.transcript.needs_final_message_separator = true;
         }
         self.app_event_tx.send(AppEvent::InsertHistoryCell(cell));
     }
@@ -1315,9 +1393,6 @@ impl ChatWidget {
                 display.remote_image_urls,
             ));
         }
-
-        // User messages reset separator state so the next agent response doesn't add a stray break.
-        self.transcript.needs_final_message_separator = false;
     }
 
     /// Exit the UI immediately without waiting for shutdown.
@@ -1330,7 +1405,7 @@ impl ChatWidget {
 
     /// Request a shutdown-first quit.
     ///
-    /// This is used for explicit quit commands (`/quit`, `/exit`, `/logout`) and for
+    /// This is used for explicit quit commands (`/quit`, `/exit`) and for
     /// the double-press Ctrl+C/Ctrl+D quit shortcut.
     fn request_quit_without_confirmation(&self) {
         self.app_event_tx
@@ -1594,6 +1669,9 @@ impl ChatWidget {
         if let Some(controller) = self.plan_stream_controller.as_mut() {
             controller.set_render_mode(render_mode);
         }
+        if let Some(controller) = self.reasoning_stream_controller.as_mut() {
+            controller.set_render_mode(render_mode);
+        }
         self.refresh_status_surfaces();
     }
 
@@ -1633,6 +1711,9 @@ impl ChatWidget {
         }
         if let Some(controller) = self.plan_stream_controller.as_mut() {
             controller.set_width(plan_stream_width);
+        }
+        if let Some(controller) = self.reasoning_stream_controller.as_mut() {
+            controller.set_width(stream_width);
         }
         self.sync_active_stream_tail();
         if !had_rendered_width {
@@ -1771,11 +1852,22 @@ impl ChatWidget {
     }
 
     pub(crate) fn prepare_local_op_submission(&mut self, op: &AppCommand) {
+        if matches!(
+            op,
+            AppCommand::Compact
+                | AppCommand::Review { .. }
+                | AppCommand::RunUserShellCommand { .. }
+        ) {
+            self.input_queue.user_turn_pending_start = true;
+        }
         if matches!(op, AppCommand::Interrupt) && self.turn_lifecycle.agent_turn_running {
             if let Some(controller) = self.stream_controller.as_mut() {
                 controller.clear_queue();
             }
             if let Some(controller) = self.plan_stream_controller.as_mut() {
+                controller.clear_queue();
+            }
+            if let Some(controller) = self.reasoning_stream_controller.as_mut() {
                 controller.clear_queue();
             }
             self.clear_active_stream_tail();
@@ -1932,6 +2024,9 @@ impl ChatWidget {
 
     pub(crate) fn clear_token_usage(&mut self) {
         self.token_info = None;
+        if self.turn_lifecycle.agent_turn_running {
+            self.bottom_pane.begin_turn_token_meter(None);
+        }
     }
 }
 

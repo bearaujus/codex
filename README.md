@@ -1,153 +1,148 @@
-> **This is a patched fork of [openai/codex](https://github.com/openai/codex).** The sections below document the fork workflow and build system. The original upstream README follows.
+> **This is a patched fork of [openai/codex](https://github.com/openai/codex).**
+> The build, installation, authentication, and upstream-sync instructions below
+> describe this fork.
 
----
+# Codex CLI
 
-## Fork Layout
+Codex CLI is a coding agent from OpenAI that runs locally on your computer.
+This fork keeps the upstream Rust product while carrying custom account-pool,
+runtime, and Windows development changes on `main`.
+
+## Branch layout
 
 | Branch | Purpose |
-|---|---|
-| `main` | Your working branch — custom patches on top of upstream |
-| `upstream` | Mirrors `openai/codex` main, no custom commits |
+| --- | --- |
+| `main` | Fork development and custom patches, with upstream changes merged in |
+| `origin/upstream` | Mirror of `openai/codex` `main`, without fork-only commits |
 
-## What this fork removes
+## Fork differences
 
-This tree intentionally drops several upstream packaging surfaces:
+This tree intentionally differs from the upstream repository:
 
-- No npm / pnpm workspace (`package.json`, `codex-cli/`, root JS package)
-- No TypeScript or Python SDK packages under `sdk/`
-- No upstream root `justfile` / Bazel CI workspace; use the repo-root `Makefile` and `scripts/*.ps1` instead
+- ChatGPT user authentication is account-pool only. API key, personal access
+  token, Bedrock key, and top-level CLI login surfaces are not supported.
+- The npm/pnpm workspace and root JavaScript package are removed.
+- The TypeScript and Python SDK packages under `sdk/` are removed.
+- The upstream root `justfile` and Bazel workspace are removed. Use the
+  repository-root `Makefile` and `scripts/*.ps1`.
 
-Install and run Codex from this fork with `make build`, `make run`, or `make install` (see below). Upstream `npm install -g @openai/codex` instructions in the preserved README sections do not apply to this repository.
+Official OpenAI installers, Homebrew, npm, and upstream release binaries install
+the upstream build; they do not contain this fork's changes.
 
-## Prerequisites (Windows)
+## Build and run this fork
 
-- [Rust toolchain](https://rustup.rs/) (`rustup`, `cargo`)
-- `make` (via [Chocolatey](https://chocolatey.org/): `choco install make`, or [GnuWin32](https://gnuwin32.sourceforge.net/packages/make.htm))
-- PowerShell 5.1+
+The repository automation currently targets native Windows.
 
-## Make Commands
+Prerequisites:
+
+- Git
+- [Rustup](https://rustup.rs/) and Cargo
+- Visual Studio 2022 Build Tools with the C++ workload and Windows SDK
+- GNU Make
+- PowerShell 5.1 or newer
+
+```powershell
+git clone https://github.com/bearaujus/codex.git
+Set-Location codex
+make build
+.\bin\codex.exe
+```
+
+Use `make run` for the local edit/run loop or `make install` to install
+`codex.exe` together with `codex-code-mode-host.exe` under
+`%LOCALAPPDATA%\codex\bin` and put that directory first on your user `PATH`.
+See [Installing and building](docs/install.md) for setup and verification
+details.
+
+## Authentication
+
+Provision one or more ChatGPT accounts through a client that drives the
+app-server browser or device-code login flow before running the CLI. The CLI
+does not expose a top-level user login command.
+
+The CLI and the companion `codex-accounts` service share
+`<CODEX_HOME>/account-pool/accounts.sqlite`. Codex selects an eligible account
+at turn boundaries and can fail over after authentication failures or Codex
+rate limits.
+
+See [Authentication in this fork](docs/authentication.md) for the supported
+flows, account-pool behavior, and the distinction between user authentication,
+MCP OAuth, and infrastructure identity.
+
+## Development commands
 
 | Command | Description |
-|---|---|
-| `make build` | Quick dev build into `./bin` (small profile, fast compile) |
-| `make run` | Build + run the local binary |
-| `make install` | Build + install to `%LOCALAPPDATA%\codex\bin` (adds to PATH) |
-| `make check` | Cargo check only — fastest inner loop, no binary output |
-| `make lint` | Clippy with deny lints — run before committing |
+| --- | --- |
+| `make build` | Build the fork CLI and prepare its verified public Code Mode host under `bin\` |
+| `make run` | Build and run the repository-local binary |
+| `make install` | Build once, then install the CLI and Code Mode host to the user `PATH` |
+| `make check` | Run a fast Cargo check |
 | `make fmt` | Format the Rust workspace |
 | `make test` | Run tests with nextest |
-| `make clean` | `cargo clean` (whole `target/`, all profiles) + remove the repo-local binary |
+| `make lint` | Run Clippy with repository deny lints |
+| `make clean` | Remove Cargo targets and the repository-local executable bundle |
 
-All commands accept optional `p=<crate>` and `args=<flags>` to narrow scope, e.g.:
+The `fmt`, `check`, `test`, and `lint` targets accept `p=<crate>` and
+`args="<flags>"`:
 
-```
+```powershell
+make fmt p=codex-login args="--check"
 make check p=codex-login
 make test p=codex-login args="--no-run"
 make lint p=codex-tui args="--features foo"
 ```
 
-## Daily Workflow
+For Rust changes, format first, run checks and scoped tests, then run the scoped
+lint last.
 
-### Sync upstream into the `upstream` branch
+## Merge upstream into `main`
 
+Configure the OpenAI repository as the `upstream` remote once:
+
+```powershell
+git remote add upstream https://github.com/openai/codex.git
 ```
+
+Refresh the fork's mirror branch without adding fork commits to it:
+
+```powershell
 git fetch upstream
-git checkout upstream
-git merge upstream/main --ff-only
-git push origin upstream
+git push origin refs/remotes/upstream/main:refs/heads/upstream
+git fetch origin
 ```
 
-### Rebase your work onto the latest upstream
+Merge the mirrored branch into `main` so both histories remain visible:
 
-```
-git checkout main
-git rebase origin/upstream
-git push --force-with-lease origin main
-```
-
-### Dev loop
-
-```
-make check          # fast compile feedback
-make lint           # before committing
-make test           # run test suite
-make build          # build local binary
-make run            # build + run
-make install        # install to PATH
+```powershell
+git switch main
+git merge --no-ff origin/upstream
 ```
 
----
+Resolve conflicts in favor of the fork's account-pool and root Makefile
+architecture while retaining compatible upstream features. Run verification
+appropriate to the affected crates, with lint last, before publishing:
 
-<p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
-<p align="center">
-  <img src="https://github.com/openai/codex/blob/main/.github/codex-cli-splash.png" alt="Codex CLI splash" width="80%" />
-</p>
-</br>
-If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="https://developers.openai.com/codex/ide">install in your IDE.</a>
-</br>If you want the desktop app experience, run <code>codex app</code> or visit <a href="https://chatgpt.com/codex?app-landing-page=true">the Codex App page</a>.
-</br>If you are looking for the <em>cloud-based agent</em> from OpenAI, <strong>Codex Web</strong>, go to <a href="https://chatgpt.com/codex">chatgpt.com/codex</a>.</p>
-
----
-
-## Quickstart
-
-### Installing and running Codex CLI
-
-Run the following on Mac or Linux to install Codex CLI:
-
-```shell
-curl -fsSL https://chatgpt.com/codex/install.sh | sh
+```powershell
+make fmt
+make check p=codex-tui
+make test p=codex-tui
+make lint p=codex-tui
+git push origin main
 ```
 
-Run the following on Windows to install Codex CLI:
+Replace `codex-tui` with each affected crate, or use the workspace-wide target
+when the change genuinely requires it.
 
-```shell
-powershell -ExecutionPolicy ByPass -c "irm https://chatgpt.com/codex/install.ps1 | iex"
-```
+## Documentation
 
-Codex CLI can also be installed via the following package managers:
+- [Getting started](docs/getting-started.md)
+- [Installing and building](docs/install.md)
+- [Authentication](docs/authentication.md)
+- [Configuration](docs/config.md)
+- [App-server API](codex-rs/app-server/README.md)
+- [Official Codex documentation](https://developers.openai.com/codex)
 
-```shell
-# Install using npm
-npm install -g @openai/codex
-```
-
-```shell
-# Install using Homebrew
-brew install --cask codex
-```
-
-Then simply run `codex` to get started.
-
-<details>
-<summary>You can also go to the <a href="https://github.com/openai/codex/releases/latest">latest GitHub Release</a> and download the appropriate binary for your platform.</summary>
-
-Each GitHub Release contains many executables, but in practice, you likely want one of these:
-
-- macOS
-  - Apple Silicon/arm64: `codex-aarch64-apple-darwin.tar.gz`
-  - x86_64 (older Mac hardware): `codex-x86_64-apple-darwin.tar.gz`
-- Linux
-  - x86_64: `codex-x86_64-unknown-linux-musl.tar.gz`
-  - arm64: `codex-aarch64-unknown-linux-musl.tar.gz`
-
-Each archive contains a single entry with the platform baked into the name (e.g., `codex-x86_64-unknown-linux-musl`), so you likely want to rename it to `codex` after extracting it.
-
-</details>
-
-### Using Codex with your ChatGPT plan
-
-This fork authenticates only through the ChatGPT account pool. Configure ChatGPT
-accounts outside the CLI (for example via app-server OAuth or device-code login)
-before running `codex`, then use your ChatGPT plan as usual. [Learn more about what's included in your ChatGPT plan](https://help.openai.com/en/articles/11369540-codex-in-chatgpt).
-
-API key, personal access token, and Bedrock API key sign-in are not supported.
-
-## Docs
-
-- [**Codex Documentation**](https://developers.openai.com/codex)
-- [**Contributing**](./docs/contributing.md)
-- [**Installing & building**](./docs/install.md)
-- [**Open source fund**](./docs/open-source-fund.md)
+The official documentation describes upstream product features. Use this
+repository's installation and authentication documents where the fork differs.
 
 This repository is licensed under the [Apache-2.0 License](LICENSE).

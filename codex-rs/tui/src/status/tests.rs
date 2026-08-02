@@ -68,6 +68,7 @@ fn stale_monthly_limit_marks_fresh_rolling_snapshot_stale() {
         primary: Some(RateLimitWindowDisplay {
             used_percent: 20.0,
             resets_at: Some("soon".to_string()),
+            resets_at_utc: None,
             window_minutes: Some(300),
         }),
         secondary: None,
@@ -101,24 +102,28 @@ fn app_server_workspace_write_profile(network_enabled: bool) -> PermissionProfil
                         value: FileSystemSpecialPath::Root,
                     },
                     access: FileSystemAccessMode::Read,
+                    missing_path_behavior: None,
                 },
                 FileSystemSandboxEntry {
                     path: FileSystemPath::Special {
                         value: FileSystemSpecialPath::ProjectRoots { subpath: None },
                     },
                     access: FileSystemAccessMode::Write,
+                    missing_path_behavior: None,
                 },
                 FileSystemSandboxEntry {
                     path: FileSystemPath::Special {
                         value: FileSystemSpecialPath::SlashTmp,
                     },
                     access: FileSystemAccessMode::Write,
+                    missing_path_behavior: None,
                 },
                 FileSystemSandboxEntry {
                     path: FileSystemPath::Special {
                         value: FileSystemSpecialPath::Tmpdir,
                     },
                     access: FileSystemAccessMode::Write,
+                    missing_path_behavior: None,
                 },
             ],
             glob_scan_max_depth: None,
@@ -302,6 +307,7 @@ async fn status_snapshot_includes_reasoning_details() {
     let snapshot = RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        fetched_at: None,
         primary: Some(RateLimitWindow {
             used_percent: 72,
             window_duration_mins: Some(300),
@@ -361,7 +367,7 @@ async fn status_snapshot_shows_chatgpt_plan_without_email() {
 
     write_chatgpt_auth(
         temp_home.path(),
-        ChatGptAuthFixture::new("access-chatgpt").plan_type("enterprise"),
+        ChatGptAuthFixture::new("access-chatgpt").plan_type("enterprise_cbp_automation"),
         AuthCredentialsStoreMode::File,
     )
     .expect("write email-less ChatGPT auth");
@@ -380,7 +386,7 @@ async fn status_snapshot_shows_chatgpt_plan_without_email() {
         account_display,
         StatusAccountDisplay::ChatGpt {
             email: None,
-            plan: Some("Enterprise".to_string()),
+            plan: Some("Enterprise (Automation)".to_string()),
         }
     );
     let usage = TokenUsage::default();
@@ -1004,6 +1010,7 @@ async fn status_snapshot_includes_monthly_limit() {
     let snapshot = RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        fetched_at: None,
         primary: Some(RateLimitWindow {
             used_percent: 12,
             window_duration_mins: Some(43_200),
@@ -1068,6 +1075,7 @@ async fn status_snapshot_includes_enterprise_monthly_credit_limit() {
     let snapshot = RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        fetched_at: None,
         primary: None,
         secondary: None,
         credits: None,
@@ -1146,6 +1154,7 @@ async fn status_snapshot_uses_generic_limit_labels_for_unsupported_windows() {
     let snapshot = RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        fetched_at: None,
         primary: Some(RateLimitWindow {
             used_percent: 35,
             window_duration_mins: Some(2 * 60),
@@ -1204,6 +1213,7 @@ async fn status_snapshot_shows_unlimited_credits() {
     let snapshot = RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        fetched_at: None,
         primary: None,
         secondary: None,
         credits: Some(CreditsSnapshot {
@@ -1256,6 +1266,7 @@ async fn status_snapshot_shows_positive_credits() {
     let snapshot = RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        fetched_at: None,
         primary: None,
         secondary: None,
         credits: Some(CreditsSnapshot {
@@ -1317,6 +1328,7 @@ async fn status_snapshot_shows_available_credits_without_display_balance() {
         let snapshot = RateLimitSnapshot {
             limit_id: None,
             limit_name: None,
+            fetched_at: None,
             primary: None,
             secondary: None,
             credits: Some(CreditsSnapshot {
@@ -1368,6 +1380,7 @@ async fn status_snapshot_respects_unlimited_without_has_credits_flag() {
     let snapshot = RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        fetched_at: None,
         primary: None,
         secondary: None,
         credits: Some(CreditsSnapshot {
@@ -1478,6 +1491,7 @@ async fn status_snapshot_truncates_in_narrow_terminal() {
     let snapshot = RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        fetched_at: None,
         primary: Some(RateLimitWindow {
             used_percent: 72,
             window_duration_mins: Some(300),
@@ -1516,6 +1530,42 @@ async fn status_snapshot_truncates_in_narrow_terminal() {
             *line = line.replace('\\', "/");
         }
     }
+    let sanitized = sanitize_directory(rendered_lines).join("\n");
+
+    assert_snapshot!(sanitized);
+}
+
+#[tokio::test]
+async fn status_snapshot_truncates_halfwidth_kana_in_narrow_terminal() {
+    let temp_home = TempDir::new().expect("temp home");
+    let mut config = test_config(&temp_home).await;
+    set_workspace_cwd(&mut config, test_path_buf("/workspace/tests").abs());
+
+    let account = StatusAccountDisplay::ChatGpt {
+        email: Some("ｶﾞﾊﾟｶﾞﾊﾟｶﾞﾊﾟ@example.com".to_string()),
+        plan: Some("ｶﾞﾊﾟ plan".to_string()),
+    };
+    let usage = TokenUsage::default();
+    let now = chrono::Local
+        .with_ymd_and_hms(2024, 1, 2, 3, 4, 5)
+        .single()
+        .expect("timestamp");
+    let composite = new_status_output(
+        &config,
+        Some(&account),
+        /*token_info*/ None,
+        &usage,
+        &None,
+        Some("ｶﾞﾊﾟｶﾞﾊﾟｶﾞﾊﾟｶﾞﾊﾟ thread".to_string()),
+        /*forked_from*/ None,
+        /*rate_limits*/ None,
+        /*plan_type*/ None,
+        now,
+        "ｶﾞﾊﾟｶﾞﾊﾟｶﾞﾊﾟｶﾞﾊﾟ-model",
+        Some("ｶﾞﾊﾟ collaboration mode"),
+        /*reasoning_effort_override*/ None,
+    );
+    let rendered_lines = render_lines(&composite.display_lines(/*width*/ 42));
     let sanitized = sanitize_directory(rendered_lines).join("\n");
 
     assert_snapshot!(sanitized);
@@ -1646,6 +1696,7 @@ async fn status_snapshot_shows_refreshing_limits_notice() {
     let snapshot = RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        fetched_at: None,
         primary: Some(RateLimitWindow {
             used_percent: 45,
             window_duration_mins: Some(300),
@@ -1740,11 +1791,13 @@ async fn transcript_overlay_remeasures_status_after_rate_limit_refresh() {
             primary: Some(RateLimitWindowDisplay {
                 used_percent: 45.0,
                 resets_at: Some("soon".to_string()),
+                resets_at_utc: None,
                 window_minutes: Some(300),
             }),
             secondary: Some(RateLimitWindowDisplay {
                 used_percent: 30.0,
                 resets_at: Some("later".to_string()),
+                resets_at_utc: None,
                 window_minutes: Some(10_080),
             }),
             credits: None,
@@ -1798,6 +1851,7 @@ async fn status_snapshot_includes_credits_and_limits() {
     let snapshot = RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        fetched_at: None,
         primary: Some(RateLimitWindow {
             used_percent: 45,
             window_duration_mins: Some(300),
@@ -1866,6 +1920,7 @@ async fn status_snapshot_shows_unavailable_limits_message() {
     let snapshot = RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        fetched_at: None,
         primary: None,
         secondary: None,
         credits: None,
@@ -1925,6 +1980,7 @@ async fn status_snapshot_treats_refreshing_empty_limits_as_unavailable() {
     let snapshot = RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        fetched_at: None,
         primary: None,
         secondary: None,
         credits: None,
@@ -1990,6 +2046,7 @@ async fn status_snapshot_shows_stale_limits_message() {
     let snapshot = RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        fetched_at: None,
         primary: Some(RateLimitWindow {
             used_percent: 72,
             window_duration_mins: Some(300),
@@ -2059,6 +2116,7 @@ async fn status_snapshot_cached_limits_hide_credits_without_flag() {
     let snapshot = RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        fetched_at: None,
         primary: Some(RateLimitWindow {
             used_percent: 60,
             window_duration_mins: Some(300),

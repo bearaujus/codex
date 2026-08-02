@@ -224,18 +224,22 @@ async fn preamble_keeps_working_status_snapshot() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.thread_id = Some(ThreadId::new());
 
-    // Regression sequence: a preamble line is committed to history before any exec/tool event.
-    // After commentary completes, the status row should be restored before subsequent work.
+    // Regression sequence: commentary arrives before any exec/tool event. It should use the
+    // rolling status surface, then leave the status row available for subsequent work.
     chat.on_task_started();
-    chat.on_agent_message_delta("Preamble line\n".to_string());
-    chat.on_commit_tick();
-    drain_insert_history(&mut rx);
+    start_assistant_message(
+        &mut chat,
+        "msg-commentary-snapshot",
+        Some(MessagePhase::Commentary),
+    );
+    handle_agent_message_delta_for_item(&mut chat, "msg-commentary-snapshot", "Preamble line\n");
     complete_assistant_message(
         &mut chat,
         "msg-commentary-snapshot",
         "Preamble line\n",
         Some(MessagePhase::Commentary),
     );
+    drain_insert_history(&mut rx);
 
     let height = chat.desired_height(/*width*/ 80);
     let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, height))
@@ -247,6 +251,268 @@ async fn preamble_keeps_working_status_snapshot() {
         "preamble_keeps_working_status",
         normalized_backend_snapshot(terminal.backend())
     );
+}
+
+#[tokio::test]
+async fn phased_commentary_stays_live_then_persists_in_primary_history() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    handle_turn_started(&mut chat, "turn-1");
+    start_assistant_message(&mut chat, "msg-commentary", Some(MessagePhase::Commentary));
+    handle_agent_message_delta_for_item(
+        &mut chat,
+        "msg-commentary",
+        "First update.\nSecond update.\nThird update.\n",
+    );
+
+    assert!(chat.stream_controller.is_none());
+    assert_eq!(
+        chat.bottom_pane
+            .status_widget()
+            .and_then(|status| status.details()),
+        Some("Second update.\nThird update.")
+    );
+
+    complete_assistant_message(
+        &mut chat,
+        "msg-commentary",
+        "First update.\nSecond update.\nThird update.\n",
+        Some(MessagePhase::Commentary),
+    );
+
+    let mut found_commentary = false;
+    while let Ok(event) = rx.try_recv() {
+        if let AppEvent::InsertHistoryCell(cell) = event
+            && lines_to_single_string(&cell.transcript_lines(/*width*/ 80))
+                .contains("Third update.")
+        {
+            found_commentary = true;
+            assert!(
+                lines_to_single_string(&cell.display_lines(/*width*/ 80))
+                    .contains("• First update."),
+                "completed commentary should remain visible after its Thinking preview"
+            );
+        }
+    }
+    assert!(
+        found_commentary,
+        "commentary should remain visible and available in Ctrl+T"
+    );
+
+    start_assistant_message(&mut chat, "msg-final", Some(MessagePhase::FinalAnswer));
+    assert_eq!(
+        chat.bottom_pane
+            .status_widget()
+            .and_then(|status| status.details()),
+        None,
+        "the final answer should clear the rolling commentary detail"
+    );
+}
+
+#[tokio::test]
+async fn empty_commentary_start_does_not_claim_hidden_transcript_detail() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    handle_turn_started(&mut chat, "turn-1");
+
+    start_assistant_message(&mut chat, "msg-commentary", Some(MessagePhase::Commentary));
+    handle_agent_message_delta_for_item(&mut chat, "msg-commentary", " \n\t");
+
+    assert!(
+        !chat.transcript.has_hidden_detail_this_turn,
+        "an empty or whitespace-only item has nothing for Ctrl+T to reveal"
+    );
+}
+
+#[tokio::test]
+async fn turn_without_final_answer_keeps_one_interrupted_commentary_checkpoint() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    handle_turn_started(&mut chat, "turn-1");
+    start_assistant_message(&mut chat, "msg-commentary", Some(MessagePhase::Commentary));
+    handle_agent_message_delta_for_item(
+        &mut chat,
+        "msg-commentary",
+        "Inspecting the failure path.\n",
+    );
+    complete_assistant_message(
+        &mut chat,
+        "msg-commentary",
+        "Inspecting the failure path.\n",
+        Some(MessagePhase::Commentary),
+    );
+    drain_insert_history(&mut rx);
+
+    handle_turn_completed(&mut chat, "turn-1", /*duration_ms*/ None);
+    let history = drain_insert_history_text(&mut rx);
+
+    assert_eq!(history.matches("Interrupted:").count(), 1);
+    assert!(history.contains("Inspecting the failure path."));
+}
+
+#[tokio::test]
+async fn unfinished_commentary_is_preserved_when_the_turn_ends() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    handle_turn_started(&mut chat, "turn-1");
+    start_assistant_message(&mut chat, "msg-commentary", Some(MessagePhase::Commentary));
+    handle_agent_message_delta_for_item(
+        &mut chat,
+        "msg-commentary",
+        "Inspecting the failure path.\nChecking the retry boundary.\n",
+    );
+
+    handle_turn_interrupted(&mut chat, "turn-1");
+
+    let mut primary = String::new();
+    let mut transcript = String::new();
+    while let Ok(event) = rx.try_recv() {
+        if let AppEvent::InsertHistoryCell(cell) = event {
+            primary.push_str(&lines_to_single_string(&cell.display_lines(/*width*/ 80)));
+            transcript.push_str(&lines_to_single_string(
+                &cell.transcript_lines(/*width*/ 80),
+            ));
+        }
+    }
+    assert_eq!(primary.matches("Interrupted:").count(), 1);
+    assert!(primary.contains("Checking the retry boundary."));
+    assert!(transcript.contains("Inspecting the failure path."));
+    assert!(transcript.contains("Checking the retry boundary."));
+    assert_chatwidget_snapshot!(
+        "unfinished_commentary_is_preserved_when_the_turn_ends",
+        format!("PRIMARY:\n{primary}\nTRANSCRIPT:\n{transcript}")
+    );
+}
+
+#[tokio::test]
+async fn streamed_final_answer_without_completion_is_not_labeled_interrupted() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    handle_turn_started(&mut chat, "turn-1");
+    start_assistant_message(&mut chat, "msg-commentary", Some(MessagePhase::Commentary));
+    handle_agent_message_delta_for_item(
+        &mut chat,
+        "msg-commentary",
+        "Preparing the final response.\n",
+    );
+    complete_assistant_message(
+        &mut chat,
+        "msg-commentary",
+        "Preparing the final response.\n",
+        Some(MessagePhase::Commentary),
+    );
+    drain_insert_history(&mut rx);
+
+    start_assistant_message(&mut chat, "msg-final", Some(MessagePhase::FinalAnswer));
+    handle_agent_message_delta_for_item(
+        &mut chat,
+        "msg-final",
+        "Final answer delivered from the stream.",
+    );
+    handle_turn_completed(&mut chat, "turn-1", /*duration_ms*/ None);
+
+    let history = drain_insert_history_text(&mut rx);
+    assert!(history.contains("Final answer delivered from the stream."));
+    assert!(!history.contains("Interrupted:"));
+}
+
+#[tokio::test]
+async fn parallel_execs_share_one_live_panel_and_finalize_once() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    handle_turn_started(&mut chat, "turn-1");
+
+    let first = begin_exec(&mut chat, "call-1", "printf first");
+    let second = begin_exec(&mut chat, "call-2", "printf second");
+    assert!(
+        drain_insert_history(&mut rx).is_empty(),
+        "starting a parallel command must not commit an incomplete Running row"
+    );
+    assert!(
+        active_blob(&chat).contains("Running 2 commands"),
+        "parallel calls should share one live panel"
+    );
+
+    end_exec(&mut chat, second, "second\n", "", /*exit_code*/ 0);
+    let second_history = drain_insert_history_text(&mut rx);
+    assert_eq!(second_history.matches("Ran printf second").count(), 1);
+    assert!(!second_history.contains("Running printf second"));
+    assert!(active_blob(&chat).contains("Running printf first"));
+
+    end_exec(&mut chat, first, "first\n", "", /*exit_code*/ 0);
+    let first_history = drain_insert_history_text(&mut rx);
+    assert_eq!(first_history.matches("Ran printf first").count(), 1);
+    assert!(!first_history.contains("Running printf first"));
+    assert!(chat.transcript.active_cell.is_none());
+}
+
+#[tokio::test]
+async fn failed_parallel_exploration_breaks_out_without_hiding_the_group() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    handle_turn_started(&mut chat, "turn-1");
+
+    let failed = begin_exec(&mut chat, "call-failed", "rg missing src");
+    let successful = begin_exec(&mut chat, "call-success", "rg present src");
+    assert!(active_blob(&chat).contains("Exploring"));
+
+    end_exec(
+        &mut chat,
+        failed,
+        "",
+        "rg: missing target\n",
+        /*exit_code*/ 2,
+    );
+    let failure_history = drain_insert_history_text(&mut rx);
+    assert!(failure_history.contains("Failed (exit 2) rg missing src"));
+    assert!(failure_history.contains("rg: missing target"));
+    assert!(!failure_history.contains("Explored"));
+    assert!(active_blob(&chat).contains("Exploring"));
+
+    end_exec(&mut chat, successful, "src/app.rs:1:present\n", "", 0);
+    chat.flush_active_cell();
+    let group_history = drain_insert_history_text(&mut rx);
+    assert!(group_history.contains("Explored"));
+    assert!(group_history.contains("Searched present in src"));
+}
+
+#[tokio::test]
+async fn successful_exploration_warning_remains_expanded() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    handle_turn_started(&mut chat, "turn-1");
+
+    let warning = begin_exec(&mut chat, "call-warning", "rg present src");
+    end_exec(
+        &mut chat,
+        warning,
+        "warning: search index is stale\nsrc/app.rs:1:present\n",
+        "",
+        /*exit_code*/ 0,
+    );
+
+    let history = drain_insert_history_text(&mut rx);
+    assert!(history.contains("Ran with warnings rg present src"));
+    assert!(history.contains("warning: search index is stale"));
+    assert!(!history.contains("Explored"));
+    assert!(chat.transcript.active_cell.is_none());
+}
+
+#[tokio::test]
+async fn matched_source_warning_text_stays_in_compact_exploration() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    handle_turn_started(&mut chat, "turn-1");
+
+    let search = begin_exec(
+        &mut chat,
+        "call-source-warning",
+        "rg -n -C 8 warning extension/src",
+    );
+    end_exec(
+        &mut chat,
+        search,
+        "extension/src/reducer.ts:23: warning: matched source text\n",
+        "",
+        /*exit_code*/ 0,
+    );
+    chat.flush_active_cell();
+
+    let history = drain_insert_history_text(&mut rx);
+    assert!(history.contains("Explored"));
+    assert!(history.contains("Searched warning in extension"));
+    assert!(!history.contains("Ran with warnings"));
 }
 
 #[tokio::test]
@@ -281,7 +547,6 @@ async fn unified_exec_begin_restores_working_status_snapshot() {
     let height = chat.desired_height(width);
     let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
         .expect("create terminal");
-    terminal.set_viewport_area(Rect::new(0, 0, width, height));
     terminal
         .draw(|f| chat.render(f.area(), f.buffer_mut()))
         .expect("draw chatwidget");
@@ -339,10 +604,59 @@ async fn exec_history_cell_shows_working_then_failed() {
     let lines = &cells[0];
     let blob = lines_to_single_string(lines);
     assert!(
-        blob.contains("• Ran false"),
+        blob.contains("• Failed (exit 2) false"),
         "expected command and header text present: {blob:?}"
     );
     assert!(blob.to_lowercase().contains("bloop"), "expected error text");
+}
+
+#[tokio::test]
+async fn structured_powershell_read_stays_a_semantic_inspection_through_completion() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let script = "$har=Get-Content -LiteralPath 'capture.json' -Raw|ConvertFrom-Json;$har.actions";
+    let command = vec![
+        "powershell.exe".to_string(),
+        "-NoProfile".to_string(),
+        "-Command".to_string(),
+        script.to_string(),
+    ];
+    let begin = AppServerThreadItem::CommandExecution {
+        id: "inspection".to_string(),
+        command: codex_shell_command::parse_command::shlex_join(&command),
+        cwd: chat.config.cwd.clone().into(),
+        process_id: None,
+        plugin_id: None,
+        script_path: None,
+        source: ExecCommandSource::Agent,
+        status: AppServerCommandExecutionStatus::InProgress,
+        command_actions: vec![AppServerCommandAction::from_core_with_cwd(
+            codex_protocol::parse_command::ParsedCommand::Unknown {
+                cmd: script.to_string(),
+            },
+            &chat.config.cwd,
+        )],
+        aggregated_output: None,
+        exit_code: None,
+        duration_ms: None,
+    };
+    handle_exec_begin(&mut chat, begin.clone());
+
+    let active = active_blob(&chat);
+    assert!(active.contains("• Inspecting capture.json"));
+    assert!(!active.contains("ConvertFrom-Json"));
+
+    end_exec(
+        &mut chat,
+        begin,
+        "request 1\nrequest 2\nrequest 3\nrequest 4\n",
+        "",
+        /*exit_code*/ 0,
+    );
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1);
+    let completed = lines_to_single_string(&cells[0]);
+    assert!(completed.contains("• Inspected capture.json"));
+    assert!(!completed.contains("ConvertFrom-Json"));
 }
 
 #[tokio::test]
@@ -365,6 +679,8 @@ async fn exec_end_without_begin_uses_event_command() {
             command: codex_shell_command::parse_command::shlex_join(&command),
             cwd: cwd.into(),
             process_id: None,
+            plugin_id: None,
+            script_path: None,
             source: ExecCommandSource::Agent,
             status: AppServerCommandExecutionStatus::Completed,
             command_actions,
@@ -394,7 +710,7 @@ async fn exec_end_without_begin_does_not_flush_unrelated_running_exploring_cell(
 
     begin_exec(&mut chat, "call-exploring", "cat /dev/null");
     assert!(drain_insert_history(&mut rx).is_empty());
-    assert!(active_blob(&chat).contains("Read null"));
+    assert!(active_blob(&chat).contains("Reading null"));
 
     let orphan =
         begin_unified_exec_startup(&mut chat, "call-orphan", "proc-1", "echo repro-marker");
@@ -421,7 +737,7 @@ async fn exec_end_without_begin_does_not_flush_unrelated_running_exploring_cell(
         "expected unrelated exploring call to remain active: {active:?}"
     );
     assert!(
-        active.contains("Read null"),
+        active.contains("Reading null"),
         "expected active exploring command to remain visible: {active:?}"
     );
     assert!(
@@ -456,7 +772,7 @@ async fn exec_end_without_begin_flushes_completed_unrelated_exploring_cell() {
         "expected flushed exploring cell: {first:?}"
     );
     assert!(
-        first.contains("List ls -la"),
+        first.contains("Listed ls -la"),
         "expected flushed exploring cell: {first:?}"
     );
     assert!(
@@ -486,11 +802,11 @@ async fn overlapping_exploring_exec_end_is_not_misclassified_as_orphan() {
     );
     let active = active_blob(&chat);
     assert!(
-        active.contains("List ls -la"),
+        active.contains("Listed ls -la"),
         "expected first command still grouped: {active:?}"
     );
     assert!(
-        active.contains("Read foo.txt"),
+        active.contains("Reading foo.txt"),
         "expected second running command to stay in the same active cell: {active:?}"
     );
     assert!(
@@ -548,7 +864,10 @@ async fn exec_history_shows_unified_exec_tool_calls() {
     end_exec(&mut chat, begin, "", "", /*exit_code*/ 0);
 
     let blob = active_blob(&chat);
-    assert_eq!(blob, "• Explored\n  └ List ls\n");
+    assert_eq!(
+        blob,
+        "• Explored · 1 operation\n  └ Listed ls · 0 entries\n"
+    );
 }
 
 #[tokio::test]
@@ -1218,7 +1537,6 @@ async fn approval_modal_exec_without_reason_snapshot() -> anyhow::Result<()> {
     let height = chat.desired_height(width);
     let mut terminal =
         ratatui::Terminal::new(VT100Backend::new(width, height)).expect("create terminal");
-    terminal.set_viewport_area(Rect::new(0, 0, width, height));
     terminal
         .draw(|f| chat.render(f.area(), f.buffer_mut()))
         .expect("draw approval modal (no reason)");
@@ -1263,7 +1581,6 @@ async fn approval_modal_exec_multiline_prefix_hides_execpolicy_option_snapshot()
     let height = chat.desired_height(width);
     let mut terminal =
         ratatui::Terminal::new(VT100Backend::new(width, height)).expect("create terminal");
-    terminal.set_viewport_area(Rect::new(0, 0, width, height));
     terminal
         .draw(|f| chat.render(f.area(), f.buffer_mut()))
         .expect("draw approval modal (multiline prefix)");
@@ -1307,7 +1624,6 @@ async fn approval_modal_patch_snapshot() -> anyhow::Result<()> {
     let height = chat.desired_height(/*width*/ 80);
     let mut terminal =
         ratatui::Terminal::new(VT100Backend::new(/*width*/ 80, height)).expect("create terminal");
-    terminal.set_viewport_area(Rect::new(0, 0, 80, height));
     terminal
         .draw(|f| chat.render(f.area(), f.buffer_mut()))
         .expect("draw patch approval modal");

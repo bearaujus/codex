@@ -56,12 +56,7 @@ pub enum TelemetryAuthMode {
 impl From<AuthMode> for TelemetryAuthMode {
     fn from(mode: AuthMode) -> Self {
         match mode {
-            AuthMode::ApiKey | AuthMode::BedrockApiKey => Self::ApiKey,
-            AuthMode::Chatgpt
-            | AuthMode::ChatgptAuthTokens
-            | AuthMode::Headers
-            | AuthMode::AgentIdentity
-            | AuthMode::PersonalAccessToken => Self::Chatgpt,
+            AuthMode::Chatgpt | AuthMode::Headers | AuthMode::AgentIdentity => Self::Chatgpt,
         }
     }
 }

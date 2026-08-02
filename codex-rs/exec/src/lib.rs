@@ -238,11 +238,6 @@ fn exec_stderr_env_filter() -> EnvFilter {
 }
 
 pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
-    #[allow(clippy::print_stderr)]
-    if let Some(message) = cli.removed_full_auto_warning() {
-        eprintln!("{message}");
-    }
-
     if let Err(err) = set_default_originator("codex_exec".to_string()) {
         tracing::warn!(?err, "Failed to set codex exec originator override {err:?}");
     }
@@ -255,15 +250,15 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         ephemeral,
         ignore_user_config,
         ignore_rules,
-        removed_full_auto,
         color,
         last_message_file,
         json: json_mode,
         prompt,
         output_schema: output_schema_path,
-        config_overrides,
+        mut config_overrides,
     } = cli;
-    let shared = shared.into_inner();
+    let mut shared = shared.into_inner();
+    shared.take_auto_review_config_overrides(&mut config_overrides);
     let SharedCliOptions {
         images,
         model: model_cli_arg,
@@ -271,6 +266,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         oss_provider,
         config_profile_v2,
         sandbox_mode: sandbox_mode_cli_arg,
+        auto_review: _,
         dangerously_bypass_approvals_and_sandbox,
         bypass_hook_trust,
         cwd,
@@ -290,9 +286,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         .with_writer(std::io::stderr)
         .with_filter(exec_stderr_env_filter());
 
-    let sandbox_mode = if removed_full_auto {
-        Some(SandboxMode::WorkspaceWrite)
-    } else if dangerously_bypass_approvals_and_sandbox {
+    let sandbox_mode = if dangerously_bypass_approvals_and_sandbox {
         Some(SandboxMode::DangerFullAccess)
     } else {
         sandbox_mode_cli_arg.map(Into::<SandboxMode>::into)
@@ -361,7 +355,6 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     )?;
     let cloud_config_bundle = cloud_config_bundle_loader_for_storage(
         codex_home.to_path_buf(),
-        /*enable_codex_api_key_env*/ false,
         bootstrap_config_toml
             .cli_auth_credentials_store
             .unwrap_or_default(),
@@ -460,7 +453,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     };
     let config = build_exec_config(
         overrides,
-        dangerously_bypass_approvals_and_sandbox || removed_full_auto,
+        dangerously_bypass_approvals_and_sandbox,
         build_config,
     )
     .await?;
@@ -550,10 +543,15 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
     )?;
     let state_db = codex_core::init_state_db(&config).await;
     let environment_manager = if run_loader_overrides.ignore_user_config {
-        EnvironmentManager::from_env(Some(local_runtime_paths)).await?
-    } else {
-        EnvironmentManager::from_codex_home(config.codex_home.clone(), Some(local_runtime_paths))
+        EnvironmentManager::from_env(Some(local_runtime_paths), config.http_client_factory())
             .await?
+    } else {
+        EnvironmentManager::from_codex_home(
+            config.codex_home.clone(),
+            Some(local_runtime_paths),
+            config.http_client_factory(),
+        )
+        .await?
     };
     let in_process_start_args = InProcessClientStartArgs {
         arg0_paths,
@@ -568,7 +566,6 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         environment_manager: std::sync::Arc::new(environment_manager),
         config_warnings,
         session_source: SessionSource::Exec,
-        enable_codex_api_key_env: true,
         client_name: "codex_exec".to_string(),
         client_version: env!("CARGO_PKG_VERSION").to_string(),
         experimental_api: true,
@@ -992,9 +989,10 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
 
         match server_event {
             InProcessServerEvent::ServerRequest(request) => {
-                handle_server_request(&client, request, &mut error_seen).await;
+                handle_server_request(&client, *request, &mut error_seen).await;
             }
-            InProcessServerEvent::ServerNotification(mut notification) => {
+            InProcessServerEvent::ServerNotification(notification) => {
+                let mut notification = *notification;
                 if let ServerNotification::Error(payload) = &notification {
                     if payload.thread_id == primary_thread_id_for_requests
                         && payload.turn_id == task_id
@@ -1110,6 +1108,7 @@ fn thread_resume_params_from_config(
         sandbox: sandbox.flatten(),
         permissions,
         config: thread_config_overrides_from_config(config),
+        exclude_turns: true,
         ..ThreadResumeParams::default()
     }
 }
@@ -1397,7 +1396,7 @@ fn should_backfill_turn_completed_items(
         return false;
     };
 
-    !thread_ephemeral && payload.turn.items.is_empty()
+    !thread_ephemeral && payload.turn.items_view != codex_app_server_protocol::TurnItemsView::Full
 }
 
 fn turn_items_for_thread(
@@ -1479,6 +1478,7 @@ async fn resolve_resume_thread_id(
                         model_providers: model_providers.clone(),
                         source_kinds: Some(all_thread_source_kinds()),
                         archived: Some(false),
+                        section_id: None,
                         parent_thread_id: None,
                         ancestor_thread_id: None,
                         cwd: None,
@@ -1546,6 +1546,7 @@ async fn resolve_resume_thread_id(
                     model_providers: model_providers.clone(),
                     source_kinds: Some(all_thread_source_kinds()),
                     archived: Some(false),
+                    section_id: None,
                     parent_thread_id: None,
                     ancestor_thread_id: None,
                     cwd: None,
@@ -1721,15 +1722,6 @@ async fn handle_server_request(
                     "dynamic tool calls are not supported in exec mode for thread `{}`",
                     params.thread_id
                 ),
-            )
-            .await
-        }
-        ServerRequest::ChatgptAuthTokensRefresh { request_id, .. } => {
-            reject_server_request(
-                client,
-                request_id,
-                &method,
-                "chatgpt auth token refresh is not supported in exec mode".to_string(),
             )
             .await
         }

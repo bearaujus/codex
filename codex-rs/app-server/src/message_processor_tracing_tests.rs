@@ -119,7 +119,7 @@ impl TracingHarness {
         let server = create_mock_responses_server_repeating_assistant("Done").await;
         let codex_home = TempDir::new()?;
         let config = Arc::new(build_test_config(codex_home.path(), &server.uri()).await?);
-        let (processor, outgoing_rx) = build_test_processor(config).await;
+        let (processor, _auth_manager, outgoing_rx) = build_test_processor(config).await;
         let tracing = init_test_tracing();
         tracing.exporter.reset();
         tracing::callsite::rebuild_interest_cache();
@@ -230,11 +230,11 @@ async fn build_test_processor(
     config: Arc<Config>,
 ) -> (
     Arc<MessageProcessor>,
+    Arc<AuthManager>,
     mpsc::Receiver<crate::outgoing_message::OutgoingEnvelope>,
 ) {
     let (outgoing_tx, outgoing_rx) = mpsc::channel(16);
-    let auth_manager =
-        AuthManager::shared_from_config(config.as_ref(), /*enable_codex_api_key_env*/ false).await;
+    let auth_manager = AuthManager::shared_from_config(config.as_ref()).await;
     let config_manager = ConfigManager::new(
         config.codex_home.to_path_buf(),
         Vec::new(),
@@ -262,20 +262,21 @@ async fn build_test_processor(
         state_db: None,
         config_warnings: Vec::new(),
         session_source: SessionSource::VSCode,
-        auth_manager,
+        auth_manager: Arc::clone(&auth_manager),
         installation_id: "11111111-1111-4111-8111-111111111111".to_string(),
+        code_mode_session_provider: None,
         rpc_transport: AppServerRpcTransport::Stdio,
         remote_control_handle: None,
         plugin_startup_tasks: crate::PluginStartupTasks::Start,
     }));
-    (processor, outgoing_rx)
+    (processor, auth_manager, outgoing_rx)
 }
 
 fn run_current_thread_test_with_stack<F>(name: &str, future: F) -> Result<()>
 where
     F: Future<Output = Result<()>> + Send + 'static,
 {
-    const TEST_STACK_SIZE_BYTES: usize = 4 * 1024 * 1024;
+    const TEST_STACK_SIZE_BYTES: usize = 8 * 1024 * 1024;
 
     let handle = std::thread::Builder::new()
         .name(name.to_string())
@@ -449,8 +450,10 @@ async fn read_response<T: serde::de::DeserializeOwned>(
         if response.id != RequestId::Integer(request_id) {
             continue;
         }
-        return serde_json::from_value(response.result)
-            .expect("response payload should deserialize");
+        return serde_json::from_value(
+            serde_json::to_value(response.result).expect("response payload should serialize"),
+        )
+        .expect("response payload should deserialize");
     }
 }
 

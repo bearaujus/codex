@@ -68,7 +68,8 @@ async fn request_body_is_zstd_compressed_for_codex_backend_when_enabled() -> any
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn request_body_is_not_compressed_for_api_key_auth_even_when_enabled() -> anyhow::Result<()> {
+async fn request_body_is_not_compressed_without_chatgpt_auth_even_when_enabled()
+-> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -106,7 +107,7 @@ async fn request_body_is_not_compressed_for_api_key_auth_even_when_enabled() -> 
     let request = request_log.single_request();
     assert!(
         request.header("content-encoding").is_none(),
-        "did not expect request compression for API-key auth"
+        "did not expect request compression without ChatGPT auth"
     );
 
     let json: serde_json::Value = serde_json::from_slice(&request.body_bytes())?;

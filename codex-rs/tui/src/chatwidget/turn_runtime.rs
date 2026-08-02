@@ -16,13 +16,25 @@ fn is_safety_access_block_message(message: &str) -> bool {
 }
 
 impl ChatWidget {
+    fn clear_guardian_review_status(&mut self) {
+        self.status_state.pending_guardian_review_status.clear();
+        if self.status_state.current_status.is_guardian_review() {
+            let header = self
+                .mcp_startup_status_header()
+                .unwrap_or_else(|| String::from("Working"));
+            self.set_status_header(header);
+        }
+    }
+
     /// Synchronize the bottom-pane "task running" indicator with the current lifecycles.
     ///
     /// The bottom pane only has one running flag, but this module treats it as a derived state of
     /// both the agent turn lifecycle and MCP startup lifecycle.
     pub(super) fn update_task_running_state(&mut self) {
         self.bottom_pane.set_task_running(
-            self.turn_lifecycle.agent_turn_running || self.mcp_startup_status.is_some(),
+            self.turn_lifecycle.agent_turn_running
+                || self.review.is_review_mode
+                || self.mcp_startup_status.is_some(),
         );
         self.refresh_plan_mode_nudge();
         self.refresh_status_surfaces();
@@ -61,6 +73,7 @@ impl ChatWidget {
         self.reset_safety_buffering_for_turn_start();
         self.turn_lifecycle.start(Instant::now());
         self.transcript.reset_turn_flags();
+        self.reset_hidden_transcript_detail();
         self.adaptive_chunking.reset();
         if self.plan_stream_controller.take().is_some() {
             self.request_pending_usage_output_insertion_after_stream_shutdown();
@@ -71,6 +84,12 @@ impl ChatWidget {
         self.quit_shortcut_expires_at = None;
         self.quit_shortcut_key = None;
         self.update_task_running_state();
+        let token_baseline = self
+            .token_info
+            .as_ref()
+            .map(|info| info.total_token_usage.clone());
+        self.bottom_pane
+            .begin_turn_token_meter(token_baseline.as_ref());
         self.status_state.retry_status_header = None;
         self.clear_active_hook_cell();
         self.status_state.pending_status_indicator_restore = false;
@@ -80,8 +99,14 @@ impl ChatWidget {
         if self.mcp_startup_status.is_none() || !self.status_header_is_mcp_startup_owned() {
             self.set_status_header(String::from("Working"));
         }
-        self.reasoning_summary_parts.clear();
+        // Discard leftover reasoning from an aborted prior turn rather than
+        // committing it here. Committing at this point would insert the reasoning
+        // blocks after the new user message in history, which is out of order and
+        // confusing. The content was already visible to the user in the live stream.
         self.reasoning_buffer.clear();
+        self.full_reasoning_buffer.clear();
+        self.clear_live_reasoning();
+        self.reasoning_summary_parts.clear();
         self.reasoning_header = None;
         self.set_ambient_pet_notification(
             crate::pets::PetNotificationKind::Running,
@@ -97,20 +122,9 @@ impl ChatWidget {
         from_replay: bool,
     ) {
         self.input_queue.submit_pending_steers_after_interrupt = false;
-        // Use `last_agent_message` from the turn-complete notification as the copy
-        // source only when no earlier item-level event (AgentMessageItem, plan
-        // commit, review output) already recorded markdown for this turn. This
-        // prevents the final summary from overwriting a more specific source.
         let sanitized_last_agent_message = last_agent_message.as_deref().map(|message| {
             parse_assistant_markdown(message, self.config.cwd.as_path()).visible_markdown
         });
-        if let Some(message) = sanitized_last_agent_message
-            .as_ref()
-            .filter(|message| !message.is_empty())
-            && !self.transcript.saw_copy_source_this_turn
-        {
-            self.record_agent_markdown(message);
-        }
         // For desktop notifications: prefer the notification payload, fall back to
         // the item-level copy source if present, otherwise send an empty string.
         let notification_response = sanitized_last_agent_message
@@ -128,6 +142,14 @@ impl ChatWidget {
         self.transcript.saw_copy_source_this_turn = false;
         // If a stream is currently active, finalize it.
         self.flush_answer_stream_with_separator();
+        // Flush any tool/exec events that were deferred while the text stream was
+        // active. Without this, MCP tool completions, exec outputs, and file-change
+        // events queued during streaming are permanently dropped at turn end.
+        self.flush_interrupt_queue();
+        // Commit any live reasoning that did not receive its final event (e.g., the
+        // server sent TurnCompleted before AgentReasoningFinal in a race).
+        self.commit_pending_reasoning_to_history();
+        self.clear_live_reasoning();
         if let Some(mut controller) = self.plan_stream_controller.take() {
             let had_live_tail = controller.has_live_tail();
             self.clear_active_stream_tail();
@@ -143,12 +165,15 @@ impl ChatWidget {
             self.request_pending_usage_output_insertion_after_stream_shutdown();
         }
         self.flush_unified_exec_wait_streak();
+        // Preserve commentary if a turn ends before its item-completed event. Completed
+        // commentary is already visible in primary history; an unfinished stream remains
+        // transcript-only and receives the compact interrupted checkpoint below.
+        self.finalize_unfinished_commentary();
         if !from_replay {
             self.collect_runtime_metrics_delta();
             let runtime_metrics =
                 (!self.turn_runtime_metrics.is_empty()).then_some(self.turn_runtime_metrics);
-            let show_work_separator = self.transcript.had_work_activity
-                && (self.transcript.needs_final_message_separator || runtime_metrics.is_some());
+            let show_work_separator = self.transcript.had_work_activity;
             if show_work_separator || runtime_metrics.is_some() {
                 let elapsed_seconds = if show_work_separator {
                     duration_ms
@@ -168,17 +193,32 @@ impl ChatWidget {
                 ));
             }
             self.turn_runtime_metrics = RuntimeMetricsSummary::default();
-            self.transcript.needs_final_message_separator = false;
             self.transcript.had_work_activity = false;
             self.request_status_line_branch_refresh();
             self.request_status_line_git_summary_refresh();
+        }
+        if !from_replay
+            && !self.transcript.saw_final_answer_this_turn
+            && sanitized_last_agent_message
+                .as_ref()
+                .is_none_or(|message| message.trim().is_empty())
+            && self.last_non_retry_error.is_none()
+            && let Some(commentary) = self.transcript.latest_commentary_markdown.clone()
+        {
+            let commentary =
+                parse_assistant_markdown(&commentary, self.config.cwd.as_path()).visible_markdown;
+            if !commentary.is_empty() {
+                self.add_to_history(history_cell::InterruptedCommentaryCell::new(&commentary));
+            }
         }
         // Mark task stopped and request redraw now that all content is in history.
         self.status_state.pending_status_indicator_restore = false;
         self.input_queue.user_turn_pending_start = false;
         self.clear_active_hook_cell();
+        self.clear_guardian_review_status();
         self.turn_lifecycle.finish();
         self.clear_safety_buffering();
+        self.bottom_pane.end_turn_token_meter();
         self.update_task_running_state();
         self.running_commands.clear();
         self.suppressed_exec_calls.clear();
@@ -311,9 +351,20 @@ impl ChatWidget {
     /// and should continue to drive the bottom-pane running indicator while it is in progress.
     pub(super) fn finalize_turn(&mut self) {
         self.clear_safety_buffering();
+        // Every terminal path must preserve partial assistant output. Specialized errors such as
+        // server overload and policy blocks call this shared teardown directly rather than
+        // `on_error`, so finalizing only in `on_error` silently dropped their active stream.
+        self.flush_answer_stream_with_separator();
+        // Commentary uses a transcript-only buffer instead of the visible answer stream. Flush it
+        // through the same shared terminal path so interrupts and errors cannot discard it.
+        self.finalize_unfinished_commentary();
         // Drop preview-only stream tail content on any termination path before
         // failed-cell finalization, so transient tail cells are never persisted.
         self.clear_active_stream_tail();
+        // Commit any in-progress live reasoning so content visible to the user is
+        // not silently discarded on turn failure/interrupt.
+        self.commit_pending_reasoning_to_history();
+        self.clear_live_reasoning();
         // Ensure any spinner is replaced by a red ✗ and flushed into history.
         self.finalize_active_cell_as_failed();
         // Turn-scoped hook rows are transient live state; once the turn is over,
@@ -322,7 +373,9 @@ impl ChatWidget {
         self.clear_active_hook_cell();
         // Reset running state and clear streaming buffers.
         self.input_queue.user_turn_pending_start = false;
+        self.clear_guardian_review_status();
         self.turn_lifecycle.finish();
+        self.bottom_pane.end_turn_token_meter();
         self.update_task_running_state();
         self.running_commands.clear();
         self.suppressed_exec_calls.clear();
@@ -331,6 +384,12 @@ impl ChatWidget {
         self.adaptive_chunking.reset();
         self.stream_controller = None;
         self.plan_stream_controller = None;
+        // commit_pending_reasoning_to_history above already finalized this; reset
+        // defensively so a stray controller never survives turn teardown.
+        self.reasoning_stream_controller = None;
+        // Flush deferred tool/exec events so outputs that arrived while text was
+        // streaming are still shown, even on abort or error paths.
+        self.flush_interrupt_queue();
         self.request_pending_usage_output_insertion_after_stream_shutdown();
         self.status_state.pending_status_indicator_restore = false;
         self.safety_buffering_prompt = None;
@@ -354,9 +413,8 @@ impl ChatWidget {
         self.maybe_send_next_queued_input();
     }
 
-    pub(super) fn on_error(&mut self, message: String) {
+    fn on_error(&mut self, message: String) {
         self.input_queue.submit_pending_steers_after_interrupt = false;
-        self.flush_answer_stream_with_separator();
         self.finalize_turn();
         self.add_to_history(history_cell::new_error_event(message));
         self.set_ambient_pet_notification(
@@ -367,6 +425,14 @@ impl ChatWidget {
 
         // After an error ends the turn, try sending the next queued input.
         self.maybe_send_next_queued_input();
+    }
+
+    pub(crate) fn handle_turn_start_rejection(&mut self, message: String) -> bool {
+        if !self.input_queue.user_turn_pending_start {
+            return false;
+        }
+        self.on_error(message);
+        true
     }
 
     pub(super) fn on_cyber_policy_error(&mut self) {

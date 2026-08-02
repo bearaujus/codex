@@ -4,6 +4,8 @@
 //! context (for example, the unified-exec background-process summary). Keeping
 //! these pieces on one line avoids vertical layout churn in the bottom pane.
 
+mod token_transition;
+
 use std::time::Duration;
 use std::time::Instant;
 
@@ -15,22 +17,27 @@ use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::text::Text;
 use ratatui::widgets::Paragraph;
-use ratatui::widgets::WidgetRef;
+use ratatui::widgets::Widget;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app_event_sender::AppEventSender;
 use crate::key_hint;
-use crate::key_hint::KeyBinding;
+use crate::key_hint::ShortcutHint;
 use crate::line_truncation::truncate_line_with_ellipsis_if_overflow;
 use crate::motion::MotionMode;
 use crate::motion::ReducedMotionIndicator;
 use crate::motion::activity_indicator;
 use crate::motion::shimmer_text;
 use crate::render::renderable::Renderable;
+use crate::status::format_tokens_compact;
 use crate::text_formatting::capitalize_first;
 use crate::tui::FrameRequester;
 use crate::wrapping::RtOptions;
 use crate::wrapping::word_wrap_lines;
+use token_transition::TokenActivity;
+use token_transition::TokenUsageFrame;
+use token_transition::TokenUsageTransition;
+pub(crate) use token_transition::TurnTokenUsage;
 
 pub(crate) const STATUS_DETAILS_DEFAULT_MAX_LINES: usize = 3;
 const DETAILS_PREFIX: &str = "  └ ";
@@ -49,8 +56,10 @@ pub(crate) struct StatusIndicatorWidget {
     details_max_lines: usize,
     /// Optional suffix rendered after the elapsed/interrupt segment.
     inline_message: Option<String>,
+    turn_token_usage: Option<TurnTokenUsage>,
+    token_usage_transition: Option<TokenUsageTransition>,
     show_interrupt_hint: bool,
-    interrupt_binding: Option<KeyBinding>,
+    interrupt_binding: Option<ShortcutHint>,
 
     elapsed_running: Duration,
     last_resume_at: Instant,
@@ -88,8 +97,10 @@ impl StatusIndicatorWidget {
             details: None,
             details_max_lines: STATUS_DETAILS_DEFAULT_MAX_LINES,
             inline_message: None,
+            turn_token_usage: None,
+            token_usage_transition: None,
             show_interrupt_hint: true,
-            interrupt_binding: Some(key_hint::plain(KeyCode::Esc)),
+            interrupt_binding: Some(key_hint::plain(KeyCode::Esc).into()),
             elapsed_running: Duration::ZERO,
             last_resume_at: Instant::now(),
             is_paused: false,
@@ -139,6 +150,32 @@ impl StatusIndicatorWidget {
             .filter(|message| !message.is_empty());
     }
 
+    pub(crate) fn update_turn_token_usage(&mut self, usage: Option<TurnTokenUsage>) {
+        let now = Instant::now();
+        let usage = usage.filter(|usage| !usage.is_empty());
+        if usage == self.turn_token_usage {
+            return;
+        }
+        let current = self.token_usage_frame_at(now).map(|frame| frame.usage);
+        self.turn_token_usage = usage;
+        self.token_usage_transition = match (current, usage) {
+            (_, None) => None,
+            (Some(current), Some(target)) if target.precedes(current) => None,
+            (Some(current), Some(target)) if self.animations_enabled => {
+                TokenUsageTransition::new(current, target, now)
+            }
+            (Some(_), Some(_)) | (None, Some(_)) => None,
+        };
+    }
+
+    /// Restores an existing meter after the status row was temporarily hidden.
+    ///
+    /// Recreating the widget must not replay the count-up animation from zero.
+    pub(crate) fn restore_turn_token_usage(&mut self, usage: Option<TurnTokenUsage>) {
+        self.turn_token_usage = usage.filter(|usage| !usage.is_empty());
+        self.token_usage_transition = None;
+    }
+
     pub(crate) fn header(&self) -> &str {
         &self.header
     }
@@ -148,11 +185,16 @@ impl StatusIndicatorWidget {
         self.details.as_deref()
     }
 
+    #[cfg(test)]
+    pub(crate) fn turn_token_usage(&self) -> Option<TurnTokenUsage> {
+        self.turn_token_usage
+    }
+
     pub(crate) fn set_interrupt_hint_visible(&mut self, visible: bool) {
         self.show_interrupt_hint = visible;
     }
 
-    pub(crate) fn set_interrupt_binding(&mut self, binding: Option<KeyBinding>) {
+    pub(crate) fn set_interrupt_binding(&mut self, binding: Option<ShortcutHint>) {
         self.interrupt_binding = binding;
     }
 
@@ -195,6 +237,63 @@ impl StatusIndicatorWidget {
 
     pub fn elapsed_seconds(&self) -> u64 {
         self.elapsed_seconds_at(Instant::now())
+    }
+
+    fn token_usage_frame_at(&self, now: Instant) -> Option<TokenUsageFrame> {
+        let target = self.turn_token_usage?;
+        Some(
+            self.token_usage_transition
+                .map(|transition| transition.frame_at(now))
+                .unwrap_or(TokenUsageFrame {
+                    usage: target,
+                    input_activity: TokenActivity::Idle,
+                    output_activity: TokenActivity::Idle,
+                }),
+        )
+    }
+
+    fn token_usage_spans(&self, now: Instant) -> Vec<Span<'static>> {
+        let Some(frame) = self.token_usage_frame_at(now) else {
+            return Vec::new();
+        };
+        let usage = frame.usage;
+        let alternate_arrow = self
+            .token_usage_transition
+            .is_some_and(|transition| transition.alternate_arrow_at(now));
+        let input_arrow =
+            if frame.input_activity == TokenActivity::Moving && self.animations_enabled {
+                if alternate_arrow { "⇣" } else { "↓" }
+            } else {
+                "↓"
+            };
+        let output_arrow =
+            if frame.output_activity == TokenActivity::Moving && self.animations_enabled {
+                if alternate_arrow { "⇡" } else { "↑" }
+            } else {
+                "↑"
+            };
+        let input = format!("{input_arrow}{}", format_tokens_compact(usage.input_tokens));
+        let output = format!(
+            "{output_arrow}{}",
+            format_tokens_compact(usage.output_tokens)
+        );
+        let input = match frame.input_activity {
+            TokenActivity::Moving => input.cyan().bold(),
+            TokenActivity::Holding => input.cyan(),
+            TokenActivity::Idle => input.dim(),
+        };
+        let output = match frame.output_activity {
+            TokenActivity::Moving => output.cyan().bold(),
+            TokenActivity::Holding => output.cyan(),
+            TokenActivity::Idle => output.dim(),
+        };
+        vec![
+            input,
+            " ".into(),
+            output,
+            " ".into(),
+            format!("Σ{}", format_tokens_compact(usage.total_tokens)).dim(),
+        ]
     }
 
     /// Wrap the details text into a fixed width and return the lines, truncating if necessary.
@@ -250,7 +349,7 @@ impl Renderable for StatusIndicatorWidget {
         let pretty_elapsed = fmt_elapsed_compact(elapsed_duration.as_secs());
         let motion_mode = MotionMode::from_animations_enabled(self.animations_enabled);
 
-        let mut spans = Vec::with_capacity(5);
+        let mut spans = Vec::with_capacity(12);
         if let Some(indicator) = activity_indicator(
             Some(self.last_resume_at),
             motion_mode,
@@ -260,20 +359,31 @@ impl Renderable for StatusIndicatorWidget {
             spans.push(" ".into());
         }
         spans.extend(shimmer_text(&self.header, motion_mode));
-        if !spans.is_empty() {
-            spans.push(" ".into());
-        }
-        if self.show_interrupt_hint
-            && let Some(interrupt_binding) = self.interrupt_binding
-        {
-            spans.extend(vec![
-                format!("({pretty_elapsed} • ").dim(),
-                interrupt_binding.into(),
-                " to interrupt)".dim(),
-            ]);
+        spans.push(" · ".dim());
+        spans.push(pretty_elapsed.dim());
+
+        let interrupt_binding = if self.show_interrupt_hint {
+            self.interrupt_binding
         } else {
-            spans.push(format!("({pretty_elapsed})").dim());
+            None
+        };
+        let interrupt_tail = if let Some(interrupt_binding) = interrupt_binding {
+            vec![" · ".dim(), interrupt_binding.into(), " to interrupt".dim()]
+        } else {
+            Vec::new()
+        };
+        let token_usage_spans = self.token_usage_spans(now);
+        let token_usage_fits = !token_usage_spans.is_empty()
+            && Line::from(spans.clone()).width()
+                + UnicodeWidthStr::width(" · ")
+                + Line::from(token_usage_spans.clone()).width()
+                + Line::from(interrupt_tail.clone()).width()
+                <= usize::from(area.width);
+        if token_usage_fits {
+            spans.push(" · ".dim());
+            spans.extend(token_usage_spans);
         }
+        spans.extend(interrupt_tail);
         if let Some(message) = &self.inline_message {
             // Keep optional context after elapsed/interrupt text so that core
             // interrupt affordances stay in a fixed visual location.
@@ -293,7 +403,7 @@ impl Renderable for StatusIndicatorWidget {
             lines.extend(details.into_iter().take(max_details));
         }
 
-        Paragraph::new(Text::from(lines)).render_ref(area, buf);
+        Paragraph::new(Text::from(lines)).render(area, buf);
     }
 }
 
@@ -410,7 +520,7 @@ mod tests {
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
 
-        assert!(line.starts_with("Working (0s • esc to interrupt)"));
+        assert!(line.starts_with("Working · 0s · esc to interrupt"));
     }
 
     #[test]
@@ -422,7 +532,7 @@ mod tests {
             crate::tui::FrameRequester::test_dummy(),
             /*animations_enabled*/ false,
         );
-        w.set_interrupt_binding(Some(key_hint::plain(KeyCode::F(12))));
+        w.set_interrupt_binding(Some(key_hint::plain(KeyCode::F(12)).into()));
         w.is_paused = true;
         w.elapsed_running = Duration::ZERO;
 
@@ -431,6 +541,91 @@ mod tests {
             .draw(|f| w.render(f.area(), f.buffer_mut()))
             .expect("draw");
         insta::assert_snapshot!(terminal.backend());
+    }
+
+    #[test]
+    fn renders_compact_turn_token_usage_before_interrupt_hint() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut widget = StatusIndicatorWidget::new(
+            tx,
+            crate::tui::FrameRequester::test_dummy(),
+            /*animations_enabled*/ false,
+        );
+        widget.is_paused = true;
+        widget.elapsed_running = Duration::ZERO;
+        widget.update_turn_token_usage(Some(TurnTokenUsage {
+            input_tokens: 1_250,
+            output_tokens: 250,
+            total_tokens: 1_500,
+        }));
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 1)).expect("terminal");
+        terminal
+            .draw(|frame| widget.render(frame.area(), frame.buffer_mut()))
+            .expect("draw");
+        let line = terminal.backend().buffer().content()[..100]
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+
+        assert!(line.starts_with("Working · 0s · ↓1.25K ↑250 Σ1.5K · esc to interrupt"));
+    }
+
+    #[test]
+    fn first_token_snapshot_does_not_fake_a_stream_from_zero() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut widget = StatusIndicatorWidget::new(
+            tx,
+            crate::tui::FrameRequester::test_dummy(),
+            /*animations_enabled*/ true,
+        );
+        let usage = TurnTokenUsage {
+            input_tokens: 3_840_000,
+            output_tokens: 9_770,
+            total_tokens: 3_849_770,
+        };
+
+        widget.update_turn_token_usage(Some(usage));
+
+        assert!(widget.token_usage_transition.is_none());
+        assert_eq!(
+            widget
+                .token_usage_frame_at(Instant::now())
+                .map(|frame| frame.usage),
+            Some(usage)
+        );
+    }
+
+    #[test]
+    fn narrow_status_keeps_interrupt_hint_instead_of_token_meter() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut widget = StatusIndicatorWidget::new(
+            tx,
+            crate::tui::FrameRequester::test_dummy(),
+            /*animations_enabled*/ false,
+        );
+        widget.is_paused = true;
+        widget.elapsed_running = Duration::ZERO;
+        widget.update_turn_token_usage(Some(TurnTokenUsage {
+            input_tokens: 12_000,
+            output_tokens: 2_000,
+            total_tokens: 14_000,
+        }));
+
+        let mut terminal = Terminal::new(TestBackend::new(38, 1)).expect("terminal");
+        terminal
+            .draw(|frame| widget.render(frame.area(), frame.buffer_mut()))
+            .expect("draw");
+        let line = terminal.backend().buffer().content()[..38]
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+
+        assert!(line.contains("esc to interrupt"));
+        assert!(!line.contains('Σ'));
     }
 
     #[test]

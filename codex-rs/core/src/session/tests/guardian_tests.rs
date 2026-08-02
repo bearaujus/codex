@@ -438,6 +438,7 @@ async fn strict_auto_review_turn_grant_forces_guardian_for_shell_command_policy_
     );
     let session = Arc::new(session);
     let turn_context = Arc::new(turn_context_raw);
+    let expiration_ms: u64 = if cfg!(windows) { 2_500 } else { 1_000 };
 
     let handler = crate::tools::handlers::ShellCommandHandler::from(
         codex_tools::ShellCommandBackendConfig::Classic,
@@ -460,7 +461,7 @@ async fn strict_auto_review_turn_grant_forces_guardian_for_shell_command_policy_
                     "command": "echo hi",
                     "login": false,
                     "workdir": workdir,
-                    "timeout_ms": 1_000_u64,
+                    "timeout_ms": expiration_ms,
                 })
                 .to_string(),
             },
@@ -539,12 +540,20 @@ async fn process_compacted_history_preserves_separate_guardian_developer_message
     turn_context.session_source = guardian_source;
     turn_context.developer_instructions = Some(guardian_policy.clone());
     let turn_context = Arc::new(turn_context);
-    let world_state = Arc::new(build_world_state_from_turn_context(&session, &turn_context).await);
-    let initial_context_injection = InitialContextInjection::BeforeLastUserMessage(world_state);
+    let step_context = StepContext::for_test(Arc::clone(&turn_context));
+    let world_state = Arc::new(
+        session
+            .build_world_state_for_step(&step_context)
+            .await
+            .expect("world state should build"),
+    );
+    let initial_context_injection = InitialContextInjection::BeforeLastUserMessage {
+        world_state,
+        step_context,
+    };
 
     let (refreshed, _) = crate::compact_remote::process_compacted_history(
         &session,
-        &turn_context,
         vec![
             ResponseItem::Message {
                 id: None,
@@ -707,7 +716,8 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
         }
     );
 
-    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("Test API Key"));
+    let auth_manager =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
     let models_manager = models_manager_with_provider(
         config.codex_home.to_path_buf(),
         auth_manager.clone(),
@@ -735,10 +745,11 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
         skills_service,
         plugins_manager,
         mcp_manager,
-        code_mode_session_provider: Arc::new(codex_code_mode::InProcessCodeModeSessionProvider),
+        code_mode_session_provider: Arc::new(codex_code_mode::DisabledCodeModeSessionProvider),
         extensions: codex_extension_api::empty_extension_registry(),
         conversation_history: InitialHistory::New,
         requested_history_mode: None,
+        fork_persistence: ForkPersistence::Copied,
         session_source: SessionSource::SubAgent(SubAgentSource::Other(
             GUARDIAN_REVIEWER_NAME.to_string(),
         )),
@@ -762,6 +773,9 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
         attestation_provider: None,
         external_time_provider: None,
         inherited_multi_agent_version: None,
+        git_enrichment_policy: GitEnrichmentPolicy::Skip,
+        windows_sandbox_proxy_settings_mode:
+            codex_sandboxing::WindowsSandboxProxySettingsMode::Preserve,
     })
     .await
     .expect("spawn guardian subagent");

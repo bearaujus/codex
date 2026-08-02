@@ -1,6 +1,7 @@
 use super::AnalyticsEventsClient;
 use super::AnalyticsEventsDestination;
 use super::AnalyticsEventsQueue;
+use super::AnalyticsEventsQueueMessage;
 #[cfg(debug_assertions)]
 use super::capture_track_events_request;
 #[cfg(debug_assertions)]
@@ -41,8 +42,10 @@ use codex_app_server_protocol::ApprovalsReviewer as AppServerApprovalsReviewer;
 use codex_app_server_protocol::AskForApproval as AppServerAskForApproval;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ClientResponsePayload;
+use codex_app_server_protocol::CommandExecutionOutputDeltaNotification;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SandboxPolicy as AppServerSandboxPolicy;
+use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::SessionSource as AppServerSessionSource;
 use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadArchiveParams;
@@ -52,13 +55,19 @@ use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStatus as AppServerThreadStatus;
 use codex_app_server_protocol::Turn;
+use codex_app_server_protocol::TurnDiffUpdatedNotification;
+use codex_app_server_protocol::TurnInterruptParams;
+use codex_app_server_protocol::TurnInterruptResponse;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStatus as AppServerTurnStatus;
 use codex_app_server_protocol::TurnSteerParams;
 use codex_app_server_protocol::TurnSteerResponse;
+#[cfg(debug_assertions)]
+use codex_login::AuthManager;
 use codex_utils_absolute_path::test_support::PathBufExt;
 use codex_utils_absolute_path::test_support::test_path_buf;
+use pretty_assertions::assert_eq;
 use std::collections::HashSet;
 #[cfg(debug_assertions)]
 use std::fs;
@@ -70,6 +79,18 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
+
+#[cfg(debug_assertions)]
+impl AnalyticsEventsClient {
+    pub(crate) fn new_for_capture_file(auth_manager: Arc<AuthManager>, path: PathBuf) -> Self {
+        Self {
+            queue: Some(AnalyticsEventsQueue::new(
+                auth_manager,
+                AnalyticsEventsDestination::CaptureFile { path },
+            )),
+        }
+    }
+}
 
 fn sample_accepted_line_fingerprint_event(thread_id: &str) -> TrackEventRequest {
     TrackEventRequest::AcceptedLineFingerprints(Box::new(
@@ -100,6 +121,7 @@ fn sample_skill_track_event(thread_id: &str, plugin_id: Option<&str>) -> TrackEv
             product_client_id: None,
             skill_scope: None,
             plugin_id: plugin_id.map(str::to_string),
+            remote_plugin_id: None,
             repo_url: None,
             thread_id: Some(thread_id.to_string()),
             turn_id: Some("turn-1".to_string()),
@@ -197,7 +219,10 @@ fn unique_capture_path(name: &str) -> PathBuf {
     ))
 }
 
-fn client_with_receiver() -> (AnalyticsEventsClient, mpsc::Receiver<AnalyticsFact>) {
+fn client_with_receiver() -> (
+    AnalyticsEventsClient,
+    mpsc::Receiver<AnalyticsEventsQueueMessage>,
+) {
     let (sender, receiver) = mpsc::channel(8);
     let queue = AnalyticsEventsQueue {
         sender,
@@ -326,84 +351,6 @@ async fn capture_file_writes_final_batches_as_separate_lines() {
 
     fs::remove_file(capture_path).expect("remove capture file");
 }
-
-#[tokio::test]
-#[cfg(debug_assertions)]
-async fn api_key_auth_sends_only_plugin_events_to_codex_backend() {
-    let capture_path = unique_capture_path("api-key-plugin-events");
-    let destination = AnalyticsEventsDestination::CaptureFile {
-        path: capture_path.clone(),
-    };
-    let auth_manager = codex_login::AuthManager::from_auth_for_testing(
-        codex_login::CodexAuth::from_api_key("sk-test"),
-    );
-
-    send_track_events(
-        &auth_manager,
-        &destination,
-        vec![
-            sample_regular_track_event("non-plugin-skill"),
-            sample_mcp_tool_call_event("non-plugin-mcp", /*plugin_id*/ None),
-            sample_plugin_used_track_event("non-plugin-used", /*plugin_id*/ None),
-            sample_accepted_line_fingerprint_event("other-event"),
-            sample_plugin_used_track_event("plugin-used", Some("sample@test")),
-            sample_skill_track_event("plugin-skill", Some("sample@test")),
-            sample_mcp_tool_call_event("plugin-mcp", Some("sample@test")),
-        ],
-    )
-    .await;
-
-    let contents = fs::read_to_string(&capture_path).expect("read capture file");
-    let lines = contents.lines().collect::<Vec<_>>();
-    assert_eq!(lines.len(), 1);
-    let payload: serde_json::Value =
-        serde_json::from_str(lines[0]).expect("parse captured payload");
-    let events = payload["events"].as_array().expect("events array");
-    for event in events {
-        let event_params = event["event_params"].as_object().expect("event params");
-        for server_owned_field in [
-            "auth_mode",
-            "api_organization_id",
-            "api_project_id",
-            "api_key_tracking_id",
-        ] {
-            assert!(!event_params.contains_key(server_owned_field));
-        }
-    }
-    let delivered_events = events
-        .iter()
-        .map(|event| {
-            serde_json::json!({
-                "event_type": event["event_type"],
-                "plugin_id": event["event_params"]["plugin_id"],
-                "thread_id": event["event_params"]["thread_id"],
-            })
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        delivered_events,
-        vec![
-            serde_json::json!({
-                "event_type": "codex_plugin_used",
-                "plugin_id": "sample@test",
-                "thread_id": "plugin-used",
-            }),
-            serde_json::json!({
-                "event_type": "skill_invocation",
-                "plugin_id": "sample@test",
-                "thread_id": "plugin-skill",
-            }),
-            serde_json::json!({
-                "event_type": "codex_mcp_tool_call_event",
-                "plugin_id": "sample@test",
-                "thread_id": "plugin-mcp",
-            }),
-        ]
-    );
-
-    fs::remove_file(capture_path).expect("remove capture file");
-}
-
 #[test]
 #[cfg(debug_assertions)]
 fn capture_write_failure_still_consumes_delivery() {
@@ -442,6 +389,20 @@ fn sample_turn_steer_request() -> ClientRequest {
     }
 }
 
+fn sample_turn_interrupt_request(turn_id: &str) -> ClientRequest {
+    ClientRequest::TurnInterrupt {
+        request_id: RequestId::Integer(3),
+        params: TurnInterruptParams {
+            thread_id: "thread-1".to_string(),
+            turn_id: turn_id.to_string(),
+        },
+    }
+}
+
+fn sample_turn_interrupt_response() -> ClientResponsePayload {
+    ClientResponsePayload::TurnInterrupt(TurnInterruptResponse {})
+}
+
 fn sample_thread_archive_request() -> ClientRequest {
     ClientRequest::ThreadArchive {
         request_id: RequestId::Integer(3),
@@ -460,6 +421,8 @@ fn sample_thread(thread_id: &str) -> Thread {
         parent_thread_id: None,
         preview: "first prompt".to_string(),
         ephemeral: false,
+        section: None,
+        section_entered_at: None,
         history_mode: Default::default(),
         model_provider: "openai".to_string(),
         created_at: 1,
@@ -569,15 +532,41 @@ fn track_request_only_enqueues_analytics_relevant_requests() {
         client.track_request(/*connection_id*/ 7, request_id, &request);
         assert!(matches!(
             receiver.try_recv(),
-            Ok(AnalyticsFact::ClientRequest { .. })
+            Ok(AnalyticsEventsQueueMessage::Fact(input))
+                if matches!(*input, AnalyticsFact::ClientRequest { .. })
         ));
     }
+
+    client.track_request(
+        /*connection_id*/ 7,
+        RequestId::Integer(3),
+        &sample_turn_interrupt_request("turn-1"),
+    );
+    assert!(matches!(
+        receiver.try_recv(),
+        Ok(AnalyticsEventsQueueMessage::Fact(input))
+            if matches!(
+                *input,
+                AnalyticsFact::ExplicitClientInterruptRequest {
+                    ref turn_id,
+                    requested_at_ms,
+                    ..
+                } if turn_id == "turn-1" && requested_at_ms > 0
+            )
+    ));
 
     let ignored_request = sample_thread_archive_request();
     client.track_request(
         /*connection_id*/ 7,
         RequestId::Integer(3),
         &ignored_request,
+    );
+    assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+
+    client.track_request(
+        /*connection_id*/ 7,
+        RequestId::Integer(4),
+        &sample_turn_interrupt_request(""),
     );
     assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
 }
@@ -592,19 +581,107 @@ fn track_response_only_enqueues_analytics_relevant_responses() {
         (RequestId::Integer(3), sample_thread_fork_response()),
         (RequestId::Integer(4), sample_turn_start_response()),
         (RequestId::Integer(5), sample_turn_steer_response()),
+        (RequestId::Integer(6), sample_turn_interrupt_response()),
     ] {
-        client.track_response(/*connection_id*/ 7, request_id, response);
+        client.track_response(/*connection_id*/ 7, request_id, &response);
         assert!(matches!(
             receiver.try_recv(),
-            Ok(AnalyticsFact::ClientResponse { .. })
+            Ok(AnalyticsEventsQueueMessage::Fact(input))
+                if matches!(*input, AnalyticsFact::ClientResponse { .. })
         ));
     }
 
     client.track_response(
         /*connection_id*/ 7,
-        RequestId::Integer(6),
-        ClientResponsePayload::ThreadArchive(ThreadArchiveResponse {}),
+        RequestId::Integer(7),
+        &ClientResponsePayload::ThreadArchive(ThreadArchiveResponse {}),
     );
+    assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+}
+
+#[cfg(unix)]
+#[test]
+fn track_response_ignores_unserializable_thread_responses() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let (client, mut receiver) = client_with_receiver();
+    let mut response = sample_thread_start_response();
+    let ClientResponsePayload::ThreadStart(thread_start) = &mut response else {
+        panic!("expected thread/start response");
+    };
+    thread_start.cwd = codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(
+        std::path::PathBuf::from(OsString::from_vec(vec![b'/', b'b', b'a', b'd', 0xff])),
+    )
+    .expect("non-UTF-8 Unix paths are valid absolute paths");
+
+    client.track_response(/*connection_id*/ 7, RequestId::Integer(1), &response);
+
+    assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+}
+
+#[tokio::test]
+async fn flush_waits_for_preceding_fact_delivery() {
+    let (client, mut receiver) = client_with_receiver();
+    client.track_request(
+        /*connection_id*/ 7,
+        RequestId::Integer(1),
+        &sample_turn_start_request(),
+    );
+
+    let flush = tokio::spawn(async move { client.flush().await });
+    assert!(matches!(
+        receiver.recv().await,
+        Some(AnalyticsEventsQueueMessage::Fact(input))
+            if matches!(*input, AnalyticsFact::ClientRequest { .. })
+    ));
+    let done_tx = match receiver.recv().await {
+        Some(AnalyticsEventsQueueMessage::Flush(done_tx)) => done_tx,
+        _ => panic!("expected analytics flush barrier"),
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    assert!(!flush.is_finished());
+    done_tx.send(()).expect("flush receiver should remain open");
+    flush.await.expect("flush task should complete");
+}
+
+#[tokio::test]
+async fn flush_is_noop_when_analytics_is_disabled() {
+    AnalyticsEventsClient::disabled().flush().await;
+}
+
+#[test]
+fn track_notification_only_enqueues_analytics_relevant_notifications() {
+    let (client, mut receiver) = client_with_receiver();
+    let tracked_payload = TurnDiffUpdatedNotification {
+        thread_id: "thread-1".to_string(),
+        turn_id: "turn-1".to_string(),
+        diff: "diff".to_string(),
+    };
+    let tracked_notification = ServerNotification::TurnDiffUpdated(tracked_payload.clone());
+
+    client.track_notification(&tracked_notification);
+
+    let Ok(AnalyticsEventsQueueMessage::Fact(input)) = receiver.try_recv() else {
+        panic!("expected analytics notification");
+    };
+    let AnalyticsFact::Notification(notification) = *input else {
+        panic!("expected analytics notification fact");
+    };
+    let ServerNotification::TurnDiffUpdated(notification) = *notification else {
+        panic!("expected turn diff notification");
+    };
+    assert_eq!(notification, tracked_payload);
+
+    let ignored_notification =
+        ServerNotification::CommandExecutionOutputDelta(CommandExecutionOutputDeltaNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            item_id: "item-1".to_string(),
+            delta: "output".to_string(),
+        });
+
+    client.track_notification(&ignored_notification);
     assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
 }
 

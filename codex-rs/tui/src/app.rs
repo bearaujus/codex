@@ -49,6 +49,7 @@ use crate::history_cell::HistoryCell;
 use crate::history_cell::UpdateAvailableHistoryCell;
 use crate::hooks_rpc::HookTrustUpdate;
 use crate::key_hint::KeyBindingListExt;
+use crate::keymap::KeyChordMatcher;
 use crate::keymap::RuntimeKeymap;
 use crate::legacy_core::config::Config;
 use crate::legacy_core::config::ConfigBuilder;
@@ -174,12 +175,14 @@ use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
 use ratatui::backend::Backend;
 use ratatui::layout::Rect;
+use ratatui::layout::Size;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Wrap;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::io::Write;
 use std::path::Path;
@@ -201,6 +204,7 @@ use toml::Value as TomlValue;
 use uuid::Uuid;
 mod agent_message_consolidation;
 mod agent_navigation;
+mod agent_picker;
 mod agent_status_feed;
 mod app_server_event_targets;
 mod app_server_events;
@@ -534,6 +538,7 @@ pub(crate) struct App {
 
     pub(crate) enhanced_keys_supported: bool,
     pub(crate) keymap: RuntimeKeymap,
+    pub(crate) key_chord_matcher: KeyChordMatcher,
 
     /// Controls the animation thread that sends CommitTick events.
     pub(crate) commit_anim_running: Arc<AtomicBool>,
@@ -574,6 +579,7 @@ pub(crate) struct App {
     thread_event_listener_tasks: HashMap<ThreadId, JoinHandle<()>>,
     agent_navigation: AgentNavigationState,
     side_threads: HashMap<ThreadId, SideThreadState>,
+    abandoned_side_threads: HashSet<ThreadId>,
     active_thread_id: Option<ThreadId>,
     active_thread_rx: Option<mpsc::Receiver<ThreadBufferedEvent>>,
     primary_thread_id: Option<ThreadId>,
@@ -583,7 +589,7 @@ pub(crate) struct App {
     pending_app_server_requests: PendingAppServerRequests,
     pending_startup_thread_start: bool,
     /// Invalidates in-flight full rate-limit reads when a newer rolling hard stop arrives.
-    rate_limit_hard_stop_generation: u64,
+    rate_limit_update_generation: u64,
     // Serialize plugin enablement writes per plugin so stale completions cannot
     // overwrite a newer toggle, even if the plugin is toggled from different
     // cwd contexts.
@@ -652,6 +658,15 @@ fn spawn_startup_thread_start(
         .map_err(|err| format!("{err:#}"));
         app_event_tx.send(AppEvent::StartupThreadStarted { result });
     });
+}
+
+fn hydrate_startup_rate_limit_snapshots(
+    chat_widget: &mut ChatWidget,
+    snapshots: Vec<codex_app_server_protocol::RateLimitSnapshot>,
+) {
+    for snapshot in snapshots {
+        chat_widget.on_rate_limit_snapshot(Some(snapshot));
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -816,6 +831,7 @@ impl App {
         }
         let mut model = config.model.clone().unwrap_or(bootstrap.default_model);
         let available_models = bootstrap.available_models;
+        let initial_rate_limit_snapshots = bootstrap.initial_rate_limit_snapshots;
         let remote_connection = crate::status::remote_connection::remote_connection_status_value(
             &app_server_target,
             app_server.server_version(),
@@ -1010,6 +1026,7 @@ impl App {
                 (ChatWidget::new_with_app_event(init), Some(forked))
             }
         };
+        hydrate_startup_rate_limit_snapshots(&mut chat_widget, initial_rate_limit_snapshots);
         chat_widget.remote_connection = remote_connection;
         let thread_and_widget_ms = thread_and_widget_started_at.elapsed().as_millis();
         chat_widget
@@ -1044,6 +1061,7 @@ See the Codex keymap documentation for supported actions and examples."
             file_search,
             enhanced_keys_supported,
             keymap: runtime_keymap,
+            key_chord_matcher: KeyChordMatcher::default(),
             transcript_cells: Vec::new(),
             overlay: None,
             deferred_history_lines: Vec::new(),
@@ -1067,6 +1085,7 @@ See the Codex keymap documentation for supported actions and examples."
             thread_event_listener_tasks: HashMap::new(),
             agent_navigation: AgentNavigationState::default(),
             side_threads: HashMap::new(),
+            abandoned_side_threads: HashSet::new(),
             active_thread_id: None,
             active_thread_rx: None,
             primary_thread_id: None,
@@ -1075,7 +1094,7 @@ See the Codex keymap documentation for supported actions and examples."
             pending_primary_events: VecDeque::new(),
             pending_app_server_requests: PendingAppServerRequests::default(),
             pending_startup_thread_start,
-            rate_limit_hard_stop_generation: 0,
+            rate_limit_update_generation: 0,
             pending_plugin_enabled_writes: HashMap::new(),
             pending_hook_enabled_writes: HashMap::new(),
         };
@@ -1131,7 +1150,7 @@ See the Codex keymap documentation for supported actions and examples."
         let tui_events = tui.event_stream();
         tokio::pin!(tui_events);
 
-        tui.frame_requester().schedule_frame();
+        tui.schedule_screen_size_recheck(Duration::ZERO);
         tracing::info!(
             duration_ms = %(startup_elapsed_before_app + startup_started_at.elapsed()).as_millis(),
             bootstrap_ms = %bootstrap_ms,
@@ -1142,9 +1161,8 @@ See the Codex keymap documentation for supported actions and examples."
             "tui startup initial frame scheduled"
         );
         app.refresh_startup_skills(&app_server);
-        // Kick off a non-blocking rate-limit prefetch so the first `/status`
-        // already has data and available reset credits can be surfaced, without
-        // delaying the initial frame render.
+        // Refresh reset-credit details and catch any account-pool updates that
+        // landed after the cached bootstrap read, without delaying first paint.
         if requires_openai_auth && has_chatgpt_account {
             let reset_hint_request_id = app.chat_widget.start_rate_limit_reset_startup_check();
             app.refresh_rate_limits(
@@ -1285,9 +1303,20 @@ See the Codex keymap documentation for supported actions and examples."
         app_server: &mut AppServerSession,
         event: TuiEvent,
     ) -> Result<AppRunControl> {
-        if matches!(event, TuiEvent::Draw | TuiEvent::Resize) {
-            self.handle_draw_pre_render(tui)?;
+        let screen_size = tui.screen_size_for_event(&event)?;
+        if !matches!(&event, TuiEvent::Key(_) | TuiEvent::Paste(_)) {
+            self.expire_pending_key_chord();
+            self.handle_draw_pre_render(tui, screen_size)?;
         }
+
+        let event = if let TuiEvent::Key(key_event) = event {
+            let Some(key_event) = self.route_key_chord_event(tui, key_event) else {
+                return Ok(AppRunControl::Continue);
+            };
+            TuiEvent::Key(key_event)
+        } else {
+            event
+        };
 
         if self.overlay.is_some() {
             let _ = self.handle_backtrack_overlay_event(tui, event).await?;
@@ -1304,9 +1333,9 @@ See the Codex keymap documentation for supported actions and examples."
                     let pasted = pasted.replace("\r", "\n");
                     self.chat_widget.handle_paste(pasted);
                 }
-                TuiEvent::Draw | TuiEvent::Resize => {
+                TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) => {
                     if self.backtrack_render_pending {
-                        self.rebuild_transcript_after_backtrack(tui)?;
+                        self.rebuild_transcript_after_backtrack(tui, screen_size.into())?;
                         self.backtrack_render_pending = false;
                     }
                     self.chat_widget.maybe_post_pending_notification(tui);
@@ -1314,18 +1343,18 @@ See the Codex keymap documentation for supported actions and examples."
                         .chat_widget
                         .handle_paste_burst_tick(tui.frame_requester())
                     {
+                        tui.defer_screen_size(screen_size);
                         return Ok(AppRunControl::Continue);
                     }
                     // Allow widgets to process any pending timers before rendering.
                     self.chat_widget.pre_draw_tick();
-                    let rendered_area = self.render_chat_widget_frame(tui)?;
+                    let rendered_area = self.render_chat_widget_frame(tui, screen_size)?;
                     if self.chat_widget.ambient_pet_image_enabled() {
-                        let terminal_size = tui.terminal.size()?;
                         let ambient_pet_area = Rect::new(
                             /*x*/ 0,
                             /*y*/ 0,
-                            terminal_size.width,
-                            terminal_size.height,
+                            screen_size.width,
+                            screen_size.height,
                         );
                         if let Err(err) = tui.draw_ambient_pet_image(
                             self.chat_widget
@@ -1357,25 +1386,37 @@ See the Codex keymap documentation for supported actions and examples."
     pub(super) fn show_shutdown_feedback(&mut self, tui: &mut tui::Tui) -> Result<()> {
         self.disable_ambient_pet_before_shutdown(tui)?;
         self.chat_widget.show_shutdown_in_progress();
-        self.handle_draw_pre_render(tui)?;
+        let screen_size = tui.terminal.last_known_screen_size;
+        self.handle_draw_pre_render(tui, screen_size)?;
         self.chat_widget.pre_draw_tick();
-        self.render_chat_widget_frame(tui)?;
+        self.render_chat_widget_frame(tui, screen_size)?;
         Ok(())
     }
 
-    fn render_chat_widget_frame(&mut self, tui: &mut tui::Tui) -> Result<Rect> {
-        let desired_height = self.chat_widget.desired_height(tui.terminal.size()?.width);
-        let mut rendered_area = Rect::default();
-        tui.draw_with_resize_reflow(desired_height, |frame| {
-            let area = frame.area();
-            rendered_area = area;
-            self.chat_widget.render(area, frame.buffer);
-            if let Some((x, y)) = self.chat_widget.cursor_pos(area) {
-                frame.set_cursor_style(self.chat_widget.cursor_style(area));
-                frame.set_cursor_position((x, y));
-            }
-        })?;
-        Ok(rendered_area)
+    fn render_chat_widget_frame(&mut self, tui: &mut tui::Tui, screen_size: Size) -> Result<Rect> {
+        self.with_chat_widget_frame(screen_size.width, |desired_height, chat_widget| {
+            let mut rendered_area = Rect::default();
+            tui.draw_with_resize_reflow(desired_height, screen_size, |frame| {
+                let area = frame.area();
+                rendered_area = area;
+                chat_widget.render(area, frame.buffer);
+                self.chat_widget.note_rendered_width(area.width);
+                if let Some((x, y)) = chat_widget.cursor_pos(area) {
+                    frame.set_cursor_style(chat_widget.cursor_style(area));
+                    frame.set_cursor_position((x, y));
+                }
+            })?;
+            Ok(rendered_area)
+        })
+    }
+
+    fn with_chat_widget_frame<T>(
+        &self,
+        width: u16,
+        render: impl FnOnce(u16, &dyn Renderable) -> T,
+    ) -> T {
+        let chat_widget = self.chat_widget.as_renderable();
+        render(chat_widget.desired_height(width), &chat_widget)
     }
 }
 

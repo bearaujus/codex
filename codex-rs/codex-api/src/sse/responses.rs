@@ -355,6 +355,7 @@ pub fn process_responses_event(
         "response.reasoning_summary_text.delta" => {
             if let (Some(delta), Some(summary_index)) = (event.delta, event.summary_index) {
                 return Ok(Some(ResponseEvent::ReasoningSummaryDelta {
+                    item_id: event.item_id.clone(),
                     delta,
                     summary_index,
                 }));
@@ -374,6 +375,7 @@ pub fn process_responses_event(
         "response.reasoning_text.delta" => {
             if let (Some(delta), Some(content_index)) = (event.delta, event.content_index) {
                 return Ok(Some(ResponseEvent::ReasoningContentDelta {
+                    item_id: event.item_id.clone(),
                     delta,
                     content_index,
                 }));
@@ -460,6 +462,7 @@ pub fn process_responses_event(
         "response.reasoning_summary_part.added" => {
             if let Some(summary_index) = event.summary_index {
                 return Ok(Some(ResponseEvent::ReasoningSummaryPartAdded {
+                    item_id: event.item_id.clone(),
                     summary_index,
                 }));
             }

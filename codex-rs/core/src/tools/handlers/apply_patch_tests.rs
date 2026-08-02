@@ -164,6 +164,30 @@ fn diff_consumer_streams_apply_patch_changes_with_environment_header() {
 }
 
 #[test]
+fn diff_consumer_skips_replace_file_streaming_preview_until_verification() {
+    let mut consumer = ApplyPatchArgumentDiffConsumer::default();
+    assert!(
+        consumer
+            .push_delta(
+                "call-1".to_string(),
+                "*** Begin Patch\n*** Replace File: hello.txt\n+hello"
+            )
+            .is_none()
+    );
+    assert!(
+        consumer
+            .push_delta("call-1".to_string(), "\n+world\n*** End Patch")
+            .is_none()
+    );
+    assert!(
+        consumer
+            .finish_update_on_complete()
+            .expect("finish parser")
+            .is_none()
+    );
+}
+
+#[test]
 fn diff_consumer_sends_next_update_after_buffer_interval() {
     let mut consumer = ApplyPatchArgumentDiffConsumer::default();
     consumer.push_delta("call-1".to_string(), "*** Begin Patch\n");
@@ -293,4 +317,71 @@ fn write_permissions_for_paths_keep_dirs_outside_workspace_root() {
             .and_then(|roots| roots.write),
         Some(vec![expected_outside])
     );
+}
+
+#[test]
+fn apply_patch_verification_errors_are_bounded_for_model_context() {
+    let error = apply_patch_verification_error("diagnostic ".repeat(10_000));
+    let FunctionCallError::RespondToModel(message) = error else {
+        panic!("expected a model-facing verification error");
+    };
+
+    assert!(message.contains("tokens truncated"));
+    assert!(
+        codex_utils_output_truncation::approx_token_count(&message)
+            <= APPLY_PATCH_DIAGNOSTIC_MAX_TOKENS + 10
+    );
+}
+
+#[tokio::test]
+async fn ambiguous_path_diagnostic_caps_reported_paths() {
+    let tmp = TempDir::new().expect("tmp");
+    let cwd = PathUri::from_abs_path(&tmp.path().abs());
+    let mut hunks = Vec::new();
+    let mut tracked_delta = codex_apply_patch::AppliedPatchDelta::default();
+    for index in 0..AMBIGUOUS_PATH_DIAGNOSTIC_MAX_PATHS + 3 {
+        let relative_path = format!("ambiguous-{index}.txt");
+        let path = tmp.path().join(&relative_path);
+        std::fs::write(&path, "same\nsame\n").expect("write ambiguous file");
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: {relative_path}\n@@\n-same\n+changed\n*** End Patch"
+        );
+        hunks.extend(
+            codex_apply_patch::parse_patch(&patch)
+                .expect("patch should parse")
+                .hunks,
+        );
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        tracked_delta.append(
+            codex_apply_patch::apply_patch(
+                &patch,
+                &cwd,
+                &mut stdout,
+                &mut stderr,
+                LOCAL_FS.as_ref(),
+                /*sandbox*/ None,
+            )
+            .await
+            .expect("initial update should apply"),
+        );
+        std::fs::write(path, "same\nsame\n").expect("restore ambiguous contents");
+    }
+    let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+    tracker.lock().await.track_delta("local", &tracked_delta);
+
+    let error = ensure_exact_match_updates_use_fresh_context(
+        &tracker,
+        &hunks,
+        &cwd,
+        LOCAL_FS.as_ref(),
+        /*sandbox*/ None,
+    )
+    .await
+    .expect_err("repeated anchors should require fresh context");
+    let FunctionCallError::RespondToModel(message) = error else {
+        panic!("expected a model-facing ambiguity error");
+    };
+
+    assert!(message.contains("[3 additional ambiguous paths omitted]"));
 }

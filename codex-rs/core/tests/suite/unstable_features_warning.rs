@@ -26,17 +26,21 @@ async fn emits_warning_when_unstable_features_enabled_via_config() {
     let user_config_path =
         AbsolutePathBuf::from_absolute_path(config.codex_home.join(CONFIG_TOML_FILE))
             .expect("absolute user config path");
-    config.config_layer_stack = config.config_layer_stack.with_user_config(
-        &user_config_path,
-        toml! { features = { apply_patch_streaming_events = true } }.into(),
-    );
+    config.config_layer_stack = config
+        .config_layer_stack
+        .with_user_config(
+            &user_config_path,
+            toml! { features = { apply_patch_streaming_events = true } }.into(),
+        )
+        .expect("feature user config should be valid");
 
     let thread_manager = codex_core::test_support::thread_manager_with_models_provider(
-        CodexAuth::from_api_key("test"),
+        CodexAuth::create_dummy_chatgpt_auth_for_testing(),
         config.model_provider.clone(),
     );
-    let auth_manager =
-        codex_core::test_support::auth_manager_from_auth(CodexAuth::from_api_key("test"));
+    let auth_manager = codex_core::test_support::auth_manager_from_auth(
+        CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+    );
 
     let NewThread {
         thread: conversation,
@@ -73,17 +77,21 @@ async fn suppresses_warning_when_configured() {
     let user_config_path =
         AbsolutePathBuf::from_absolute_path(config.codex_home.join(CONFIG_TOML_FILE))
             .expect("absolute user config path");
-    config.config_layer_stack = config.config_layer_stack.with_user_config(
-        &user_config_path,
-        toml! { features = { apply_patch_streaming_events = true } }.into(),
-    );
+    config.config_layer_stack = config
+        .config_layer_stack
+        .with_user_config(
+            &user_config_path,
+            toml! { features = { apply_patch_streaming_events = true } }.into(),
+        )
+        .expect("feature user config should be valid");
 
     let thread_manager = codex_core::test_support::thread_manager_with_models_provider(
-        CodexAuth::from_api_key("test"),
+        CodexAuth::create_dummy_chatgpt_auth_for_testing(),
         config.model_provider.clone(),
     );
-    let auth_manager =
-        codex_core::test_support::auth_manager_from_auth(CodexAuth::from_api_key("test"));
+    let auth_manager = codex_core::test_support::auth_manager_from_auth(
+        CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+    );
 
     let NewThread {
         thread: conversation,

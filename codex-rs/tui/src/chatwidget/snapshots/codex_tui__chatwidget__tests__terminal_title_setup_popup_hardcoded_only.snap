@@ -16,5 +16,5 @@ expression: terminal_title_popup_snapshot(&mut chat)
   [ ] activity       Spinner while working, action-required message while blocked.
   [ ] run-state      Compact session run-state text (Ready, Working, Thinking)
 
-  thread title | feat/awesome-feature | Tasks 0/0
+  thread title | feat/awesome-feature | Tasks 2/5
   Press space to toggle; ←/→ to move; enter to confirm and close; esc to close

@@ -507,14 +507,35 @@ pub struct ModelMessages {
     pub instructions_template: Option<String>,
     pub instructions_variables: Option<ModelInstructionsVariables>,
     pub approvals: Option<ApprovalMessages>,
+    pub collaboration_modes: Option<CollaborationModeMessages>,
     pub auto_review: Option<AutoReviewMessages>,
     pub permissions: Option<PermissionMessages>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_budget: Option<ModelTokenBudgetConfig>,
+}
+
+/// Model-owned defaults for the context-window token-budget feature.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
+pub struct ModelTokenBudgetConfig {
+    pub reminder_threshold_tokens: i64,
+    pub reminder_message_template: String,
+    pub guidance_message: String,
+    pub auto_compact_fallback_prompt: String,
+    pub auto_compact_fallback_buffer_tokens: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
 pub struct ApprovalMessages {
     pub on_request: Option<String>,
     pub on_request_auto_review: Option<String>,
+    pub never: Option<String>,
+    pub unless_trusted: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
+pub struct CollaborationModeMessages {
+    pub default: Option<String>,
+    pub plan: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
@@ -749,13 +770,23 @@ mod tests {
     }
 
     #[test]
-    fn model_messages_deserialize_without_approvals() {
+    fn model_messages_deserialize_without_optional_sections() {
         let messages: ModelMessages =
             from_str(r#"{"instructions_template":null,"instructions_variables":null}"#)
                 .expect("model messages should deserialize");
 
-        assert_eq!(messages.approvals, None);
-        assert_eq!(messages.permissions, None);
+        assert_eq!(
+            messages,
+            ModelMessages {
+                instructions_template: None,
+                instructions_variables: None,
+                approvals: None,
+                collaboration_modes: None,
+                auto_review: None,
+                permissions: None,
+                token_budget: None,
+            }
+        );
     }
 
     #[test]
@@ -765,7 +796,8 @@ mod tests {
                 "instructions_template": null,
                 "instructions_variables": null,
                 "approvals": {
-                    "on_request": ""
+                    "on_request": "",
+                    "never": ""
                 }
             }"#,
         )
@@ -776,6 +808,8 @@ mod tests {
             Some(ApprovalMessages {
                 on_request: Some(String::new()),
                 on_request_auto_review: None,
+                never: Some(String::new()),
+                unless_trusted: None,
             })
         );
     }
@@ -840,6 +874,36 @@ mod tests {
                 workspace_write: Some(String::new()),
                 read_only: None,
             })
+        );
+    }
+
+    #[test]
+    fn collaboration_mode_messages_preserve_missing_and_empty_values() {
+        let messages: ModelMessages = from_str(
+            r#"{
+                "instructions_template": null,
+                "instructions_variables": null,
+                "collaboration_modes": {
+                    "default": ""
+                }
+            }"#,
+        )
+        .expect("collaboration mode messages should deserialize");
+
+        assert_eq!(
+            messages,
+            ModelMessages {
+                instructions_template: None,
+                instructions_variables: None,
+                approvals: None,
+                collaboration_modes: Some(CollaborationModeMessages {
+                    default: Some(String::new()),
+                    plan: None,
+                }),
+                auto_review: None,
+                permissions: None,
+                token_budget: None,
+            }
         );
     }
 
@@ -915,8 +979,10 @@ mod tests {
             instructions_template: Some("Hello {{ personality }}".to_string()),
             instructions_variables: Some(personality_variables()),
             approvals: None,
+            collaboration_modes: None,
             auto_review: None,
             permissions: None,
+            token_budget: None,
         }));
 
         let instructions = model.get_model_instructions(Some(Personality::Friendly));
@@ -934,8 +1000,10 @@ mod tests {
                 personality_pragmatic: None,
             }),
             approvals: None,
+            collaboration_modes: None,
             auto_review: None,
             permissions: None,
+            token_budget: None,
         }));
         assert_eq!(
             model.get_model_instructions(Some(Personality::Friendly)),
@@ -962,8 +1030,10 @@ mod tests {
                 personality_pragmatic: None,
             }),
             approvals: None,
+            collaboration_modes: None,
             auto_review: None,
             permissions: None,
+            token_budget: None,
         }));
         assert_eq!(
             model_no_personality.get_model_instructions(Some(Personality::Friendly)),
@@ -993,8 +1063,10 @@ mod tests {
                 personality_pragmatic: None,
             }),
             approvals: None,
+            collaboration_modes: None,
             auto_review: None,
             permissions: None,
+            token_budget: None,
         }));
 
         let instructions = model.get_model_instructions(Some(Personality::Friendly));

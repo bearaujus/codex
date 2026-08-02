@@ -7,7 +7,14 @@ import type { RateLimitReachedType } from "./RateLimitReachedType";
 import type { RateLimitWindow } from "./RateLimitWindow";
 import type { SpendControlLimitSnapshot } from "./SpendControlLimitSnapshot";
 
-export type RateLimitSnapshot = { limitId: string | null, limitName: string | null, primary: RateLimitWindow | null, secondary: RateLimitWindow | null, credits: CreditsSnapshot | null, individualLimit: SpendControlLimitSnapshot | null,
+export type RateLimitSnapshot = { limitId: string | null, limitName: string | null,
+/**
+ * Unix timestamp in seconds when this snapshot was fetched from the backend.
+ *
+ * `null` for rolling updates and servers that do not preserve the original
+ * observation time. Clients should use their receipt time only as a fallback.
+ */
+fetchedAt: number | null, primary: RateLimitWindow | null, secondary: RateLimitWindow | null, credits: CreditsSnapshot | null, individualLimit: SpendControlLimitSnapshot | null,
 /**
  * Backend-reported spend-control state. `None` is unavailable, not a sparse-update recovery.
  */

@@ -42,6 +42,13 @@
     },
     "AccountUpdatedNotification": {
       "properties": {
+        "accountEmail": {
+          "description": "Email for the current account, or `null` when unavailable or signed out.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "authMode": {
           "anyOf": [
             {
@@ -353,12 +360,6 @@
             "null"
           ]
         },
-        "firstPartyType": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "review": {
           "anyOf": [
             {
@@ -516,23 +517,9 @@
       "description": "Authentication mode for OpenAI-backed providers.",
       "oneOf": [
         {
-          "description": "OpenAI API key provided by the caller and stored by Codex.",
-          "enum": [
-            "apikey"
-          ],
-          "type": "string"
-        },
-        {
-          "description": "ChatGPT OAuth managed by Codex (tokens persisted and refreshed by Codex).",
+          "description": "ChatGPT OAuth managed via the ChatGPT account pool.",
           "enum": [
             "chatgpt"
-          ],
-          "type": "string"
-        },
-        {
-          "description": "[UNSTABLE] FOR OPENAI INTERNAL USE ONLY - DO NOT USE.\n\nChatGPT auth tokens are supplied by an external host app and are only stored in memory. Token refresh must be handled by the external host app.",
-          "enum": [
-            "chatgptAuthTokens"
           ],
           "type": "string"
         },
@@ -547,20 +534,6 @@
           "description": "Programmatic Codex auth backed by a registered Agent Identity.",
           "enum": [
             "agentIdentity"
-          ],
-          "type": "string"
-        },
-        {
-          "description": "Programmatic Codex auth backed by a personal access token.",
-          "enum": [
-            "personalAccessToken"
-          ],
-          "type": "string"
-        },
-        {
-          "description": "Amazon Bedrock bearer token managed by Codex.",
-          "enum": [
-            "bedrockApiKey"
           ],
           "type": "string"
         }
@@ -804,7 +777,7 @@
               "type": "string"
             },
             "path": {
-              "$ref": "#/definitions/AbsolutePathBuf"
+              "$ref": "#/definitions/LegacyAppPathString"
             },
             "type": {
               "enum": [
@@ -1277,6 +1250,14 @@
           ]
         },
         "target": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "default": null,
+          "description": "Original title for an imported session; null for other item types.",
           "type": [
             "string",
             "null"
@@ -2919,8 +2900,11 @@
         "pro",
         "prolite",
         "team",
+        "self_serve_business_prolite",
         "self_serve_business_usage_based",
         "business",
+        "ent26",
+        "enterprise_cbp_automation",
         "enterprise_cbp_usage_based",
         "enterprise",
         "edu",
@@ -3038,6 +3022,14 @@
             {
               "type": "null"
             }
+          ]
+        },
+        "fetchedAt": {
+          "description": "Unix timestamp in seconds when this snapshot was fetched from the backend.\n\n`null` for rolling updates and servers that do not preserve the original observation time. Clients should use their receipt time only as a fallback.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
           ]
         },
         "individualLimit": {
@@ -3800,6 +3792,27 @@
             "null"
           ]
         },
+        "section": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ThreadSection"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The independently persisted section selected for this thread, if any."
+        },
+        "sectionEnteredAt": {
+          "default": null,
+          "description": "Unix timestamp in seconds when the thread entered its current section.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "sessionId": {
           "description": "Session id shared by threads that belong to the same session tree.",
           "type": "string"
@@ -4217,8 +4230,24 @@
             "id": {
               "type": "string"
             },
+            "pluginId": {
+              "default": null,
+              "description": "Trusted first-party plugin id when this command resolves to one plugin script.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "processId": {
               "description": "Identifier for the underlying PTY process (when available).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "scriptPath": {
+              "default": null,
+              "description": "Safe plugin-relative path when this command resolves to one plugin script.",
               "type": [
                 "string",
                 "null"
@@ -4329,6 +4358,12 @@
             "pluginId": {
               "type": [
                 "string",
+                "null"
+              ]
+            },
+            "readOnlyHint": {
+              "type": [
+                "boolean",
                 "null"
               ]
             },
@@ -4950,6 +4985,24 @@
         "role",
         "text",
         "threadId"
+      ],
+      "type": "object"
+    },
+    "ThreadSection": {
+      "description": "An independently persisted, user-visible thread section.",
+      "properties": {
+        "id": {
+          "description": "Opaque UUIDv7 identity that remains stable when the section is renamed.",
+          "type": "string"
+        },
+        "name": {
+          "description": "The current user-visible section name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name"
       ],
       "type": "object"
     },

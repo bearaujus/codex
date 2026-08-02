@@ -1,5 +1,6 @@
 ---
-source: tui/src/chatwidget/tests.rs
+source: tui/src/chatwidget/tests/exec_flow.rs
+assertion_line: 718
 expression: snapshot
 ---
 History:
@@ -7,5 +8,5 @@ History:
   └ repro-marker
 
 Active:
-• Exploring
-  └ Read null
+• Exploring · 1 active · 0 done
+  └ Reading null

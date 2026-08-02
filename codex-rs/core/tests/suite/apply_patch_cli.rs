@@ -37,6 +37,7 @@ use codex_sandboxing::landlock::CODEX_LINUX_SANDBOX_ARG0;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use core_test_support::PathBufExt;
+use core_test_support::TestTargetOs;
 use core_test_support::assert_regex_match;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -56,6 +57,7 @@ use core_test_support::test_codex::TestCodexHarness;
 use core_test_support::test_codex::local;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
+use core_test_support::test_target_os;
 use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_with_timeout;
 use serde_json::json;
@@ -140,12 +142,14 @@ fn workspace_write_with_read_only_root(read_only_root: AbsolutePathBuf) -> Permi
                 path: read_only_root,
             },
             access: FileSystemAccessMode::Read,
+            missing_path_behavior: None,
         },
         FileSystemSandboxEntry {
             path: FileSystemPath::Special {
                 value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
             },
             access: FileSystemAccessMode::Write,
+            missing_path_behavior: None,
         },
     ]);
     PermissionProfile::from_runtime_permissions(
@@ -162,12 +166,14 @@ fn workspace_write_with_unreadable_path(unreadable_path: AbsolutePathBuf) -> Per
                 path: unreadable_path,
             },
             access: FileSystemAccessMode::Deny,
+            missing_path_behavior: None,
         },
         FileSystemSandboxEntry {
             path: FileSystemPath::Special {
                 value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
             },
             access: FileSystemAccessMode::Write,
+            missing_path_behavior: None,
         },
     ]);
     PermissionProfile::from_runtime_permissions(
@@ -495,6 +501,34 @@ async fn apply_patch_cli_add_overwrites_existing_file() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn apply_patch_cli_replaces_entire_file() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let harness = apply_patch_harness().await?;
+
+    harness
+        .write_file("replace.txt", "before\r\nafter\r\n")
+        .await?;
+
+    let patch = "*** Begin Patch\n*** Replace File: replace.txt\n+fresh\n+content\n*** End Patch";
+    let call_id = "apply-replace-file";
+    mount_apply_patch(&harness, call_id, patch, "ok").await;
+
+    harness.submit("replace a whole file").await?;
+
+    let out = harness.apply_patch_output(call_id).await;
+    assert_regex_match(
+        r"(?s)^Exit code: 0.*Success\. Updated the following files:\nM replace\.txt\n?$",
+        &out,
+    );
+    assert_eq!(
+        harness.read_file_text("replace.txt").await?,
+        "fresh\r\ncontent\r\n"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_cli_rejects_invalid_hunk_header() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -541,6 +575,9 @@ async fn apply_patch_cli_reports_missing_context() -> Result<()> {
         "expected verification failure message"
     );
     assert!(out.contains("Failed to find expected lines in"));
+    assert!(out.contains("Re-read the live file and retry with current context."));
+    assert!(out.contains("Nearby live lines from line 1:"));
+    assert!(out.contains("1| line1"));
     assert_eq!(
         harness.read_file_text("modify.txt").await?,
         "line1\nline2\n"
@@ -1579,6 +1616,63 @@ async fn apply_patch_emits_turn_diff_event_with_unified_diff() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn apply_patch_turn_diff_emits_portable_paths_for_remote_cwd() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_no_remote_env!(Ok(()));
+
+    let harness = apply_patch_harness().await?;
+    let test = harness.test();
+    let codex = test.codex.clone();
+
+    let call_id = "apply-foreign-windows-diff";
+    let file = "nested/foreign.txt";
+    let patch = format!("*** Begin Patch\n*** Add File: {file}\n+hello\n*** End Patch");
+    mount_apply_patch(&harness, call_id, &patch, "ok").await;
+
+    submit_without_wait(&harness, "emit diff for a foreign Windows cwd").await?;
+
+    let mut last_diff = None;
+    wait_for_event(&codex, |event| match event {
+        EventMsg::TurnDiff(ev) => {
+            last_diff = Some(ev.unified_diff.clone());
+            false
+        }
+        EventMsg::TurnComplete(_) => true,
+        _ => false,
+    })
+    .await;
+
+    let cwd = &test.executor_environment().selection().cwd;
+    let file_uri = cwd.join(file)?;
+    let expected_relative_path = match test_target_os() {
+        TestTargetOs::Linux | TestTargetOs::MacOs => "nested/foreign.txt",
+        TestTargetOs::Windows => r"nested\foreign.txt",
+    };
+    assert_eq!(
+        file_uri.relative_path_from(cwd).as_deref(),
+        Some(expected_relative_path)
+    );
+    assert_eq!(
+        test.fs()
+            .read_file_text(&file_uri, /*sandbox*/ None)
+            .await?,
+        "hello\n"
+    );
+    assert_eq!(
+        last_diff.expect("expected TurnDiff event"),
+        r#"diff --git a/nested/foreign.txt b/nested/foreign.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..ce013625030ba8dba906f756967f9e9ca394464a
+--- /dev/null
++++ b/nested/foreign.txt
+@@ -0,0 +1 @@
++hello
+"#
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn apply_patch_turn_diff_tracks_local_and_remote_environment_paths() -> Result<()> {
     // TODO(anp): Remove after shared-cwd helpers use target-native paths.
     skip_if_target_windows!(
@@ -1785,10 +1879,162 @@ async fn apply_patch_aggregates_diff_across_multiple_tool_calls() -> Result<()> 
     .await;
 
     let diff = last_diff.expect("expected TurnDiff after two patches");
-    assert!(diff.contains("agg/a.txt"), "diff missing a.txt");
-    assert!(diff.contains("agg/b.txt"), "diff missing b.txt");
+    assert!(diff.contains("agg/a.txt"), "diff missing agg/a.txt: {diff}");
+    assert!(diff.contains("agg/b.txt"), "diff missing agg/b.txt: {diff}");
     // Final content reflects v2 for a.txt
     assert!(diff.contains("+v2\n") || diff.contains("v2\n"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn apply_patch_allows_second_exact_match_update_with_unique_context_in_same_turn()
+-> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let harness = apply_patch_harness().await?;
+    harness.write_file("repeat.txt", "before\n").await?;
+
+    let call1 = "repeat-1";
+    let call2 = "repeat-2";
+    let patch1 = "*** Begin Patch\n*** Update File: repeat.txt\n@@\n-before\n+after\n*** End Patch";
+    let patch2 = "*** Begin Patch\n*** Update File: repeat.txt\n@@\n-after\n+again\n*** End Patch";
+
+    let s1 = sse(vec![
+        ev_response_created("resp-1"),
+        ev_apply_patch_custom_tool_call(call1, patch1),
+        ev_completed("resp-1"),
+    ]);
+    let s2 = sse(vec![
+        ev_response_created("resp-2"),
+        ev_apply_patch_custom_tool_call(call2, patch2),
+        ev_completed("resp-2"),
+    ]);
+    let s3 = sse(vec![
+        ev_assistant_message("msg-1", "done"),
+        ev_completed("resp-3"),
+    ]);
+    mount_sse_sequence(harness.server(), vec![s1, s2, s3]).await;
+
+    submit_without_wait(&harness, "repeat exact-match updates in one turn").await?;
+
+    wait_for_event(&harness.test().codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let first_out = harness.apply_patch_output(call1).await;
+    assert!(first_out.contains("Exit code: 0"));
+
+    // The second update anchors to a line ("after") that occurs exactly once in
+    // the live file, so it unambiguously targets one location and is applied
+    // without requiring a re-read.
+    let second_out = harness.apply_patch_output(call2).await;
+    assert!(second_out.contains("Exit code: 0"));
+    assert_eq!(harness.read_file_text("repeat.txt").await?, "again\n");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn apply_patch_requires_refresh_for_ambiguous_exact_match_update_in_same_turn() -> Result<()>
+{
+    skip_if_no_network!(Ok(()));
+
+    let harness = apply_patch_harness().await?;
+    harness
+        .write_file("ambig.txt", "header\ndup\ndup\nfooter\n")
+        .await?;
+
+    let call1 = "ambig-1";
+    let call2 = "ambig-2";
+    // First edit a unique line so the file is marked as edited this turn.
+    let patch1 = "*** Begin Patch\n*** Update File: ambig.txt\n@@\n-header\n+HEADER\n*** End Patch";
+    // The second update anchors to "dup", which occurs twice: the applier would
+    // resolve it to the first occurrence, which may not be the intended one now
+    // that the file shifted, so it must be refreshed before retrying.
+    let patch2 = "*** Begin Patch\n*** Update File: ambig.txt\n@@\n-dup\n+DUP\n*** End Patch";
+
+    let s1 = sse(vec![
+        ev_response_created("resp-1"),
+        ev_apply_patch_custom_tool_call(call1, patch1),
+        ev_completed("resp-1"),
+    ]);
+    let s2 = sse(vec![
+        ev_response_created("resp-2"),
+        ev_apply_patch_custom_tool_call(call2, patch2),
+        ev_completed("resp-2"),
+    ]);
+    let s3 = sse(vec![
+        ev_assistant_message("msg-1", "done"),
+        ev_completed("resp-3"),
+    ]);
+    mount_sse_sequence(harness.server(), vec![s1, s2, s3]).await;
+
+    submit_without_wait(&harness, "ambiguous exact-match update in one turn").await?;
+
+    wait_for_event(&harness.test().codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let first_out = harness.apply_patch_output(call1).await;
+    assert!(first_out.contains("Exit code: 0"));
+
+    let second_out = harness.apply_patch_output(call2).await;
+    assert!(second_out.contains("apply_patch verification failed"));
+    assert!(second_out.contains("ambiguous"));
+    assert!(second_out.contains("ambig.txt"));
+    assert!(second_out.contains("*** Replace File:"));
+    assert_eq!(
+        harness.read_file_text("ambig.txt").await?,
+        "HEADER\ndup\ndup\nfooter\n"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn apply_patch_allows_replace_file_after_prior_edit_in_same_turn() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let harness = apply_patch_harness().await?;
+    harness
+        .write_file("replace-after-update.txt", "before\n")
+        .await?;
+
+    let call1 = "replace-after-update-1";
+    let call2 = "replace-after-update-2";
+    let patch1 = "*** Begin Patch\n*** Update File: replace-after-update.txt\n@@\n-before\n+after\n*** End Patch";
+    let patch2 =
+        "*** Begin Patch\n*** Replace File: replace-after-update.txt\n+final\n*** End Patch";
+
+    let s1 = sse(vec![
+        ev_response_created("resp-1"),
+        ev_apply_patch_custom_tool_call(call1, patch1),
+        ev_completed("resp-1"),
+    ]);
+    let s2 = sse(vec![
+        ev_response_created("resp-2"),
+        ev_apply_patch_custom_tool_call(call2, patch2),
+        ev_completed("resp-2"),
+    ]);
+    let s3 = sse(vec![
+        ev_assistant_message("msg-1", "done"),
+        ev_completed("resp-3"),
+    ]);
+    mount_sse_sequence(harness.server(), vec![s1, s2, s3]).await;
+
+    submit_without_wait(&harness, "replace file after prior update").await?;
+
+    wait_for_event(&harness.test().codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let second_out = harness.apply_patch_output(call2).await;
+    assert!(second_out.contains("Exit code: 0"));
+    assert_eq!(
+        harness.read_file_text("replace-after-update.txt").await?,
+        "final\n"
+    );
     Ok(())
 }
 

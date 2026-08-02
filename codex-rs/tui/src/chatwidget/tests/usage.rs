@@ -103,6 +103,31 @@ fn reset_credit_options_use_generic_copy_when_backend_copy_is_missing() {
 }
 
 #[tokio::test]
+async fn failed_full_refresh_allows_later_rolling_rate_limit_updates() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.update_account_state(
+        /*status_account_display*/ None, /*plan_type*/ None,
+        /*has_chatgpt_account*/ true, /*has_codex_backend_auth*/ true,
+    );
+    let request_id = chat.start_rate_limit_reset_startup_check();
+
+    assert!(chat.finish_rate_limit_reset_hint_refresh(
+        request_id,
+        Vec::new(),
+        Err("backend unavailable".to_string()),
+    ));
+    chat.on_rolling_rate_limit_snapshot(snapshot(/*percent*/ 42.0));
+
+    assert_eq!(
+        chat.rate_limit_snapshots_by_limit_id
+            .get("codex")
+            .and_then(|snapshot| snapshot.primary.as_ref())
+            .map(|window| window.used_percent),
+        Some(42.0)
+    );
+}
+
+#[tokio::test]
 async fn usage_command_opens_menu_when_reset_is_available_snapshot() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     set_chatgpt_auth(&mut chat);

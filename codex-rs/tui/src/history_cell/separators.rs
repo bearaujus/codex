@@ -1,9 +1,10 @@
 //! Turn separators and runtime-metrics labels for transcript history.
 
 use super::*;
+use crate::line_truncation::truncate_line_with_ellipsis_if_overflow;
 
 #[derive(Debug)]
-/// A visual divider between turns, optionally showing how long the assistant "worked for".
+/// Compact metadata attached to the end of a completed turn.
 ///
 /// This separator is only emitted for turns that performed concrete work (e.g., running commands,
 /// applying patches, making MCP tool calls), so purely conversational turns do not show an empty
@@ -39,18 +40,16 @@ impl HistoryCell for FinalMessageSeparator {
         }
 
         if label_parts.is_empty() {
-            return vec![Line::from_iter(["─".repeat(width as usize).dim()])];
+            return Vec::new();
         }
-
-        let label = format!("─ {} ─", label_parts.join(" • "));
-        let (label, _suffix, label_width) = take_prefix_by_width(&label, width as usize);
-        vec![
-            Line::from_iter([
-                label,
-                "─".repeat((width as usize).saturating_sub(label_width)),
-            ])
-            .dim(),
-        ]
+        // Render this as supporting metadata attached to the response above.
+        // A standalone rule looks orphaned after a plan and visually competes
+        // with the final answer.
+        let label = format!("  └ {}", label_parts.join(" • "));
+        vec![truncate_line_with_ellipsis_if_overflow(
+            Line::from(label).dim(),
+            usize::from(width),
+        )]
     }
 
     fn raw_lines(&self) -> Vec<Line<'static>> {
@@ -70,6 +69,12 @@ impl HistoryCell for FinalMessageSeparator {
         } else {
             vec![Line::from(label_parts.join(" • "))]
         }
+    }
+
+    fn is_stream_continuation(&self) -> bool {
+        // The marker is itself the boundary; a leading blank row would spend
+        // vertical space expressing the same separation twice.
+        true
     }
 }
 
@@ -94,7 +99,7 @@ pub(crate) fn runtime_metrics_label(summary: RuntimeMetricsSummary) -> Option<St
     if summary.websocket_calls.count > 0 {
         let duration = format_duration_ms(summary.websocket_calls.duration_ms);
         parts.push(format!(
-            "WebSocket: {} events send ({duration})",
+            "WebSocket: {} events sent ({duration})",
             summary.websocket_calls.count
         ));
     }

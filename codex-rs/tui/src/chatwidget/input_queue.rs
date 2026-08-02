@@ -7,6 +7,7 @@ use std::collections::VecDeque;
 
 use super::PendingSteer;
 use super::QueuedUserMessage;
+use super::StagedUserMessage;
 use super::UserMessage;
 use super::UserMessageHistoryRecord;
 use super::user_message_preview_text;
@@ -27,6 +28,8 @@ pub(super) struct InputQueueState {
     /// stays in lockstep with `queued_user_messages`, with missing entries
     /// treated as user-message text.
     pub(super) queued_user_message_history_records: VecDeque<UserMessageHistoryRecord>,
+    /// User messages held locally during the Undo Send grace window.
+    pub(super) staged_user_messages: VecDeque<StagedUserMessage>,
     /// A user turn has been submitted to core, but `TurnStarted` has not arrived yet.
     pub(super) user_turn_pending_start: bool,
     /// User messages that tried to steer a non-regular turn and must be retried first.
@@ -52,6 +55,7 @@ impl InputQueueState {
     pub(super) fn clear(&mut self) {
         self.queued_user_messages.clear();
         self.queued_user_message_history_records.clear();
+        self.staged_user_messages.clear();
         self.user_turn_pending_start = false;
         self.rejected_steers_queue.clear();
         self.rejected_steer_history_records.clear();

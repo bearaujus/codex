@@ -124,6 +124,11 @@ impl ChatWidget {
     pub(super) fn on_interrupted_turn(&mut self, reason: TurnAbortReason) {
         // Finalize, log a gentle prompt, and clear running state.
         self.finalize_turn();
+        if !self.transcript.saw_final_answer_this_turn
+            && let Some(commentary) = self.transcript.latest_commentary_markdown.clone()
+        {
+            self.add_to_history(history_cell::InterruptedCommentaryCell::new(&commentary));
+        }
         let send_pending_steers_immediately =
             self.input_queue.submit_pending_steers_after_interrupt;
         self.input_queue.submit_pending_steers_after_interrupt = false;
@@ -301,7 +306,7 @@ impl ChatWidget {
         self.bottom_pane.set_composer_pending_pastes(pending_pastes);
     }
 
-    fn composer_state_from_user_message(
+    pub(super) fn composer_state_from_user_message(
         user_message: UserMessage,
         pending_pastes: Vec<(String, String)>,
     ) -> ThreadComposerState {
@@ -360,6 +365,7 @@ impl ChatWidget {
                 .input_queue
                 .queued_user_message_history_records
                 .clone(),
+            staged_user_messages: self.input_queue.staged_user_messages.clone(),
             user_turn_pending_start: self.input_queue.user_turn_pending_start,
             submit_pending_steers_after_interrupt: self
                 .input_queue
@@ -404,6 +410,7 @@ impl ChatWidget {
             let mut queued_user_messages = input_state.queued_user_messages;
             let mut queued_user_message_history_records =
                 input_state.queued_user_message_history_records;
+            self.input_queue.staged_user_messages = input_state.staged_user_messages;
             if preserve_in_flight_turn {
                 self.input_queue.pending_steers = pending_steers
                     .into_iter()
@@ -452,6 +459,9 @@ impl ChatWidget {
             self.input_queue.clear();
             self.restore_composer_state(Default::default());
         }
+        let effort = self.effective_reasoning_effort();
+        self.bottom_pane
+            .set_active_reasoning_effort_baseline(effort.as_ref());
         self.turn_lifecycle
             .restore_running(self.turn_lifecycle.agent_turn_running, Instant::now());
         self.update_task_running_state();

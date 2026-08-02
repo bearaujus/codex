@@ -384,6 +384,7 @@ async fn restore_thread_input_state_restores_pending_steers_without_downgrading_
             rejected_steer_history_records: VecDeque::new(),
             queued_user_messages,
             queued_user_message_history_records: VecDeque::new(),
+            staged_user_messages: VecDeque::new(),
             user_turn_pending_start: false,
             submit_pending_steers_after_interrupt: false,
             current_collaboration_mode: chat.current_collaboration_mode.clone(),
@@ -1191,6 +1192,19 @@ async fn interrupt_exec_marks_failed_snapshot() {
     // The first inserted cell should be the finalized exec; snapshot its text.
     let exec_blob = lines_to_single_string(&cells[0]);
     assert_chatwidget_snapshot!("interrupt_exec_marks_failed", exec_blob);
+}
+
+#[tokio::test]
+async fn interrupt_exploration_marks_card_failed_snapshot() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    begin_exec(&mut chat, "call-search", "rg needle src");
+    handle_exec_output_delta(&mut chat, "call-search", "src/lib.rs:1:needle\n");
+    handle_turn_interrupted(&mut chat, "turn-1");
+
+    let cells = drain_insert_history(&mut rx);
+    let exec_blob = lines_to_single_string(cells.first().expect("failed exploration card"));
+    assert_chatwidget_snapshot!("interrupt_exploration_marks_card_failed", exec_blob);
 }
 
 // Snapshot test: after an interrupted turn, a gentle error message is inserted

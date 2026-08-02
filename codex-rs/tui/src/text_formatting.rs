@@ -1,6 +1,6 @@
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthChar;
-use unicode_width::UnicodeWidthStr;
+
+use crate::width::display_width;
 
 pub(crate) fn capitalize_first(input: &str) -> String {
     let mut chars = input.chars();
@@ -11,25 +11,6 @@ pub(crate) fn capitalize_first(input: &str) -> String {
             capitalized
         }
         None => String::new(),
-    }
-}
-
-/// Truncate a tool result to fit within the given height and width. If the text is valid JSON, we format it in a compact way before truncating.
-/// This is a best-effort approach that may not work perfectly for text where 1 grapheme is rendered as multiple terminal cells.
-pub(crate) fn format_and_truncate_tool_result(
-    text: &str,
-    max_lines: usize,
-    line_width: usize,
-) -> String {
-    // Work out the maximum number of graphemes we can display for a result.
-    // It's not guaranteed that 1 grapheme = 1 cell, so we subtract 1 per line as a fudge factor.
-    // It also won't handle future terminal resizes properly, but it's an OK approximation for now.
-    let max_graphemes = (max_lines * line_width).saturating_sub(max_lines);
-
-    if let Some(formatted_json) = format_json_compact(text) {
-        truncate_text(&formatted_json, max_graphemes)
-    } else {
-        truncate_text(text, max_graphemes)
     }
 }
 
@@ -121,7 +102,7 @@ pub(crate) fn center_truncate_path(path: &str, max_width: usize) -> String {
     if max_width == 0 {
         return String::new();
     }
-    if UnicodeWidthStr::width(path) <= max_width {
+    if display_width(path) <= max_width {
         return path.to_string();
     }
 
@@ -142,7 +123,7 @@ pub(crate) fn center_truncate_path(path: &str, max_width: usize) -> String {
     if raw_segments.is_empty() {
         if has_leading_sep {
             let root = sep.to_string();
-            if UnicodeWidthStr::width(root.as_str()) <= max_width {
+            if display_width(root.as_str()) <= max_width {
                 return root;
             }
         }
@@ -174,27 +155,27 @@ pub(crate) fn center_truncate_path(path: &str, max_width: usize) -> String {
         if allowed_width == 0 {
             return String::new();
         }
-        if UnicodeWidthStr::width(original) <= allowed_width {
+        if display_width(original) <= allowed_width {
             return original.to_string();
         }
         if allowed_width == 1 {
             return "…".to_string();
         }
 
-        let mut kept: Vec<char> = Vec::new();
+        let mut kept = Vec::new();
         let mut used_width = 1; // reserve space for leading ellipsis
-        for ch in original.chars().rev() {
-            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-            if used_width + ch_width > allowed_width {
+        for grapheme in original.graphemes(/*is_extended*/ true).rev() {
+            let grapheme_width = display_width(grapheme);
+            if used_width + grapheme_width > allowed_width {
                 break;
             }
-            used_width += ch_width;
-            kept.push(ch);
+            used_width += grapheme_width;
+            kept.push(grapheme);
         }
         kept.reverse();
         let mut truncated = String::from("…");
-        for ch in kept {
-            truncated.push(ch);
+        for grapheme in kept {
+            truncated.push_str(grapheme);
         }
         truncated
     };
@@ -236,7 +217,7 @@ pub(crate) fn center_truncate_path(path: &str, max_width: usize) -> String {
         |segments: &mut Vec<Segment<'_>>, allow_front_truncate: bool| -> Option<String> {
             loop {
                 let candidate = assemble(has_leading_sep, segments);
-                let width = UnicodeWidthStr::width(candidate.as_str());
+                let width = display_width(candidate.as_str());
                 if width <= max_width {
                     return Some(candidate);
                 }
@@ -263,11 +244,11 @@ pub(crate) fn center_truncate_path(path: &str, max_width: usize) -> String {
 
                 let mut changed = false;
                 for idx in indices {
-                    let original_width = UnicodeWidthStr::width(segments[idx].original);
+                    let original_width = display_width(segments[idx].original);
                     if original_width <= max_width && segment_count > 2 {
                         continue;
                     }
-                    let seg_width = UnicodeWidthStr::width(segments[idx].text.as_str());
+                    let seg_width = display_width(segments[idx].text.as_str());
                     let other_width = width.saturating_sub(seg_width);
                     let allowed_width = max_width.saturating_sub(other_width).max(1);
                     let new_text = front_truncate(segments[idx].original, allowed_width);

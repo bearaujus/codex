@@ -138,6 +138,9 @@ pub struct ModelProviderInfo {
     /// Whether this provider supports the Responses API WebSocket transport.
     #[serde(default)]
     pub supports_websockets: bool,
+    /// Whether this provider supports the standalone web-search endpoint.
+    #[serde(default)]
+    pub supports_standalone_web_search: bool,
 }
 
 /// AWS SigV4 auth configuration for a model provider.
@@ -241,13 +244,7 @@ impl ModelProviderInfo {
     pub fn to_api_provider(&self, auth_mode: Option<AuthMode>) -> CodexResult<ApiProvider> {
         let default_base_url = if matches!(
             auth_mode,
-            Some(
-                AuthMode::Chatgpt
-                    | AuthMode::ChatgptAuthTokens
-                    | AuthMode::Headers
-                    | AuthMode::AgentIdentity
-                    | AuthMode::PersonalAccessToken
-            )
+            Some(AuthMode::Chatgpt | AuthMode::Headers | AuthMode::AgentIdentity)
         ) {
             CHATGPT_CODEX_BASE_URL
         } else {
@@ -360,6 +357,7 @@ impl ModelProviderInfo {
             websocket_connect_timeout_ms: None,
             requires_openai_auth: true,
             supports_websockets: true,
+            supports_standalone_web_search: true,
         }
     }
 
@@ -393,6 +391,7 @@ impl ModelProviderInfo {
             websocket_connect_timeout_ms: None,
             requires_openai_auth: false,
             supports_websockets: false,
+            supports_standalone_web_search: false,
         }
     }
 
@@ -540,6 +539,7 @@ pub fn create_oss_provider_with_base_url(base_url: &str, wire_api: WireApi) -> M
         websocket_connect_timeout_ms: None,
         requires_openai_auth: false,
         supports_websockets: false,
+        supports_standalone_web_search: false,
     }
 }
 

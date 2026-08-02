@@ -3,11 +3,14 @@
 use codex_app_server_protocol::CommandExecutionSource as ExecCommandSource;
 use codex_protocol::parse_command::ParsedCommand;
 
+use crate::exec_cell::CommandPresentation;
 use crate::exec_command::split_command_string;
 
+#[derive(Clone)]
 pub(super) struct RunningCommand {
     pub(super) command: Vec<String>,
     pub(super) parsed_cmd: Vec<ParsedCommand>,
+    pub(super) presentation: CommandPresentation,
     pub(super) source: ExecCommandSource,
 }
 

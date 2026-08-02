@@ -4,4 +4,8 @@
 import type { AuthMode } from "../AuthMode";
 import type { PlanType } from "../PlanType";
 
-export type AccountUpdatedNotification = { authMode: AuthMode | null, planType: PlanType | null, };
+export type AccountUpdatedNotification = { authMode: AuthMode | null, planType: PlanType | null,
+/**
+ * Email for the current account, or `null` when unavailable or signed out.
+ */
+accountEmail: string | null, };

@@ -3,6 +3,10 @@
 use super::*;
 
 impl ChatWidget {
+    pub(crate) fn keymap_contexts(&self) -> crate::keymap::KeymapContextSet {
+        self.bottom_pane.keymap_contexts()
+    }
+
     pub(crate) fn handle_key_event(&mut self, key_event: KeyEvent) {
         if self.bottom_pane.has_active_view()
             && !matches!(
@@ -105,12 +109,51 @@ impl ChatWidget {
             _ => {}
         }
 
+        if matches!(
+            key_event,
+            KeyEvent {
+                code: KeyCode::Esc,
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            }
+        ) && self.has_staged_submission()
+        {
+            self.cancel_latest_staged_submission();
+            return;
+        }
+
+        let contextual_up_recall = matches!(
+            key_event,
+            KeyEvent {
+                code: KeyCode::Up,
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press,
+                ..
+            }
+        ) && self.bottom_pane.composer_is_empty()
+            && self.bottom_pane.no_modal_or_popup_active()
+            && (self.has_staged_submission()
+                || (self.bottom_pane.is_task_running() && self.has_queued_follow_up_messages()));
+        if contextual_up_recall {
+            if !self.cancel_latest_staged_submission()
+                && let Some(composer) = self.pop_latest_queued_composer_state()
+            {
+                self.restore_composer_state(composer);
+                self.refresh_pending_input_preview();
+                self.request_redraw();
+            }
+            return;
+        }
+
         if key_event.kind == KeyEventKind::Press
             && self.chat_keymap.edit_queued_message.is_pressed(key_event)
-            && self.has_queued_follow_up_messages()
+            && (self.has_staged_submission() || self.has_queued_follow_up_messages())
             && self.bottom_pane.no_modal_or_popup_active()
         {
-            if let Some(composer) = self.pop_latest_queued_composer_state() {
+            if !self.cancel_latest_staged_submission()
+                && let Some(composer) = self.pop_latest_queued_composer_state()
+            {
                 self.restore_composer_state(composer);
                 self.refresh_pending_input_preview();
                 self.request_redraw();
@@ -231,6 +274,24 @@ impl ChatWidget {
         self.bottom_pane.show_selection_view(params);
         self.refresh_plan_mode_nudge();
         self.request_redraw();
+    }
+
+    pub(crate) fn selected_index_for_present_view(&self, view_id: &'static str) -> Option<usize> {
+        self.bottom_pane.selected_index_for_present_view(view_id)
+    }
+
+    pub(crate) fn replace_selection_view_if_present(
+        &mut self,
+        view_id: &'static str,
+        params: SelectionViewParams,
+    ) -> bool {
+        let replaced = self
+            .bottom_pane
+            .replace_selection_view_if_present(view_id, params);
+        if replaced {
+            self.refresh_plan_mode_nudge();
+        }
+        replaced
     }
 
     pub(crate) fn no_modal_or_popup_active(&self) -> bool {

@@ -1,10 +1,11 @@
 ---
-source: tui/src/history_cell.rs
+source: tui/src/history_cell/tests.rs
+assertion_line: 1955
 expression: rendered
 ---
-• Ran seq 1 10 1>&2 && false
-  └ 1
-    2
-    … +6 lines (ctrl + t to view transcript)
-    9
-    10
+• Failed (exit 1) seq 1 10 1>&2 && false
+  │ 1
+  │ 2
+  │ … +6 lines
+  │ 9
+  └ 10

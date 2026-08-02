@@ -32,6 +32,7 @@ use codex_extension_api::UserInstructionsProvider;
 use codex_extension_api::empty_extension_registry;
 use codex_features::Feature;
 use codex_home::CodexHomeUserInstructionsProvider;
+use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::built_in_model_providers;
@@ -41,13 +42,13 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RealtimeConversationVersion as RealtimeWsVersion;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::TurnEnvironmentSelections;
 use codex_protocol::user_input::UserInput;
@@ -67,6 +68,7 @@ use crate::responses::output_value_to_text;
 use crate::responses::start_mock_server;
 use crate::streaming_sse::StreamingSseServer;
 use crate::test_environment;
+use crate::wait_for_event;
 use crate::wait_for_event_match;
 use crate::wait_for_event_with_timeout;
 use wiremock::Match;
@@ -279,13 +281,6 @@ pub enum ApplyPatchModelOutput {
     ShellCommandViaHeredoc,
 }
 
-/// A collection of different ways the model can output an apply_patch call
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ShellModelOutput {
-    ShellCommand,
-    // UnifiedExec has its own set of tests
-}
-
 /// Returns the permission fields required by test thread-settings overrides.
 pub fn turn_permission_fields(
     permission_profile: PermissionProfile,
@@ -299,7 +294,8 @@ pub fn turn_permission_fields(
 
 pub struct TestCodexBuilder {
     config_mutators: Vec<Box<ConfigMutator>>,
-    auth: CodexAuth,
+    auth: Option<CodexAuth>,
+    auth_manager: Option<Arc<AuthManager>>,
     pre_build_hooks: Vec<Box<PreBuildHook>>,
     workspace_setups: Vec<Box<WorkspaceSetup>>,
     home: Option<Arc<TempDir>>,
@@ -324,7 +320,14 @@ impl TestCodexBuilder {
     }
 
     pub fn with_auth(mut self, auth: CodexAuth) -> Self {
-        self.auth = auth;
+        self.auth = Some(auth);
+        self
+    }
+
+    /// Inject a fully constructed [`AuthManager`], for example one opened via
+    /// [`AuthManager::shared`] over a ChatGPT account-pool home directory.
+    pub fn with_auth_manager(mut self, auth_manager: Arc<AuthManager>) -> Self {
+        self.auth_manager = Some(auth_manager);
         self
     }
 
@@ -555,6 +558,21 @@ impl TestCodexBuilder {
         .await
     }
 
+    pub async fn restart(
+        &mut self,
+        server: &MockServer,
+        previous: &TestCodex,
+    ) -> Result<TestCodex> {
+        let rollout_path = previous
+            .session_configured
+            .rollout_path
+            .clone()
+            .context("rollout path")?;
+        previous.codex.shutdown_and_wait().await?;
+        self.resume(server, Arc::clone(&previous.home), rollout_path)
+            .await
+    }
+
     async fn build_with_home_and_base_url(
         &mut self,
         base_url: String,
@@ -621,7 +639,6 @@ impl TestCodexBuilder {
         test_env: TestEnv,
         environment_manager: Arc<codex_exec_server::EnvironmentManager>,
     ) -> anyhow::Result<TestCodex> {
-        let auth = self.auth.clone();
         let state_db = codex_core::init_state_db(&config).await;
         let thread_store = thread_store_from_config(&config, state_db.clone());
         let installation_id = resolve_installation_id(&config.codex_home).await?;
@@ -631,11 +648,17 @@ impl TestCodexBuilder {
                     config.codex_home.clone(),
                 ))
             });
-        let auth_manager = codex_core::test_support::auth_manager_from_auth(auth.clone());
+        let auth_manager = if let Some(auth_manager) = self.auth_manager.clone() {
+            auth_manager
+        } else if let Some(auth) = self.auth.clone() {
+            codex_core::test_support::auth_manager_from_auth(auth)
+        } else {
+            AuthManager::shared_from_config(&config).await
+        };
         let thread_manager = ThreadManager::new(
             &config,
             auth_manager.clone(),
-            codex_core::build_models_manager(&config, auth_manager),
+            codex_core::build_models_manager(&config, auth_manager.clone()),
             codex_core::CodexAppsToolsCache::default(),
             SessionSource::Exec,
             Arc::clone(&environment_manager),
@@ -658,6 +681,7 @@ impl TestCodexBuilder {
             codex_core::test_support::with_code_mode_host_program(
                 thread_manager,
                 code_mode_host_program,
+                &config,
             )
         } else {
             thread_manager
@@ -665,65 +689,49 @@ impl TestCodexBuilder {
         let thread_manager = Arc::new(thread_manager);
         let user_shell_override = self.user_shell_override.clone();
 
-        let new_conversation = match (resume_from, user_shell_override) {
-            (Some(path), Some(user_shell_override)) => {
-                let auth_manager = codex_core::test_support::auth_manager_from_auth(auth);
-                Box::pin(
+        let new_conversation =
+            match (resume_from, user_shell_override) {
+                (Some(path), Some(user_shell_override)) => Box::pin(
                     codex_core::test_support::resume_thread_from_rollout_with_user_shell_override(
                         thread_manager.as_ref(),
                         config.clone(),
                         path,
-                        auth_manager,
+                        auth_manager.clone(),
                         user_shell_override,
                         self.supports_openai_form_elicitation,
                     ),
                 )
-                .await?
-            }
-            (Some(path), None) => {
-                let auth_manager = codex_core::test_support::auth_manager_from_auth(auth);
-                Box::pin(thread_manager.resume_thread_from_rollout(
-                    config.clone(),
-                    path,
-                    auth_manager,
-                    /*parent_trace*/ None,
-                    self.supports_openai_form_elicitation,
-                ))
-                .await?
-            }
-            (None, Some(user_shell_override)) => {
-                Box::pin(
-                    codex_core::test_support::start_thread_with_user_shell_override(
-                        thread_manager.as_ref(),
+                .await?,
+                (Some(path), None) => {
+                    Box::pin(thread_manager.resume_thread_from_rollout(
                         config.clone(),
-                        user_shell_override,
+                        path,
+                        auth_manager.clone(),
+                        /*parent_trace*/ None,
                         self.supports_openai_form_elicitation,
-                    ),
-                )
-                .await?
-            }
-            (None, None) => {
-                let environments = thread_manager
-                    .default_environment_selections(&config.cwd, &config.workspace_roots);
-                Box::pin(
-                    thread_manager.start_thread_with_options(StartThreadOptions {
-                        config: config.clone(),
-                        allow_provider_model_fallback: false,
-                        initial_history: InitialHistory::New,
+                    ))
+                    .await?
+                }
+                (None, Some(user_shell_override)) => {
+                    Box::pin(
+                        codex_core::test_support::start_thread_with_user_shell_override(
+                            thread_manager.as_ref(),
+                            config.clone(),
+                            user_shell_override,
+                            self.supports_openai_form_elicitation,
+                        ),
+                    )
+                    .await?
+                }
+                (None, None) => {
+                    Box::pin(thread_manager.start_thread(StartThreadOptions {
                         history_mode: self.history_mode,
-                        session_source: None,
-                        thread_source: None,
-                        dynamic_tools: Vec::new(),
-                        metrics_service_name: None,
-                        parent_trace: None,
-                        environments,
-                        thread_extension_init: Default::default(),
                         supports_openai_form_elicitation: self.supports_openai_form_elicitation,
-                    }),
-                )
-                .await?
-            }
-        };
+                        ..StartThreadOptions::new(config.clone())
+                    }))
+                    .await?
+                }
+            };
 
         Ok(TestCodex {
             home,
@@ -849,6 +857,25 @@ impl TestCodex {
     pub async fn submit_turn(&self, prompt: &str) -> Result<()> {
         self.submit_turn_with_permission_profile(prompt, PermissionProfile::Disabled)
             .await
+    }
+
+    /// Submits a text turn without changing the current thread settings.
+    pub async fn submit_text_turn(&self, prompt: &str) -> Result<()> {
+        self.codex
+            .submit(Op::UserInput {
+                items: vec![UserInput::Text {
+                    text: prompt.into(),
+                    text_elements: Vec::new(),
+                }],
+                final_output_json_schema: None,
+                responsesapi_client_metadata: None,
+                additional_context: Default::default(),
+                thread_settings: ThreadSettingsOverrides::default(),
+            })
+            .await?;
+
+        wait_for_event(&self.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+        Ok(())
     }
 
     pub async fn submit_turn_with_permission_profile(
@@ -980,7 +1007,7 @@ impl TestCodex {
                 final_output_json_schema: None,
                 responsesapi_client_metadata: None,
                 additional_context: Default::default(),
-                thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                thread_settings: ThreadSettingsOverrides {
                     environments: turn_environment_selections,
                     approval_policy: Some(approval_policy),
                     sandbox_policy: Some(sandbox_policy),
@@ -1023,14 +1050,6 @@ pub struct TestCodexHarness {
 }
 
 impl TestCodexHarness {
-    pub async fn new() -> Result<Self> {
-        Self::with_builder(test_codex()).await
-    }
-
-    pub async fn with_config(mutator: impl FnOnce(&mut Config) + Send + 'static) -> Result<Self> {
-        Self::with_builder(test_codex().with_config(mutator)).await
-    }
-
     pub async fn with_builder(mut builder: TestCodexBuilder) -> Result<Self> {
         let server = start_mock_server().await;
         let test = builder.build(&server).await?;
@@ -1053,10 +1072,6 @@ impl TestCodexHarness {
 
     pub fn cwd(&self) -> &Path {
         self.test.config.cwd.as_path()
-    }
-
-    pub fn cwd_abs(&self) -> AbsolutePathBuf {
-        self.test.config.cwd.clone()
     }
 
     pub fn path(&self, rel: impl AsRef<Path>) -> PathBuf {
@@ -1160,16 +1175,6 @@ impl TestCodexHarness {
         Box::pin(self.test.submit_turn(prompt)).await
     }
 
-    pub async fn submit_with_policy(
-        &self,
-        prompt: &str,
-        sandbox_policy: SandboxPolicy,
-    ) -> Result<()> {
-        self.test
-            .submit_turn_with_policy(prompt, sandbox_policy)
-            .await
-    }
-
     pub async fn submit_with_permission_profile(
         &self,
         prompt: &str,
@@ -1265,8 +1270,16 @@ pub fn test_codex() -> TestCodexBuilder {
                 .features
                 .disable(Feature::ShellSnapshot)
                 .expect("test config should allow ShellSnapshot override");
+            // The historical API-key fixture did not compress requests. Preserve that generic
+            // harness contract for the unauthenticated mock provider; compression tests opt in
+            // explicitly.
+            config
+                .features
+                .disable(Feature::EnableRequestCompression)
+                .expect("test config should allow request-compression override");
         })],
-        auth: CodexAuth::from_api_key("dummy"),
+        auth: None,
+        auth_manager: None,
         pre_build_hooks: vec![],
         workspace_setups: vec![],
         home: None,

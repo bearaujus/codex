@@ -47,7 +47,10 @@ async fn apply_verified_patch(root: &Path, patch: &str) -> AppliedPatchDelta {
 }
 
 fn tracker_with_root(root: &Path) -> TurnDiffTracker {
-    TurnDiffTracker::with_environment_display_roots([("".to_string(), root.to_path_buf())])
+    TurnDiffTracker::with_environment_display_roots([(
+        "".to_string(),
+        PathUri::from_host_native_path(root).expect("absolute display root"),
+    )])
 }
 
 #[tokio::test]
@@ -111,8 +114,14 @@ async fn tracks_same_absolute_path_across_multiple_environments() {
     .await;
 
     let mut tracker = TurnDiffTracker::with_environment_display_roots([
-        ("local".to_string(), dir.path().to_path_buf()),
-        ("remote".to_string(), dir.path().to_path_buf()),
+        (
+            "local".to_string(),
+            PathUri::from_host_native_path(dir.path()).expect("absolute local display root"),
+        ),
+        (
+            "remote".to_string(),
+            PathUri::from_host_native_path(dir.path()).expect("absolute remote display root"),
+        ),
     ]);
     tracker.track_delta("remote", &add);
     tracker.track_delta("local", &add);
@@ -136,6 +145,21 @@ index {ZERO_OID}..{right_oid}
 "#,
     );
     assert_eq!(tracker.get_unified_diff(), Some(expected));
+}
+
+#[test]
+fn displays_foreign_paths_relative_to_their_environment_root() {
+    let tracker = TurnDiffTracker::with_environment_display_roots([(
+        "windows".to_string(),
+        PathUri::parse("file:///C:/workspace/project").expect("valid Windows display root"),
+    )]);
+    let path = TrackedPath::new(
+        "windows",
+        &PathUri::parse("file:///C:/workspace/project/src/main.rs")
+            .expect("valid Windows file path"),
+    );
+
+    assert_eq!(tracker.display_path(&path), r"src\main.rs");
 }
 
 #[tokio::test]
@@ -339,6 +363,35 @@ index {left_oid_b}..{right_oid_b}
 }
 
 #[tokio::test]
+async fn refresh_required_for_existing_path_after_turn_edit_but_not_for_new_add() {
+    let dir = tempdir().expect("tempdir");
+    fs::write(dir.path().join("existing.txt"), "before\n").expect("seed file");
+
+    let mut tracker = tracker_with_root(dir.path());
+    let update_existing = apply_verified_patch(
+        dir.path(),
+        "*** Begin Patch\n*** Update File: existing.txt\n@@\n-before\n+after\n*** End Patch",
+    )
+    .await;
+    tracker.track_delta("", &update_existing);
+
+    let existing_path = PathUri::from_host_native_path(dir.path().join("existing.txt"))
+        .expect("absolute existing file path");
+    assert!(tracker.requires_refresh_for_exact_match_update(&existing_path));
+
+    let add_new = apply_verified_patch(
+        dir.path(),
+        "*** Begin Patch\n*** Add File: new.txt\n+hello\n*** End Patch",
+    )
+    .await;
+    tracker.track_delta("", &add_new);
+
+    let new_path =
+        PathUri::from_host_native_path(dir.path().join("new.txt")).expect("absolute new file path");
+    assert!(!tracker.requires_refresh_for_exact_match_update(&new_path));
+}
+
+#[tokio::test]
 async fn preserves_committed_change_order_with_delete_then_move_overwrite() {
     let dir = tempdir().expect("tempdir");
     fs::write(dir.path().join("a.txt"), "from\n").expect("seed source");
@@ -463,7 +516,8 @@ fn large_rewrite_returns_promptly_and_preserves_exact_content() {
             .success()
     );
     let tracker = tracker_with_root(dir.path());
-    let tracked_path = TrackedPath::new("", &path);
+    let path_uri = PathUri::from_host_native_path(&path).expect("absolute tracked path");
+    let tracked_path = TrackedPath::new("", &path_uri);
 
     let started = Instant::now();
     let diff = tracker

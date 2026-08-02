@@ -1,0 +1,12 @@
+---
+source: tui/src/chatwidget/tests/exec_flow.rs
+expression: "format!(\"PRIMARY:\\n{primary}\\nTRANSCRIPT:\\n{transcript}\")"
+---
+PRIMARY:
+• Interrupted: Checking the retry boundary.
+■ Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to report the issue.
+
+TRANSCRIPT:
+› Inspecting the failure path.
+  Checking the retry boundary.
+■ Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to report the issue.

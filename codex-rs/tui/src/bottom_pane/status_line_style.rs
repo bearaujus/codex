@@ -9,7 +9,7 @@ use ratatui::text::Span;
 use super::status_line_setup::StatusLineItem;
 use crate::render::highlight::foreground_style_for_scopes;
 
-const STATUS_LINE_SEPARATOR: &str = " · ";
+pub(crate) const STATUS_LINE_SEPARATOR: &str = "  ·  ";
 const STATUS_LINE_COLOR_SATURATION_PERCENT: u16 = 85;
 const STATUS_LINE_COLOR_BRIGHTNESS_PERCENT: u16 = 100;
 
@@ -44,7 +44,7 @@ impl StatusLineAccent {
             | StatusLineItem::UsedTokens
             | StatusLineItem::TotalInputTokens
             | StatusLineItem::TotalOutputTokens => Self::Usage,
-            StatusLineItem::FiveHourLimit | StatusLineItem::WeeklyLimit => Self::Limit,
+            StatusLineItem::AccountStatus => Self::Limit,
             StatusLineItem::CodexVersion | StatusLineItem::SessionId => Self::Metadata,
             StatusLineItem::FastMode | StatusLineItem::RawOutput => Self::Mode,
             StatusLineItem::Permissions => Self::Mode,
@@ -101,6 +101,9 @@ where
 {
     let mut spans = Vec::new();
     for (item, text) in segments {
+        if text.trim().is_empty() {
+            continue;
+        }
         if !spans.is_empty() {
             spans.push(STATUS_LINE_SEPARATOR.dim());
         }
@@ -202,7 +205,7 @@ mod tests {
         )
         .expect("status line");
 
-        assert_eq!(line_text(&line), "gpt-5 · /repo · main");
+        assert_eq!(line_text(&line), "gpt-5  ·  /repo  ·  main");
         assert_eq!(line.spans[0].style.fg, Some(Color::Cyan));
         assert!(!line.spans[0].style.add_modifier.contains(Modifier::DIM));
         assert_eq!(line.spans[2].style.fg, Some(Color::Green));
@@ -259,7 +262,7 @@ mod tests {
         )
         .expect("status line");
 
-        assert_eq!(line_text(&line), "gpt-5 · Context 12% used");
+        assert_eq!(line_text(&line), "gpt-5  ·  Context 12% used");
         assert_eq!(line.spans[0].style.fg, None);
         assert!(line.spans[0].style.add_modifier.contains(Modifier::DIM));
         assert!(line.spans[1].style.add_modifier.contains(Modifier::DIM));
@@ -296,5 +299,21 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn status_line_segments_skip_blank_values_without_leaving_orphan_separators() {
+        let line = status_line_from_segments_with_resolver(
+            [
+                (StatusLineItem::ModelName, "gpt-5".to_string()),
+                (StatusLineItem::WorkspaceHeadline, " \t".to_string()),
+                (StatusLineItem::GitBranch, "main".to_string()),
+            ],
+            /*use_theme_colors*/ false,
+            |_| None,
+        )
+        .expect("status line");
+
+        assert_eq!(line_text(&line), "gpt-5  ·  main");
     }
 }

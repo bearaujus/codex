@@ -5,9 +5,11 @@ use codex_protocol::auth::PlanType;
 use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use sha2::Digest;
+use sha2::Sha256;
 use thiserror::Error;
 
-#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Default)]
+#[derive(Deserialize, Serialize, Clone, PartialEq, Default)]
 pub struct TokenData {
     /// Flat info parsed from the JWT in auth.json.
     #[serde(
@@ -24,6 +26,17 @@ pub struct TokenData {
     pub account_id: Option<String>,
 }
 
+impl std::fmt::Debug for TokenData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenData")
+            .field("id_token_set", &!self.id_token.raw_jwt.is_empty())
+            .field("access_token_set", &!self.access_token.is_empty())
+            .field("refresh_token_set", &!self.refresh_token.is_empty())
+            .field("account_id_set", &self.account_id.is_some())
+            .finish()
+    }
+}
+
 /// Flat subset of useful claims in id_token from auth.json.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct IdTokenInfo {
@@ -34,6 +47,8 @@ pub struct IdTokenInfo {
     pub chatgpt_plan_type: Option<PlanType>,
     /// ChatGPT user identifier associated with the token, if present.
     pub chatgpt_user_id: Option<String>,
+    /// JWT subject associated with the token, if present.
+    pub subject: Option<String>,
     /// Organization/workspace identifier associated with the token, if present.
     pub chatgpt_account_id: Option<String>,
     /// Whether the selected ChatGPT workspace must route through the FedRAMP edge.
@@ -66,12 +81,43 @@ impl IdTokenInfo {
     pub fn is_fedramp_account(&self) -> bool {
         self.chatgpt_account_is_fedramp
     }
+
+    pub fn member_identity_key(&self) -> Option<String> {
+        self.chatgpt_user_id
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .map(|value| format!("chatgpt_user_id:{value}"))
+            .or_else(|| {
+                self.subject
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .map(|value| format!("sub:{value}"))
+            })
+    }
+}
+
+pub fn derive_pool_account_id(
+    workspace_account_id: &str,
+    member_identity_key: Option<&str>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(workspace_account_id.as_bytes());
+    hasher.update(b"\n");
+    if let Some(member_identity_key) = member_identity_key.filter(|value| !value.is_empty()) {
+        hasher.update(member_identity_key.as_bytes());
+    } else {
+        hasher.update(b"workspace");
+    }
+    let digest = format!("{:x}", hasher.finalize());
+    format!("pool_{}", &digest[..32])
 }
 
 #[derive(Deserialize)]
 struct IdClaims {
     #[serde(default)]
     email: Option<String>,
+    #[serde(default)]
+    sub: Option<String>,
     #[serde(rename = "https://api.openai.com/profile", default)]
     profile: Option<ProfileClaims>,
     #[serde(rename = "https://api.openai.com/auth", default)]
@@ -138,6 +184,7 @@ pub fn parse_chatgpt_jwt_claims(jwt: &str) -> Result<IdTokenInfo, IdTokenInfoErr
     let claims: IdClaims = decode_jwt_payload(jwt)?;
     let email = claims
         .email
+        .filter(|value| !value.is_empty())
         .or_else(|| claims.profile.and_then(|profile| profile.email));
 
     match claims.auth {
@@ -145,7 +192,11 @@ pub fn parse_chatgpt_jwt_claims(jwt: &str) -> Result<IdTokenInfo, IdTokenInfoErr
             email,
             raw_jwt: jwt.to_string(),
             chatgpt_plan_type: auth.chatgpt_plan_type,
-            chatgpt_user_id: auth.chatgpt_user_id.or(auth.user_id),
+            chatgpt_user_id: auth
+                .chatgpt_user_id
+                .filter(|value| !value.is_empty())
+                .or_else(|| auth.user_id.filter(|value| !value.is_empty())),
+            subject: claims.sub,
             chatgpt_account_id: auth.chatgpt_account_id,
             chatgpt_account_is_fedramp: auth.chatgpt_account_is_fedramp,
         }),
@@ -154,6 +205,7 @@ pub fn parse_chatgpt_jwt_claims(jwt: &str) -> Result<IdTokenInfo, IdTokenInfoErr
             raw_jwt: jwt.to_string(),
             chatgpt_plan_type: None,
             chatgpt_user_id: None,
+            subject: claims.sub,
             chatgpt_account_id: None,
             chatgpt_account_is_fedramp: false,
         }),
